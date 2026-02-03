@@ -1,0 +1,39 @@
+# Build output
+/target/
+**/target/
+
+# Cargo
+Cargo.lock
+
+# Rust analyzer / IDE
+.idea/
+.vscode/
+*.rs.bk
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Debug (Windows)
+Debug/
+Release/
+
+# Test / coverage
+coverage/
+*.profraw
+*.profdata
+
+# Misc
+*.log
+*.tmp

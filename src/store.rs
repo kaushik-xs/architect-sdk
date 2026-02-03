@@ -1,0 +1,114 @@
+//! _private_* table DDL and config persistence.
+
+use crate::error::AppError;
+use sqlx::ConnectOptions;
+use sqlx::PgPool;
+use std::str::FromStr;
+
+const PRIVATE_TABLES: &[&str] = &[
+    "_private_schemas",
+    "_private_enums",
+    "_private_tables",
+    "_private_columns",
+    "_private_indexes",
+    "_private_relationships",
+    "_private_api_entities",
+];
+
+/// Create _private_* tables if they do not exist. Safe to call at startup.
+pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
+    for table in PRIVATE_TABLES {
+        let ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id TEXT PRIMARY KEY,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+            table
+        );
+        sqlx::query(&ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Replace all rows for a config type (delete then insert). Call within transaction for atomicity.
+pub async fn replace_config_rows(
+    tx: &mut sqlx::PgConnection,
+    table: &str,
+    records: &[serde_json::Value],
+) -> Result<u64, AppError> {
+    sqlx::query(&format!("DELETE FROM {}", table))
+        .execute(&mut *tx)
+        .await?;
+
+    let mut count = 0u64;
+    for rec in records {
+        let id = rec
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AppError::BadRequest("each config record must have an 'id' field".into()))?;
+        sqlx::query(&format!(
+            "INSERT INTO {} (id, payload, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (id) DO UPDATE SET payload = $2, updated_at = NOW()",
+            table
+        ))
+        .bind(id)
+        .bind(rec)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Ensure the database in `database_url` exists; create it if not. Connects to the
+/// default `postgres` database to run CREATE DATABASE. Call before creating the main pool.
+pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> {
+    let (admin_url, db_name) = parse_db_name_from_url(database_url)?;
+    if db_name.is_empty() || db_name == "postgres" {
+        return Ok(());
+    }
+    let opts = sqlx::postgres::PgConnectOptions::from_str(&admin_url)
+        .map_err(|e| AppError::BadRequest(format!("invalid DATABASE_URL: {}", e)))?;
+    let mut conn: sqlx::PgConnection = opts.connect().await.map_err(AppError::Db)?;
+    let exists: (bool,) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+        .bind(&db_name)
+        .fetch_one(&mut conn)
+        .await
+        .map_err(AppError::Db)?;
+    if !exists.0 {
+        let quoted = quote_ident(&db_name);
+        sqlx::query(&format!("CREATE DATABASE {}", quoted))
+            .execute(&mut conn)
+            .await
+            .map_err(AppError::Db)?;
+    }
+    Ok(())
+}
+
+fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
+    let path_start = url.rfind('/').ok_or_else(|| AppError::BadRequest("DATABASE_URL: no path".into()))? + 1;
+    let path_and_query = url.get(path_start..).unwrap_or("");
+    let db_name = path_and_query.split('?').next().unwrap_or("").trim();
+    let base = url.get(..path_start).unwrap_or(url);
+    let admin_url = format!("{}postgres", base);
+    Ok((admin_url, db_name.to_string()))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub fn private_table_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "schemas" => Some("_private_schemas"),
+        "enums" => Some("_private_enums"),
+        "tables" => Some("_private_tables"),
+        "columns" => Some("_private_columns"),
+        "indexes" => Some("_private_indexes"),
+        "relationships" => Some("_private_relationships"),
+        "api_entities" => Some("_private_api_entities"),
+        _ => None,
+    }
+}

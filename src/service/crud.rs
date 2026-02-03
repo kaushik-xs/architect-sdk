@@ -1,0 +1,209 @@
+//! Generic CRUD execution against PostgreSQL.
+
+use crate::config::ResolvedEntity;
+use crate::error::AppError;
+use crate::sql::{delete, insert, select_by_id, update, PgBindValue, QueryBuf};
+use serde_json::Value;
+use sqlx::PgPool;
+use std::collections::HashMap;
+
+pub struct CrudService;
+
+impl CrudService {
+    /// Fetch one row by primary key. Returns JSON object or None.
+    pub async fn read(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        id: &Value,
+    ) -> Result<Option<Value>, AppError> {
+        let q = select_by_id(entity);
+        let row = Self::query_one(pool, &q.sql, &[id.clone()]).await?;
+        Ok(row)
+    }
+
+    /// Insert one row; body may include or omit PK (if has default). Returns created row.
+    pub async fn create(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        body: &HashMap<String, Value>,
+    ) -> Result<Value, AppError> {
+        let include_pk = body.contains_key(&entity.pk_columns[0]);
+        let q = insert(entity, body, include_pk);
+        let row = Self::execute_returning_one(pool, &q).await?
+            .ok_or_else(|| AppError::Db(sqlx::Error::RowNotFound))?;
+        Ok(row)
+    }
+
+    /// Update one row by id. Returns updated row.
+    pub async fn update(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        id: &Value,
+        body: &HashMap<String, Value>,
+    ) -> Result<Option<Value>, AppError> {
+        let q = update(entity, id, body);
+        let row = Self::execute_returning_one(pool, &q).await?;
+        Ok(row)
+    }
+
+    /// Delete one row by id. Returns deleted row or None.
+    pub async fn delete(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        id: &Value,
+    ) -> Result<Option<Value>, AppError> {
+        let q = delete(entity);
+        let row = Self::execute_returning_one_with_params(pool, &q.sql, &[id.clone()]).await?;
+        Ok(row)
+    }
+
+    /// Bulk create in a transaction. Returns vec of created rows.
+    pub async fn bulk_create(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        items: &[HashMap<String, Value>],
+    ) -> Result<Vec<Value>, AppError> {
+        const BULK_LIMIT: usize = 100;
+        if items.len() > BULK_LIMIT {
+            return Err(AppError::BadRequest(format!(
+                "bulk create limited to {} items",
+                BULK_LIMIT
+            )));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut tx = pool.begin().await?;
+        for body in items {
+            let include_pk = body.contains_key(&entity.pk_columns[0]);
+            let q = insert(entity, body, include_pk);
+            let row = Self::execute_returning_one_tx(&mut tx, &q).await?.unwrap_or(Value::Null);
+            out.push(row);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Bulk update in a transaction. Each item must have id. Returns vec of updated rows.
+    pub async fn bulk_update(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        items: &[HashMap<String, Value>],
+    ) -> Result<Vec<Value>, AppError> {
+        const BULK_LIMIT: usize = 100;
+        if items.len() > BULK_LIMIT {
+            return Err(AppError::BadRequest(format!(
+                "bulk update limited to {} items",
+                BULK_LIMIT
+            )));
+        }
+        let pk = &entity.pk_columns[0];
+        let mut out = Vec::with_capacity(items.len());
+        let mut tx = pool.begin().await?;
+        for body in items {
+            let id = body.get(pk).ok_or_else(|| AppError::Validation(format!("each item must have '{}'", pk)))?;
+            let mut body_without_pk = body.clone();
+            body_without_pk.remove(pk);
+            let q = update(entity, id, &body_without_pk);
+            if let Some(row) = Self::execute_returning_one_tx(&mut tx, &q).await? {
+                out.push(row);
+            }
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    async fn query_one(
+        pool: &PgPool,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<Value>, AppError> {
+        let bind = Self::to_sqlx_param(&params[0]);
+        let row = sqlx::query(sql)
+            .bind(bind)
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.map(|r| row_to_json(&r)))
+    }
+
+    async fn execute_returning_one(pool: &PgPool, q: &QueryBuf) -> Result<Option<Value>, AppError> {
+        let mut query = sqlx::query(&q.sql);
+        for p in &q.params {
+            let b = Self::to_sqlx_param(p);
+            query = query.bind(b);
+        }
+        let row = query.fetch_optional(pool).await?;
+        Ok(row.map(|r| row_to_json(&r)))
+    }
+
+    async fn execute_returning_one_with_params(
+        pool: &PgPool,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<Value>, AppError> {
+        let mut query = sqlx::query(sql);
+        for p in params {
+            query = query.bind(Self::to_sqlx_param(p));
+        }
+        let row = query.fetch_optional(pool).await?;
+        Ok(row.map(|r| row_to_json(&r)))
+    }
+
+    async fn execute_returning_one_tx(
+        tx: &mut sqlx::PgConnection,
+        q: &QueryBuf,
+    ) -> Result<Option<Value>, AppError> {
+        let mut query = sqlx::query(&q.sql);
+        for p in &q.params {
+            query = query.bind(Self::to_sqlx_param(p));
+        }
+        let row = query.fetch_optional(&mut *tx).await?;
+        Ok(row.map(|r| row_to_json(&r)))
+    }
+
+    fn to_sqlx_param(v: &Value) -> PgBindValue {
+        PgBindValue::from_json(v).unwrap_or(PgBindValue::Null)
+    }
+}
+
+fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row;
+    use sqlx::Column;
+    let mut map = serde_json::Map::new();
+    for col in row.columns() {
+        let name = col.name();
+        let v = cell_to_value(row, name);
+        map.insert(name.to_string(), v);
+    }
+    Value::Object(map)
+}
+
+fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
+    use sqlx::Row;
+    if let Ok(v) = row.try_get::<Option<i64>, _>(name) {
+        if let Some(n) = v {
+            return Value::Number(n.into());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(name) {
+        if let Some(n) = v {
+            if let Some(n) = serde_json::Number::from_f64(n) {
+                return Value::Number(n);
+            }
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<bool>, _>(name) {
+        if let Some(b) = v {
+            return Value::Bool(b);
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<String>, _>(name) {
+        if let Some(s) = v {
+            return Value::String(s);
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<serde_json::Value>, _>(name) {
+        if let Some(j) = v {
+            return j;
+        }
+    }
+    Value::Null
+}

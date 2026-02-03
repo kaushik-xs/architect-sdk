@@ -1,0 +1,20 @@
+[
+  {
+    "entity_id": "tbl_users",
+    "path_segment": "users",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "validation": {
+      "email": { "required": true, "format": "email", "max_length": 255 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_orders",
+    "path_segment": "orders",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "validation": {
+      "status": { "allowed": ["pending", "confirmed", "shipped", "cancelled"] },
+      "user_id": { "required": true, "format": "uuid" }
+    }
+  }
+]

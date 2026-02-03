@@ -1,0 +1,324 @@
+{
+  "info": {
+    "name": "Architect SDK API",
+    "description": "Configuration-driven REST API: common, config ingestion, and entity CRUD endpoints.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "user_id",
+      "value": ""
+    },
+    {
+      "key": "order_id",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Common",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/health",
+            "description": "Liveness check. Returns 200 + { \"status\": \"ok\" }."
+          }
+        },
+        {
+          "name": "Ready",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/ready",
+            "description": "Readiness check (includes DB). Returns 200 if ready, 503 if degraded."
+          }
+        },
+        {
+          "name": "Version",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/version",
+            "description": "Service name and version."
+          }
+        },
+        {
+          "name": "Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/info",
+            "description": "Same as version."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Config",
+      "item": [
+        {
+          "name": "GET Schemas",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/config/schemas"
+          }
+        },
+        {
+          "name": "POST Schemas",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"sch_public\",\n    \"name\": \"public\",\n    \"comment\": \"Default schema\"\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/schemas"
+          }
+        },
+        {
+          "name": "GET Enums",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/config/enums"
+          }
+        },
+        {
+          "name": "POST Enums",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"enum_order_status\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"order_status\",\n    \"values\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"],\n    \"comment\": \"Order lifecycle status\"\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/enums"
+          }
+        },
+        {
+          "name": "GET Tables",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/config/tables" }
+        },
+        {
+          "name": "POST Tables",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"tbl_users\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"users\",\n    \"comment\": \"User accounts\",\n    \"primary_key\": \"id\",\n    \"unique\": [[\"email\"]],\n    \"check\": []\n  },\n  {\n    \"id\": \"tbl_orders\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"orders\",\n    \"comment\": \"Customer orders\",\n    \"primary_key\": \"id\",\n    \"unique\": [],\n    \"check\": [{\"name\": \"created_at_not_future\", \"expression\": \"created_at <= NOW()\"}]\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/tables"
+          }
+        },
+        {
+          "name": "GET Columns",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/config/columns" }
+        },
+        {
+          "name": "POST Columns",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"col_users_id\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"gen_random_uuid()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_email\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"email\",\n    \"type\": \"varchar(255)\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_created_at\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"created_at\",\n    \"type\": \"timestamptz\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"NOW()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"id\",\n    \"type\": \"bigserial\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_user_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"user_id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": \"References users.id\"\n  },\n  {\n    \"id\": \"col_orders_status\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"status\",\n    \"type\": \"public.order_status\",\n    \"nullable\": false,\n    \"default\": \"'pending'\",\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_created_at\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"created_at\",\n    \"type\": \"timestamptz\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"NOW()\"},\n    \"comment\": null\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/columns"
+          }
+        },
+        {
+          "name": "GET Indexes",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/config/indexes" }
+        },
+        {
+          "name": "POST Indexes",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": { "mode": "raw", "raw": "[]" },
+            "url": "{{base_url}}/api/v1/config/indexes"
+          }
+        },
+        {
+          "name": "GET Relationships",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/config/relationships" }
+        },
+        {
+          "name": "POST Relationships",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": { "mode": "raw", "raw": "[]" },
+            "url": "{{base_url}}/api/v1/config/relationships"
+          }
+        },
+        {
+          "name": "GET API Entities",
+          "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/config/api_entities" }
+        },
+        {
+          "name": "POST API Entities",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"entity_id\": \"tbl_users\",\n    \"path_segment\": \"users\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"email\": { \"required\": true, \"format\": \"email\", \"max_length\": 255 },\n      \"id\": { \"format\": \"uuid\" }\n    }\n  },\n  {\n    \"entity_id\": \"tbl_orders\",\n    \"path_segment\": \"orders\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"status\": { \"allowed\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"] },\n      \"user_id\": { \"required\": true, \"format\": \"uuid\" }\n    }\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/api_entities"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "Create User",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/users",
+            "description": "Id and created_at can be omitted (DB defaults)."
+          }
+        },
+        {
+          "name": "Read User",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/users/{{user_id}}",
+            "description": "Set user_id variable from a created user's id."
+          }
+        },
+        {
+          "name": "Update User",
+          "request": {
+            "method": "PATCH",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"updated@example.com\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/users/{{user_id}}"
+          }
+        },
+        {
+          "name": "Delete User",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{base_url}}/api/v1/users/{{user_id}}"
+          }
+        },
+        {
+          "name": "Bulk Create Users",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"email\": \"bulk1@example.com\" },\n  { \"email\": \"bulk2@example.com\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/users/bulk"
+          }
+        },
+        {
+          "name": "Bulk Update Users",
+          "request": {
+            "method": "PATCH",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"id\": \"{{user_id}}\", \"email\": \"bulk-updated@example.com\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/users/bulk"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
+        {
+          "name": "Create Order",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"status\": \"pending\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/orders",
+            "description": "user_id required (UUID). status defaults to pending. id and created_at are optional."
+          }
+        },
+        {
+          "name": "Read Order",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}"
+          }
+        },
+        {
+          "name": "Update Order",
+          "request": {
+            "method": "PATCH",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"confirmed\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}"
+          }
+        },
+        {
+          "name": "Delete Order",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}"
+          }
+        },
+        {
+          "name": "Bulk Create Orders",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"user_id\": \"{{user_id}}\", \"status\": \"pending\" },\n  { \"user_id\": \"{{user_id}}\", \"status\": \"confirmed\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/orders/bulk"
+          }
+        },
+        {
+          "name": "Bulk Update Orders",
+          "request": {
+            "method": "PATCH",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"id\": 1, \"status\": \"shipped\" },\n  { \"id\": 2, \"status\": \"cancelled\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/orders/bulk"
+          }
+        }
+      ]
+    }
+  ]
+}
