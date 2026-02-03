@@ -1,0 +1,22 @@
+[
+  {
+    "id": "tbl_users",
+    "schema_id": "sch_public",
+    "name": "users",
+    "comment": "User accounts",
+    "primary_key": "id",
+    "unique": [["email"]],
+    "check": []
+  },
+  {
+    "id": "tbl_orders",
+    "schema_id": "sch_public",
+    "name": "orders",
+    "comment": "Customer orders",
+    "primary_key": "id",
+    "unique": [],
+    "check": [
+      { "name": "created_at_not_future", "expression": "created_at <= NOW()" }
+    ]
+  }
+]

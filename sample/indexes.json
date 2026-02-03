@@ -1,0 +1,29 @@
+[
+  {
+    "id": "idx_users_email",
+    "schema_id": "sch_public",
+    "table_id": "tbl_users",
+    "name": "idx_users_email",
+    "method": "btree",
+    "unique": true,
+    "columns": ["email"],
+    "include": [],
+    "where": null,
+    "comment": "Unique index on email for lookups"
+  },
+  {
+    "id": "idx_orders_user_created",
+    "schema_id": "sch_public",
+    "table_id": "tbl_orders",
+    "name": "idx_orders_user_created",
+    "method": "btree",
+    "unique": false,
+    "columns": [
+      { "name": "user_id", "direction": "asc" },
+      { "name": "created_at", "direction": "desc" }
+    ],
+    "include": [],
+    "where": null,
+    "comment": "Orders by user and creation time"
+  }
+]

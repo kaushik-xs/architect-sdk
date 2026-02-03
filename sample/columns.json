@@ -1,0 +1,65 @@
+[
+  {
+    "id": "col_users_id",
+    "table_id": "tbl_users",
+    "name": "id",
+    "type": "uuid",
+    "nullable": false,
+    "default": { "expression": "gen_random_uuid()" },
+    "comment": null
+  },
+  {
+    "id": "col_users_email",
+    "table_id": "tbl_users",
+    "name": "email",
+    "type": "varchar(255)",
+    "nullable": false,
+    "default": null,
+    "comment": null
+  },
+  {
+    "id": "col_users_created_at",
+    "table_id": "tbl_users",
+    "name": "created_at",
+    "type": "timestamptz",
+    "nullable": false,
+    "default": { "expression": "NOW()" },
+    "comment": null
+  },
+  {
+    "id": "col_orders_id",
+    "table_id": "tbl_orders",
+    "name": "id",
+    "type": "bigserial",
+    "nullable": false,
+    "default": null,
+    "comment": null
+  },
+  {
+    "id": "col_orders_user_id",
+    "table_id": "tbl_orders",
+    "name": "user_id",
+    "type": "uuid",
+    "nullable": false,
+    "default": null,
+    "comment": "References users.id"
+  },
+  {
+    "id": "col_orders_status",
+    "table_id": "tbl_orders",
+    "name": "status",
+    "type": "public.order_status",
+    "nullable": false,
+    "default": "'pending'",
+    "comment": null
+  },
+  {
+    "id": "col_orders_created_at",
+    "table_id": "tbl_orders",
+    "name": "created_at",
+    "type": "timestamptz",
+    "nullable": false,
+    "default": { "expression": "NOW()" },
+    "comment": null
+  }
+]
