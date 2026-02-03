@@ -5,7 +5,7 @@ use crate::config::types::*;
 use crate::config::{validate, FullConfig};
 use crate::error::ConfigError;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Build resolved model from full config (call after validate).
 pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
@@ -55,18 +55,37 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             })?;
         let pk_type = infer_pk_type(pk_col);
 
-        let columns: Vec<ColumnInfo> = table_columns
+        let mut columns: Vec<ColumnInfo> = table_columns
             .iter()
             .map(|c| {
                 let is_pk = pk_names.contains(&c.name);
+                let pg_type = column_pg_type_name(&c.type_);
                 ColumnInfo {
                     name: c.name.clone(),
                     pk_type: if is_pk { Some(pk_type.clone()) } else { None },
                     nullable: c.nullable,
                     has_default: c.default.is_some(),
+                    pg_type,
                 }
             })
             .collect();
+
+        let config_col_names: HashSet<String> = columns.iter().map(|c| c.name.clone()).collect();
+        for (name, nullable, has_default) in [
+            ("created_at", false, true),
+            ("updated_at", false, true),
+            ("archived_at", true, false),
+        ] {
+            if !config_col_names.contains(name) {
+                columns.push(ColumnInfo {
+                    name: name.to_string(),
+                    pk_type: None,
+                    nullable,
+                    has_default,
+                    pg_type: Some("timestamptz".into()),
+                });
+            }
+        }
 
         let entity = ResolvedEntity {
             table_id: table.id.clone(),
@@ -75,7 +94,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             path_segment: api.path_segment.clone(),
             pk_columns: pk_names.clone(),
             pk_type: pk_type.clone(),
-            columns: columns.clone(),
+            columns: columns,
             operations: api.operations.clone(),
             validation: api.validation.clone(),
         };
@@ -87,6 +106,23 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         entities,
         entity_by_path,
     })
+}
+
+fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
+    let name = match ty {
+        ColumnTypeConfig::Simple(s) => s.as_str(),
+        ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
+    };
+    let lower = name.to_lowercase();
+    if lower == "timestamptz" || lower == "timestamp with time zone" {
+        Some("timestamptz".into())
+    } else if lower == "timestamp" || lower.starts_with("timestamp ") {
+        Some("timestamp".into())
+    } else if lower == "date" {
+        Some("date".into())
+    } else {
+        None
+    }
 }
 
 fn infer_pk_type(col: &ColumnConfig) -> PkType {

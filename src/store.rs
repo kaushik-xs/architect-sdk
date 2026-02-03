@@ -3,6 +3,7 @@
 use crate::error::AppError;
 use sqlx::ConnectOptions;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 const PRIVATE_TABLES: &[&str] = &[
@@ -15,7 +16,8 @@ const PRIVATE_TABLES: &[&str] = &[
     "_private_api_entities",
 ];
 
-/// Create _private_* tables if they do not exist. Safe to call at startup.
+/// Create _private_* tables (with version) and _private_*_history tables if they do not exist.
+/// If tables already exist without a version column, adds it (PostgreSQL 11+).
 pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
     for table in PRIVATE_TABLES {
         let ddl = format!(
@@ -23,43 +25,131 @@ pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
             CREATE TABLE IF NOT EXISTS {} (
                 id TEXT PRIMARY KEY,
                 payload JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                version BIGINT NOT NULL DEFAULT 1
             )
             "#,
             table
         );
         sqlx::query(&ddl).execute(pool).await?;
+        // Add version column if table existed from an older run (idempotent on PG 11+)
+        let alter = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1",
+            table
+        );
+        let _ = sqlx::query(&alter).execute(pool).await;
+
+        let history_table = format!("{}_history", table);
+        let history_ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {} (
+                id TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                version BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (id, version)
+            )
+            "#,
+            history_table
+        );
+        sqlx::query(&history_ddl).execute(pool).await?;
     }
     Ok(())
 }
 
-/// Replace all rows for a config type (delete then insert). Call within transaction for atomicity.
+/// Resolve the storage id for a config record. For api_entities, entity_id is used when id is absent.
+fn config_record_id(table: &str, rec: &serde_json::Value) -> Result<String, AppError> {
+    let id = rec.get("id").and_then(|v| v.as_str());
+    let entity_id = rec.get("entity_id").and_then(|v| v.as_str());
+    match (table, id, entity_id) {
+        ("_private_api_entities", None, Some(eid)) => Ok(eid.to_string()),
+        (_, Some(id), _) => Ok(id.to_string()),
+        _ => Err(AppError::BadRequest(
+            "each config record must have an 'id' field (or 'entity_id' for api_entities)".into(),
+        )),
+    }
+}
+
+/// Deep-compare incoming records with current stored payloads (by id).
+/// Returns true if they are identical (same ids and same payload per id).
+fn config_payloads_unchanged(
+    table: &str,
+    current: &HashMap<String, serde_json::Value>,
+    records: &[serde_json::Value],
+) -> Result<bool, AppError> {
+    if current.len() != records.len() {
+        return Ok(false);
+    }
+    for rec in records {
+        let id = config_record_id(table, rec)?;
+        match current.get(&id) {
+            None => return Ok(false),
+            Some(existing) if existing != rec => return Ok(false),
+            Some(_) => {}
+        }
+    }
+    Ok(true)
+}
+
+/// Replace all rows for a config type: copy current to history, delete, insert with new version.
+/// If incoming payloads are deep-equal to current, no write is performed and no new version is created.
+/// Returns (count inserted, version). Call within transaction for atomicity.
 pub async fn replace_config_rows(
     tx: &mut sqlx::PgConnection,
     table: &str,
     records: &[serde_json::Value],
-) -> Result<u64, AppError> {
+) -> Result<(u64, i64), AppError> {
+    let current_version: (Option<i64>,) = sqlx::query_as(&format!(
+        "SELECT COALESCE(MAX(version), 0) FROM {}",
+        table
+    ))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::Db)?;
+    let current_version = current_version.0.unwrap_or(0);
+
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(&format!(
+        "SELECT id, payload FROM {}",
+        table
+    ))
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(AppError::Db)?;
+    let current: HashMap<String, serde_json::Value> = rows.into_iter().collect();
+
+    if config_payloads_unchanged(table, &current, records)? {
+        return Ok((0, current_version));
+    }
+
+    let history_table = format!("{}_history", table);
+    let new_version = current_version + 1;
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, payload, version, created_at) SELECT id, payload, version, updated_at FROM {}",
+        history_table, table
+    ))
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(&format!("DELETE FROM {}", table))
         .execute(&mut *tx)
         .await?;
 
     let mut count = 0u64;
     for rec in records {
-        let id = rec
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest("each config record must have an 'id' field".into()))?;
+        let id = config_record_id(table, rec)?;
         sqlx::query(&format!(
-            "INSERT INTO {} (id, payload, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (id) DO UPDATE SET payload = $2, updated_at = NOW()",
+            "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
             table
         ))
         .bind(id)
         .bind(rec)
+        .bind(new_version)
         .execute(&mut *tx)
         .await?;
         count += 1;
     }
-    Ok(count)
+    Ok((count, new_version))
 }
 
 /// Ensure the database in `database_url` exists; create it if not. Connects to the

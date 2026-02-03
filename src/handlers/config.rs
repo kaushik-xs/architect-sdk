@@ -1,6 +1,8 @@
 //! Config ingestion handlers: POST/GET for each config type.
 
+use crate::config::load_from_pool;
 use crate::error::AppError;
+use crate::migration::apply_migrations;
 use crate::state::AppState;
 use crate::store::{private_table_for_kind, replace_config_rows};
 use axum::extract::State;
@@ -15,8 +17,12 @@ async fn replace_config(
 ) -> Result<Vec<Value>, AppError> {
     let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
-    replace_config_rows(&mut tx, table, &body).await?;
+    let (count, _version) = replace_config_rows(&mut tx, table, &body).await?;
     tx.commit().await?;
+    if count > 0 {
+        let config = load_from_pool(pool).await.map_err(AppError::Config)?;
+        apply_migrations(pool, &config).await?;
+    }
     Ok(body)
 }
 

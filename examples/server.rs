@@ -1,6 +1,7 @@
 //! Example server: loads config from _private_* tables or from env (config path), ensures _private_* tables exist, mounts common, config, and entity routes.
 
 use architect_sdk::{
+    apply_migrations,
     common_routes_with_ready,
     config_routes,
     entity_routes,
@@ -33,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_source = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "sample".into());
     let config = load_config_from_path(&config_source).await?;
+    apply_migrations(&pool, &config).await?;
     let model = resolve(&config)?;
     let state = AppState {
         pool: pool.clone(),

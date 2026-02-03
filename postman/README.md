@@ -8,10 +8,20 @@ Import **Architect-SDK-API.postman_collection.json** into Postman (File → Impo
 - **user_id**: Set after creating a user (e.g. from the Create User response) so Read/Update/Delete User and Create Order can use it.
 - **order_id**: Set after creating an order so Read/Update/Delete Order can use it.
 
+## System columns
+
+Every table gets three columns added by default (no need to put them in config):
+
+- **created_at** (timestamptz, NOT NULL, default NOW())
+- **updated_at** (timestamptz, NOT NULL, default NOW(); set to NOW() on every update)
+- **archived_at** (timestamptz, nullable; use for soft-delete)
+
+Responses include these fields. You do not need to send them on create; you can optionally set **archived_at** when archiving a row.
+
 ## Folders
 
 - **Common**: Health, Ready, Version, Info (no `/api/v1` prefix).
-- **Config**: GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities (under `/api/v1/config/...`).
+- **Config**: GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities (under `/api/v1/config/...`). The sample config omits created_at/updated_at/archived_at; they are added automatically.
 - **Users**: Create, Read, Update, Delete, Bulk Create, Bulk Update (under `/api/v1/users`).
 - **Orders**: Same operations for orders (under `/api/v1/orders`).
 

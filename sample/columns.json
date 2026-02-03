@@ -18,12 +18,12 @@
     "comment": null
   },
   {
-    "id": "col_users_created_at",
+    "id": "col_users_first_name",
     "table_id": "tbl_users",
-    "name": "created_at",
-    "type": "timestamptz",
+    "name": "first_name",
+    "type": "varchar(255)",
     "nullable": false,
-    "default": { "expression": "NOW()" },
+    "default": null,
     "comment": null
   },
   {
@@ -51,15 +51,6 @@
     "type": "public.order_status",
     "nullable": false,
     "default": "'pending'",
-    "comment": null
-  },
-  {
-    "id": "col_orders_created_at",
-    "table_id": "tbl_orders",
-    "name": "created_at",
-    "type": "timestamptz",
-    "nullable": false,
-    "default": { "expression": "NOW()" },
     "comment": null
   }
 ]

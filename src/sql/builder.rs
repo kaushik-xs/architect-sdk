@@ -50,6 +50,8 @@ pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
 }
 
 /// INSERT: columns and placeholders from entity; values from body. Excludes PK if has_default.
+/// Omits columns with DB default when body does not provide a value (so DB uses default).
+/// Uses SQL cast (e.g. $n::timestamptz) for timestamp columns so string values bind correctly.
 pub fn insert(
     entity: &ResolvedEntity,
     body: &HashMap<String, Value>,
@@ -64,9 +66,18 @@ pub fn insert(
         if c.pk_type.is_some() && !include_pk {
             continue;
         }
-        let val = body.get(name).cloned().unwrap_or(Value::Null);
+        let val = body.get(name).cloned();
+        if val.is_none() && c.has_default {
+            continue;
+        }
+        let val = val.unwrap_or(Value::Null);
+        let param_num = q.push_param(val);
+        let ph = match c.pg_type.as_deref() {
+            Some("timestamptz") | Some("timestamp") | Some("date") => format!("${}::{}", param_num, c.pg_type.as_deref().unwrap()),
+            _ => format!("${}", param_num),
+        };
         cols.push(quoted(name));
-        placeholders.push(format!("${}", q.push_param(val)));
+        placeholders.push(ph);
     }
     q.sql = format!(
         "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
@@ -78,17 +89,26 @@ pub fn insert(
 }
 
 /// UPDATE by id: SET only columns present in body (and in entity columns).
+/// Uses SQL cast for timestamp columns so string values bind correctly.
 pub fn update(entity: &ResolvedEntity, id: &Value, body: &HashMap<String, Value>) -> QueryBuf {
     let mut q = QueryBuf::new();
     let table = qualified_table(&entity.schema_name, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let col_names: std::collections::HashSet<_> = entity.columns.iter().map(|c| c.name.as_str()).collect();
+    let col_by_name: std::collections::HashMap<_, _> = entity.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut sets = Vec::new();
     for (k, v) in body {
-        if col_names.contains(k.as_str()) && *k != *pk {
-            sets.push(format!("{} = ${}", quoted(k), q.push_param(v.clone())));
+        if *k == *pk {
+            continue;
         }
+        let Some(c) = col_by_name.get(k.as_str()) else { continue };
+        let param_num = q.push_param(v.clone());
+        let rhs = match c.pg_type.as_deref() {
+            Some("timestamptz") | Some("timestamp") | Some("date") => format!("${}::{}", param_num, c.pg_type.as_deref().unwrap()),
+            _ => format!("${}", param_num),
+        };
+        sets.push(format!("{} = {}", quoted(k), rhs));
     }
+    sets.push(format!("{} = NOW()", quoted("updated_at")));
     if sets.is_empty() {
         q.sql = format!("SELECT * FROM {} WHERE {} = $1", table, quoted(pk));
         q.params.push(id.clone());

@@ -19,6 +19,8 @@ pub struct ColumnInfo {
     pub nullable: bool,
     /// Whether the column has a DB default (e.g. gen_random_uuid(), NOW()).
     pub has_default: bool,
+    /// PostgreSQL type name for SQL casts (e.g. "timestamptz") when binding string values.
+    pub pg_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Architect SDK API",
-    "description": "Configuration-driven REST API: common, config ingestion, and entity CRUD endpoints.",
+    "description": "Configuration-driven REST API: common, config ingestion, and entity CRUD endpoints.\n\nEvery table automatically has created_at, updated_at, and archived_at (timestamptz). created_at/updated_at default to NOW(); updated_at is set to NOW() on every update; archived_at is for soft-delete.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -128,9 +128,10 @@
           "request": {
             "method": "POST",
             "header": [{"key": "Content-Type", "value": "application/json"}],
+            "description": "Every table gets created_at, updated_at, and archived_at (timestamptz) added automatically; omit them from config unless you need custom definitions.",
             "body": {
               "mode": "raw",
-              "raw": "[\n  {\n    \"id\": \"col_users_id\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"gen_random_uuid()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_email\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"email\",\n    \"type\": \"varchar(255)\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_created_at\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"created_at\",\n    \"type\": \"timestamptz\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"NOW()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"id\",\n    \"type\": \"bigserial\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_user_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"user_id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": \"References users.id\"\n  },\n  {\n    \"id\": \"col_orders_status\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"status\",\n    \"type\": \"public.order_status\",\n    \"nullable\": false,\n    \"default\": \"'pending'\",\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_created_at\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"created_at\",\n    \"type\": \"timestamptz\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"NOW()\"},\n    \"comment\": null\n  }\n]"
+              "raw": "[\n  {\n    \"id\": \"col_users_id\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"gen_random_uuid()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_email\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"email\",\n    \"type\": \"varchar(255)\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"id\",\n    \"type\": \"bigserial\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_orders_user_id\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"user_id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": \"References users.id\"\n  },\n  {\n    \"id\": \"col_orders_status\",\n    \"table_id\": \"tbl_orders\",\n    \"name\": \"status\",\n    \"type\": \"public.order_status\",\n    \"nullable\": false,\n    \"default\": \"'pending'\",\n    \"comment\": null\n  }\n]"
             },
             "url": "{{base_url}}/api/v1/config/columns"
           }
@@ -192,7 +193,7 @@
               "raw": "{\n  \"email\": \"user@example.com\"\n}"
             },
             "url": "{{base_url}}/api/v1/users",
-            "description": "Id and created_at can be omitted (DB defaults)."
+            "description": "id, created_at, updated_at, and archived_at are set by the server; send only email (and optional id if overriding default)."
           }
         },
         {
@@ -263,7 +264,7 @@
               "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"status\": \"pending\"\n}"
             },
             "url": "{{base_url}}/api/v1/orders",
-            "description": "user_id required (UUID). status defaults to pending. id and created_at are optional."
+            "description": "user_id and status in body. id, created_at, updated_at, archived_at are set by the server."
           }
         },
         {
