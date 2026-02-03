@@ -10,7 +10,7 @@ use axum::Json;
 use serde_json::Value;
 use sqlx::PgPool;
 
-async fn replace_config(
+pub(crate) async fn replace_config(
     pool: &PgPool,
     kind: &str,
     body: Vec<Value>,

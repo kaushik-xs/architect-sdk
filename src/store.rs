@@ -14,6 +14,7 @@ const PRIVATE_TABLES: &[&str] = &[
     "_private_indexes",
     "_private_relationships",
     "_private_api_entities",
+    "_private_plugins",
 ];
 
 /// Create _private_* tables (with version) and _private_*_history tables if they do not exist.
@@ -150,6 +151,64 @@ pub async fn replace_config_rows(
         count += 1;
     }
     Ok((count, new_version))
+}
+
+const PLUGINS_TABLE: &str = "_private_plugins";
+const PLUGINS_HISTORY_TABLE: &str = "_private_plugins_history";
+
+/// Upsert one plugin row by id: copy current to history if exists, then insert or replace with new payload and incremented version.
+pub async fn upsert_plugin(
+    pool: &PgPool,
+    id: &str,
+    payload: &serde_json::Value,
+) -> Result<i64, AppError> {
+    let mut tx = pool.begin().await?;
+    let current: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
+        "SELECT payload, version FROM {} WHERE id = $1",
+        PLUGINS_TABLE
+    ))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::Db)?;
+
+    let new_version = match &current {
+        Some((_, v)) => v + 1,
+        None => 1,
+    };
+
+    if let Some((old_payload, old_version)) = current {
+        sqlx::query(&format!(
+            "INSERT INTO {} (id, payload, version, created_at) VALUES ($1, $2, $3, NOW())",
+            PLUGINS_HISTORY_TABLE
+        ))
+        .bind(id)
+        .bind(old_payload)
+        .bind(old_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query(&format!(
+        "DELETE FROM {} WHERE id = $1",
+        PLUGINS_TABLE
+    ))
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
+        PLUGINS_TABLE
+    ))
+    .bind(id)
+    .bind(payload)
+    .bind(new_version)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(new_version)
 }
 
 /// Ensure the database in `database_url` exists; create it if not. Connects to the

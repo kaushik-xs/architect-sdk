@@ -1,11 +1,11 @@
-//! Entity CRUD handlers: create, read, update, delete, bulk.
+//! Entity CRUD handlers: create, read, update, delete, list, bulk.
 
-use crate::config::PkType;
+use crate::config::{PkType, ResolvedEntity};
 use crate::error::AppError;
 use crate::service::{CrudService, RequestValidator};
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use serde_json::Value;
@@ -30,6 +30,96 @@ fn body_to_map(value: Value) -> Result<HashMap<String, Value>, AppError> {
         Value::Object(m) => Ok(m.into_iter().collect()),
         _ => Err(AppError::BadRequest("body must be a JSON object".into())),
     }
+}
+
+fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value {
+    let col_info = entity.columns.iter().find(|c| c.name == col);
+    let is_uuid = col_info
+        .and_then(|c| c.pk_type.as_ref())
+        .map(|t| matches!(t, PkType::Uuid))
+        .unwrap_or(false)
+        || col_info
+            .and_then(|c| c.pg_type.as_deref())
+            .map(|t| t.to_lowercase().contains("uuid"))
+            .unwrap_or(false);
+    let is_int = col_info
+        .and_then(|c| c.pk_type.as_ref())
+        .map(|t| matches!(t, PkType::BigInt | PkType::Int))
+        .unwrap_or(false)
+        || col_info
+            .and_then(|c| c.pg_type.as_deref())
+            .map(|t| {
+                let l = t.to_lowercase();
+                l.contains("int") || l.contains("serial")
+            })
+            .unwrap_or(false);
+    let is_bool = col_info
+        .and_then(|c| c.pg_type.as_deref())
+        .map(|t| t.to_lowercase().starts_with("bool"))
+        .unwrap_or(false);
+
+    if is_uuid {
+        if let Ok(u) = uuid::Uuid::parse_str(s) {
+            return Value::String(u.to_string());
+        }
+    }
+    if is_int {
+        if let Ok(n) = s.parse::<i64>() {
+            return Value::Number(n.into());
+        }
+    }
+    if is_bool {
+        if s.eq_ignore_ascii_case("true") {
+            return Value::Bool(true);
+        }
+        if s.eq_ignore_ascii_case("false") {
+            return Value::Bool(false);
+        }
+    }
+    Value::String(s.to_string())
+}
+
+pub async fn list(
+    State(state): State<AppState>,
+    Path(path_segment): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "read") {
+        return Err(AppError::BadRequest("read not allowed".into()));
+    }
+    let column_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
+
+    let mut limit: Option<u32> = None;
+    let mut offset: Option<u32> = None;
+    let mut filters: Vec<(String, Value)> = Vec::new();
+
+    for (k, v) in params {
+        match k.as_str() {
+            "limit" => {
+                limit = v.parse().ok();
+            }
+            "offset" => {
+                offset = v.parse().ok();
+            }
+            _ => {
+                if column_names.contains(k.as_str()) {
+                    let val = query_value_for_column(entity, &k, &v);
+                    filters.push((k, val));
+                }
+            }
+        }
+    }
+
+    let rows = CrudService::list(&state.pool, entity, &filters, limit, offset).await?;
+    let count = rows.len() as u64;
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
 }
 
 pub async fn create(

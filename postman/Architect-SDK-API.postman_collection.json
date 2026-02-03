@@ -64,6 +64,26 @@
       "name": "Config",
       "item": [
         {
+          "name": "Install Plugin",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Zip file containing manifest.json at root plus schemas.json, enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json"
+                }
+              ]
+            },
+            "url": "{{base_url}}/api/v1/config/plugin",
+            "description": "Upload a plugin zip. Zip must have manifest.json (id, name, version) at root and config JSON files. Applies all configs in order and stores manifest in _private_plugins."
+          }
+        },
+        {
           "name": "GET Schemas",
           "request": {
             "method": "GET",
@@ -184,6 +204,24 @@
       "name": "Users",
       "item": [
         {
+          "name": "List Users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/users?limit=100&offset=0",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "users"],
+              "query": [
+                { "key": "limit", "value": "100", "description": "Max 1000, default 100" },
+                { "key": "offset", "value": "0" },
+                { "key": "email", "value": "", "description": "Filter by exact email (optional)" }
+              ]
+            },
+            "description": "List all users. Optional query filters: any column name = value (e.g. email=user@example.com). Use limit and offset for paging."
+          }
+        },
+        {
           "name": "Create User",
           "request": {
             "method": "POST",
@@ -254,6 +292,25 @@
     {
       "name": "Orders",
       "item": [
+        {
+          "name": "List Orders",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/orders?limit=100&offset=0",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "orders"],
+              "query": [
+                { "key": "limit", "value": "100" },
+                { "key": "offset", "value": "0" },
+                { "key": "status", "value": "pending", "description": "Filter by status (optional)" },
+                { "key": "user_id", "value": "{{user_id}}", "description": "Filter by user_id (optional)" }
+              ]
+            },
+            "description": "List all orders. Optional filters: status, user_id, etc. limit/offset for paging."
+          }
+        },
         {
           "name": "Create Order",
           "request": {

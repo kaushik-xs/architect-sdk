@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{delete, insert, select_by_id, update, PgBindValue, QueryBuf};
+use crate::sql::{delete, insert, select_by_id, select_list, update, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -10,6 +10,21 @@ use std::collections::HashMap;
 pub struct CrudService;
 
 impl CrudService {
+    /// List rows with optional filters (exact match), limit (default 100, max 1000), offset (default 0).
+    pub async fn list(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        filters: &[(String, Value)],
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Value>, AppError> {
+        const DEFAULT_LIMIT: u32 = 100;
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
+        let offset = offset.unwrap_or(0);
+        let q = select_list(entity, filters, Some(limit), Some(offset));
+        Self::query_many(pool, &q.sql, &q.params).await
+    }
+
     /// Fetch one row by primary key. Returns JSON object or None.
     pub async fn read(
         pool: &PgPool,
@@ -122,6 +137,19 @@ impl CrudService {
             .fetch_optional(pool)
             .await?;
         Ok(row.map(|r| row_to_json(&r)))
+    }
+
+    async fn query_many(
+        pool: &PgPool,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Value>, AppError> {
+        let mut query = sqlx::query(sql);
+        for p in params {
+            query = query.bind(Self::to_sqlx_param(p));
+        }
+        let rows = query.fetch_all(pool).await?;
+        Ok(rows.iter().map(row_to_json).collect())
     }
 
     async fn execute_returning_one(pool: &PgPool, q: &QueryBuf) -> Result<Option<Value>, AppError> {

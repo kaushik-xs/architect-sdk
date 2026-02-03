@@ -49,6 +49,58 @@ pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
     q
 }
 
+/// SELECT list with optional filters (exact match per column), ORDER BY pk, optional LIMIT/OFFSET.
+/// filters: only (col, value) where col is in entity.columns; params bound in filter order.
+pub fn select_list(
+    entity: &ResolvedEntity,
+    filters: &[(String, Value)],
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
+    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let cols: Vec<String> = entity.columns.iter().map(|c| quoted(&c.name)).collect();
+    let pk = &entity.pk_columns[0];
+
+    let mut where_parts = Vec::new();
+    for (col, val) in filters {
+        if col_names.contains(col.as_str()) {
+            let param_num = q.push_param(val.clone());
+            let ph = match entity.columns.iter().find(|c| c.name == *col) {
+                Some(c) => match c.pg_type.as_deref() {
+                    Some("timestamptz") | Some("timestamp") | Some("date") => {
+                        format!("${}::{}", param_num, c.pg_type.as_deref().unwrap())
+                    }
+                    _ => format!("${}", param_num),
+                },
+                None => format!("${}", param_num),
+            };
+            where_parts.push(format!("{} = {}", quoted(col), ph));
+        }
+    }
+
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    let order_clause = format!(" ORDER BY {}", quoted(pk));
+    let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
+    let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
+
+    q.sql = format!(
+        "SELECT {} FROM {}{}{}{}{}",
+        cols.join(", "),
+        table,
+        where_clause,
+        order_clause,
+        limit_clause,
+        offset_clause
+    );
+    q
+}
+
 /// INSERT: columns and placeholders from entity; values from body. Excludes PK if has_default.
 /// Omits columns with DB default when body does not provide a value (so DB uses default).
 /// Uses SQL cast (e.g. $n::timestamptz) for timestamp columns so string values bind correctly.

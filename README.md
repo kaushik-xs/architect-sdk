@@ -45,17 +45,21 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
        .nest("/api/v1", entity_routes(state));
    ```
 
-3. Run the example server (loads from `sample/` by default, or set `CONFIG_PATH` and `DATABASE_URL`):
+3. Run the example server. The server loads `.env` at startup. `PLUGIN_PATH` is optional:
+   - If set: config is loaded from that plugin directory (must contain `manifest.json` + config JSONs, e.g. `sample`) and migrations are applied.
+   - If not set: only _private_* tables are ensured; config is loaded from the DB (empty until you POST config via `/api/v1/config/...` or install a plugin via `POST /api/v1/config/plugin`).
 
    ```bash
+   cp .env.example .env
+   # Optionally set PLUGIN_PATH=sample to load from sample/ (manifest.json + config JSONs)
    cargo run --example server
    ```
 
 ## API overview
 
 - **Common**: `GET /health`, `GET /ready`, `GET /version`, `GET /info`
-- **Config**: `POST /api/v1/config/schemas`, `GET /api/v1/config/schemas`, and same for `enums`, `tables`, `columns`, `indexes`, `relationships`, `api_entities`
-- **Entities**: For each entity (e.g. `users`): `POST /api/v1/users`, `GET /api/v1/users/:id`, `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`
+- **Config**: `POST /api/v1/config/plugin` (multipart zip: manifest.json + config JSONs), then `POST`/`GET` per kind: `schemas`, `enums`, `tables`, `columns`, `indexes`, `relationships`, `api_entities`
+- **Entities**: For each entity (e.g. `users`): `GET /api/v1/users` (list all, optional filters: `?col=value`, `?limit=100`, `?offset=0`), `POST /api/v1/users`, `GET /api/v1/users/:id`, `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`
 
 ## License
 
