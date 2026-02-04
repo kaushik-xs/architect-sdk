@@ -1,7 +1,7 @@
 //! Resolved entity model: config validated and flattened for runtime use.
 
 use crate::config::ValidationRule;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Primary key type for parsing path/body ids.
 #[derive(Clone, Debug)]
@@ -33,6 +33,8 @@ pub struct ResolvedEntity {
     pub pk_type: PkType,
     pub columns: Vec<ColumnInfo>,
     pub operations: Vec<String>,
+    /// Column names to strip from all API responses (sensitive data).
+    pub sensitive_columns: HashSet<String>,
     pub validation: HashMap<String, ValidationRule>,
 }
 

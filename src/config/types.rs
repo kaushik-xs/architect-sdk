@@ -158,6 +158,9 @@ pub struct ApiEntityConfig {
     pub entity_id: String,
     pub path_segment: String,
     pub operations: Vec<String>,
+    /// Column names that must never be exposed in API responses (e.g. password hashes, secrets).
+    #[serde(default)]
+    pub sensitive_columns: Vec<String>,
     #[serde(default)]
     pub validation: std::collections::HashMap<String, ValidationRule>,
 }

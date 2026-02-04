@@ -90,6 +90,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             }
         }
 
+        let sensitive_columns: HashSet<String> = api.sensitive_columns.iter().cloned().collect();
         let entity = ResolvedEntity {
             table_id: table.id.clone(),
             schema_name: schema.name.clone(),
@@ -99,6 +100,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             pk_type: pk_type.clone(),
             columns: columns,
             operations: api.operations.clone(),
+            sensitive_columns,
             validation: api.validation.clone(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());

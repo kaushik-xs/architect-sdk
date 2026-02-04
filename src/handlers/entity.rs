@@ -9,7 +9,17 @@ use axum::{
     Json,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Remove sensitive column keys from a row object. No-op if sensitive_columns is empty.
+fn strip_sensitive_columns(row: &mut Value, sensitive_columns: &HashSet<String>) {
+    if sensitive_columns.is_empty() {
+        return;
+    }
+    if let Value::Object(map) = row {
+        map.retain(|k, _| !sensitive_columns.contains(k));
+    }
+}
 
 fn parse_id(id_str: &str, pk_type: &PkType) -> Result<Value, AppError> {
     Ok(match pk_type {
@@ -111,7 +121,10 @@ pub async fn list(
         }
     }
 
-    let rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
+    let mut rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+    }
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::OK,
@@ -133,7 +146,8 @@ pub async fn create(
     }
     let body = body_to_map(body)?;
     RequestValidator::validate(&body, &entity.validation)?;
-    let row = CrudService::create(&state.pool, &entity, &body).await?;
+    let mut row = CrudService::create(&state.pool, &entity, &body).await?;
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -146,8 +160,9 @@ pub async fn read(
         return Err(AppError::BadRequest("read not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let row = CrudService::read(&state.pool, &entity, &id).await?
+    let mut row = CrudService::read(&state.pool, &entity, &id).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -163,8 +178,9 @@ pub async fn update(
     let id = parse_id(&id_str, &entity.pk_type)?;
     let body = body_to_map(body)?;
     RequestValidator::validate(&body, &entity.validation)?;
-    let row = CrudService::update(&state.pool, &entity, &id, &body).await?
+    let mut row = CrudService::update(&state.pool, &entity, &id, &body).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -203,7 +219,10 @@ pub async fn bulk_create(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let rows = CrudService::bulk_create(&state.pool, &entity, &items).await?;
+    let mut rows = CrudService::bulk_create(&state.pool, &entity, &items).await?;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+    }
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::CREATED,
@@ -236,7 +255,10 @@ pub async fn bulk_update(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let rows = CrudService::bulk_update(&state.pool, &entity, &items).await?;
+    let mut rows = CrudService::bulk_update(&state.pool, &entity, &items).await?;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+    }
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::OK,

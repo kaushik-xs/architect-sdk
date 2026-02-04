@@ -16,7 +16,7 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
 
 - Reuses the [Postgres config schema](docs/postgres-config-schema.md) (schemas, enums, tables, columns, indexes, relationships).
 - The **manifest** (e.g. [sample/manifest.json](sample/manifest.json)) must include **schema** (the PostgreSQL schema name, e.g. `"public"`). All configs (enums, tables, indexes, relationships) use this schema; no separate schemas table or `schema_id` in each config.
-- Add an **api_entities** config: `entity_id`, `path_segment`, `operations`, `validation` (per-column rules). See [sample/api_entities.json](sample/api_entities.json).
+- Add an **api_entities** config: `entity_id`, `path_segment`, `operations`, `sensitive_columns` (column names never exposed in responses), `validation` (per-column rules). See [sample/api_entities.json](sample/api_entities.json).
 
 ## Quick start
 
