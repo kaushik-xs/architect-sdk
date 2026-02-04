@@ -48,7 +48,7 @@
     "id": "col_orders_status",
     "table_id": "tbl_orders",
     "name": "status",
-    "type": "public.order_status",
+    "type": "sample.order_status",
     "nullable": false,
     "default": "'pending'",
     "comment": null

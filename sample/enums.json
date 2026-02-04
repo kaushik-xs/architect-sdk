@@ -1,7 +1,6 @@
 [
   {
     "id": "enum_order_status",
-    "schema_id": "sch_public",
     "name": "order_status",
     "values": ["pending", "confirmed", "shipped", "cancelled"],
     "comment": "Order lifecycle status"

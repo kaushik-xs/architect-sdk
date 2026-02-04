@@ -1,7 +1,6 @@
 [
   {
     "id": "tbl_users",
-    "schema_id": "sch_public",
     "name": "users",
     "comment": "User accounts",
     "primary_key": "id",
@@ -10,7 +9,6 @@
   },
   {
     "id": "tbl_orders",
-    "schema_id": "sch_public",
     "name": "orders",
     "comment": "Customer orders",
     "primary_key": "id",

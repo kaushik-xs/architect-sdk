@@ -13,7 +13,8 @@ pub struct SchemaConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnumConfig {
     pub id: String,
-    pub schema_id: String,
+    #[serde(default)]
+    pub schema_id: Option<String>,
     pub name: String,
     pub values: Vec<String>,
     #[serde(default)]
@@ -36,7 +37,8 @@ pub enum PrimaryKeyConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TableConfig {
     pub id: String,
-    pub schema_id: String,
+    #[serde(default)]
+    pub schema_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub comment: Option<String>,
@@ -91,7 +93,8 @@ pub enum IndexColumnEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexConfig {
     pub id: String,
-    pub schema_id: String,
+    #[serde(default)]
+    pub schema_id: Option<String>,
     pub table_id: String,
     pub name: String,
     #[serde(default)]

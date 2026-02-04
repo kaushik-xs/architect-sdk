@@ -1,5 +1,6 @@
-//! Plugin install handler: accept zip upload, extract manifest + configs, apply configs and store manifest.
+//! Plugin install handler: accept zip upload, extract manifest + configs, apply configs, store manifest, and reload model so new entities are available without restart.
 
+use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::handlers::config::replace_config;
 use crate::state::AppState;
@@ -20,7 +21,33 @@ const CONFIG_ORDER: &[&str] = &[
     "api_entities",
 ];
 
+/// Schema id used when manifest provides the schema name (no separate schemas.json).
+const DEFAULT_SCHEMA_ID: &str = "default";
+
 const DEFAULT_EMPTY_JSON: &str = "[]";
+
+fn inject_schema_id(body: &mut [Value], schema_id: &str) {
+    for rec in body.iter_mut() {
+        if let Some(obj) = rec.as_object_mut() {
+            if !obj.contains_key("schema_id") {
+                obj.insert("schema_id".into(), Value::String(schema_id.to_string()));
+            }
+        }
+    }
+}
+
+fn inject_relationship_schema_ids(body: &mut [Value], schema_id: &str) {
+    for rec in body.iter_mut() {
+        if let Some(obj) = rec.as_object_mut() {
+            if !obj.contains_key("from_schema_id") {
+                obj.insert("from_schema_id".into(), Value::String(schema_id.to_string()));
+            }
+            if !obj.contains_key("to_schema_id") {
+                obj.insert("to_schema_id".into(), Value::String(schema_id.to_string()));
+            }
+        }
+    }
+}
 
 fn read_zip_entry_to_string<R: std::io::Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
@@ -77,22 +104,49 @@ pub async fn install_plugin(
         .get("version")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest must have 'version' (string)".into()))?;
+    let schema_name = manifest_obj
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("manifest must have 'schema' (string) - the schema name for all configs".into()))?;
+
+    let schemas_body = vec![serde_json::json!({
+        "id": DEFAULT_SCHEMA_ID,
+        "name": schema_name
+    })];
 
     let mut applied = Vec::with_capacity(CONFIG_ORDER.len());
     for kind in CONFIG_ORDER {
-        let file_name = format!("{}.json", kind);
-        let file_name_with_slash = format!("{}/{}", kind, file_name);
-        let content = read_zip_entry_to_string(&mut archive, &file_name)
-            .or_else(|_| read_zip_entry_to_string(&mut archive, &file_name_with_slash))
-            .unwrap_or_else(|_| DEFAULT_EMPTY_JSON.to_string());
+        let body: Vec<Value> = if *kind == "schemas" {
+            serde_json::from_value(Value::Array(schemas_body.clone()))
+                .map_err(|e| AppError::BadRequest(format!("schemas body: {}", e)))?
+        } else {
+            let file_name = format!("{}.json", kind);
+            let file_name_with_slash = format!("{}/{}", kind, file_name);
+            let content = read_zip_entry_to_string(&mut archive, &file_name)
+                .or_else(|_| read_zip_entry_to_string(&mut archive, &file_name_with_slash))
+                .unwrap_or_else(|_| DEFAULT_EMPTY_JSON.to_string());
 
-        let body: Vec<Value> = serde_json::from_str(&content)
-            .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", file_name, e)))?;
+            let mut body: Vec<Value> = serde_json::from_str(&content)
+                .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", file_name, e)))?;
+            match *kind {
+                "enums" | "tables" | "indexes" => inject_schema_id(&mut body, DEFAULT_SCHEMA_ID),
+                "relationships" => inject_relationship_schema_ids(&mut body, DEFAULT_SCHEMA_ID),
+                _ => {}
+            }
+            body
+        };
         replace_config(&state.pool, kind, body).await?;
         applied.push(kind.to_string());
     }
 
     upsert_plugin(&state.pool, id, &manifest_value).await?;
+
+    let config = load_from_pool(&state.pool).await.map_err(AppError::Config)?;
+    let new_model = resolve(&config).map_err(AppError::Config)?;
+    {
+        let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        *guard = new_model;
+    }
 
     #[derive(serde::Serialize)]
     struct PluginInstallResponse {

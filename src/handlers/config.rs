@@ -1,20 +1,21 @@
 //! Config ingestion handlers: POST/GET for each config type.
 
-use crate::config::load_from_pool;
+use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
-use crate::store::{private_table_for_kind, replace_config_rows};
+use crate::store::{private_table_for_kind, qualified_private_table, replace_config_rows};
 use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
 use sqlx::PgPool;
 
+/// Replace config for one kind. Returns (body, num_rows_written). When num_rows_written > 0, migrations are run.
 pub(crate) async fn replace_config(
     pool: &PgPool,
     kind: &str,
     body: Vec<Value>,
-) -> Result<Vec<Value>, AppError> {
+) -> Result<(Vec<Value>, u64), AppError> {
     let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
     let (count, _version) = replace_config_rows(&mut tx, table, &body).await?;
@@ -23,12 +24,22 @@ pub(crate) async fn replace_config(
         let config = load_from_pool(pool).await.map_err(AppError::Config)?;
         apply_migrations(pool, &config).await?;
     }
-    Ok(body)
+    Ok((body, count))
+}
+
+/// Reload in-memory model from DB so new/updated entities are available without restart.
+pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
+    let config = load_from_pool(&state.pool).await.map_err(AppError::Config)?;
+    let new_model = resolve(&config).map_err(AppError::Config)?;
+    let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+    *guard = new_model;
+    Ok(())
 }
 
 async fn get_config(pool: &PgPool, kind: &str) -> Result<Vec<Value>, AppError> {
     let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
-    let rows = sqlx::query_scalar::<_, Value>(&format!("SELECT payload FROM {} ORDER BY id", table))
+    let q_table = qualified_private_table(table);
+    let rows = sqlx::query_scalar::<_, Value>(&format!("SELECT payload FROM {} ORDER BY id", q_table))
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -40,7 +51,10 @@ macro_rules! config_handler {
             State(state): State<AppState>,
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
-            let out = replace_config(&state.pool, $kind, body).await?;
+            let (out, num_written) = replace_config(&state.pool, $kind, body).await?;
+            if num_written > 0 {
+                reload_model(&state).await?;
+            }
             let count = out.len() as u64;
             Ok((
                 axum::http::StatusCode::OK,

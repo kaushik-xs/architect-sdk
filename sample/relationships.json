@@ -1,10 +1,10 @@
 [
   {
     "id": "rel_orders_user",
-    "from_schema_id": "sch_public",
+    "from_schema_id": "default",
     "from_table_id": "tbl_orders",
     "from_column_id": "col_orders_user_id",
-    "to_schema_id": "sch_public",
+    "to_schema_id": "default",
     "to_table_id": "tbl_users",
     "to_column_id": "col_users_id",
     "on_update": "CASCADE",

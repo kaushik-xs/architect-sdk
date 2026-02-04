@@ -15,6 +15,11 @@ fn quote(s: &str) -> String {
 /// Validates config first. Idempotent for schemas and types (IF NOT EXISTS); tables are CREATE TABLE only (fails if exists).
 pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), AppError> {
     validate(config)?;
+    let default_sid = config
+        .schemas
+        .first()
+        .map(|s| s.id.as_str())
+        .ok_or_else(|| AppError::Config(crate::error::ConfigError::Validation("at least one schema required".into())))?;
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
@@ -41,11 +46,12 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
     }
 
     for e in &config.enums {
+        let sid = e.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id
-            .get(e.schema_id.as_str())
+            .get(sid)
             .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
-                id: e.schema_id.clone(),
+                id: sid.to_string(),
             }))?;
         let schema_name = quote(&schema.name);
         let type_name = quote(&e.name);
@@ -60,11 +66,12 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
     }
 
     for t in &config.tables {
+        let sid = t.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id
-            .get(t.schema_id.as_str())
+            .get(sid)
             .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
-                id: t.schema_id.clone(),
+                id: sid.to_string(),
             }))?;
         let schema_name = quote(&schema.name);
         let table_name = quote(&t.name);
@@ -130,10 +137,11 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
     }
 
     for idx in &config.indexes {
-        let schema = schemas_by_id.get(idx.schema_id.as_str()).ok_or_else(|| {
+        let sid = idx.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
-                id: idx.schema_id.clone(),
+                id: sid.to_string(),
             })
         })?;
         let table = tables_by_id.get(idx.table_id.as_str()).ok_or_else(|| {
@@ -189,10 +197,12 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
     }
 
     for rel in &config.relationships {
-        let from_schema = schemas_by_id.get(rel.from_schema_id.as_str()).ok_or_else(|| {
+        let from_sid = rel.from_schema_id.as_str();
+        let to_sid = rel.to_schema_id.as_str();
+        let from_schema = schemas_by_id.get(from_sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
-                id: rel.from_schema_id.clone(),
+                id: from_sid.to_string(),
             })
         })?;
         let from_table = tables_by_id.get(rel.from_table_id.as_str()).ok_or_else(|| {
@@ -201,10 +211,10 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
                 id: rel.from_table_id.clone(),
             })
         })?;
-        let to_schema = schemas_by_id.get(rel.to_schema_id.as_str()).ok_or_else(|| {
+        let to_schema = schemas_by_id.get(to_sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
-                id: rel.to_schema_id.clone(),
+                id: to_sid.to_string(),
             })
         })?;
         let to_table = tables_by_id.get(rel.to_table_id.as_str()).ok_or_else(|| {

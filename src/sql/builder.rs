@@ -35,14 +35,13 @@ impl QueryBuf {
 }
 
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
+/// Uses SELECT * so all table columns are returned.
 pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let cols: Vec<String> = entity.columns.iter().map(|c| quoted(&c.name)).collect();
     let table = qualified_table(&entity.schema_name, &entity.table_name);
     let pk = &entity.pk_columns[0];
     q.sql = format!(
-        "SELECT {} FROM {} WHERE {} = $1",
-        cols.join(", "),
+        "SELECT * FROM {} WHERE {} = $1",
         table,
         quoted(pk)
     );
@@ -60,7 +59,6 @@ pub fn select_list(
     let mut q = QueryBuf::new();
     let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
     let table = qualified_table(&entity.schema_name, &entity.table_name);
-    let cols: Vec<String> = entity.columns.iter().map(|c| quoted(&c.name)).collect();
     let pk = &entity.pk_columns[0];
 
     let mut where_parts = Vec::new();
@@ -90,8 +88,7 @@ pub fn select_list(
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
 
     q.sql = format!(
-        "SELECT {} FROM {}{}{}{}{}",
-        cols.join(", "),
+        "SELECT * FROM {}{}{}{}{}",
         table,
         where_clause,
         order_clause,

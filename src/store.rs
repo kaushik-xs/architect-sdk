@@ -1,10 +1,17 @@
-//! _private_* table DDL and config persistence.
+//! _private_* table DDL and config persistence. All _private_* tables live in the `architect` schema.
 
 use crate::error::AppError;
 use sqlx::ConnectOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::str::FromStr;
+
+pub const ARCHITECT_SCHEMA: &str = "architect";
+
+/// Returns schema-qualified table name for _private_* tables (e.g. "architect._private_schemas").
+pub fn qualified_private_table(table: &str) -> String {
+    format!("{}.{}", ARCHITECT_SCHEMA, table)
+}
 
 const PRIVATE_TABLES: &[&str] = &[
     "_private_schemas",
@@ -17,10 +24,15 @@ const PRIVATE_TABLES: &[&str] = &[
     "_private_plugins",
 ];
 
-/// Create _private_* tables (with version) and _private_*_history tables if they do not exist.
+/// Create `architect` schema if not exists, then _private_* tables (with version) and _private_*_history tables inside it.
 /// If tables already exist without a version column, adds it (PostgreSQL 11+).
 pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", ARCHITECT_SCHEMA))
+        .execute(pool)
+        .await?;
+
     for table in PRIVATE_TABLES {
+        let q_table = qualified_private_table(table);
         let ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -30,17 +42,16 @@ pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
                 version BIGINT NOT NULL DEFAULT 1
             )
             "#,
-            table
+            q_table
         );
         sqlx::query(&ddl).execute(pool).await?;
-        // Add version column if table existed from an older run (idempotent on PG 11+)
         let alter = format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1",
-            table
+            q_table
         );
         let _ = sqlx::query(&alter).execute(pool).await;
 
-        let history_table = format!("{}_history", table);
+        let history_table = qualified_private_table(&format!("{}_history", table));
         let history_ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -100,9 +111,10 @@ pub async fn replace_config_rows(
     table: &str,
     records: &[serde_json::Value],
 ) -> Result<(u64, i64), AppError> {
+    let q_table = qualified_private_table(table);
     let current_version: (Option<i64>,) = sqlx::query_as(&format!(
         "SELECT COALESCE(MAX(version), 0) FROM {}",
-        table
+        q_table
     ))
     .fetch_one(&mut *tx)
     .await
@@ -111,7 +123,7 @@ pub async fn replace_config_rows(
 
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(&format!(
         "SELECT id, payload FROM {}",
-        table
+        q_table
     ))
     .fetch_all(&mut *tx)
     .await
@@ -122,17 +134,17 @@ pub async fn replace_config_rows(
         return Ok((0, current_version));
     }
 
-    let history_table = format!("{}_history", table);
+    let history_table = qualified_private_table(&format!("{}_history", table));
     let new_version = current_version + 1;
 
     sqlx::query(&format!(
         "INSERT INTO {} (id, payload, version, created_at) SELECT id, payload, version, updated_at FROM {}",
-        history_table, table
+        history_table, q_table
     ))
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!("DELETE FROM {}", table))
+    sqlx::query(&format!("DELETE FROM {}", q_table))
         .execute(&mut *tx)
         .await?;
 
@@ -141,7 +153,7 @@ pub async fn replace_config_rows(
         let id = config_record_id(table, rec)?;
         sqlx::query(&format!(
             "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
-            table
+            q_table
         ))
         .bind(id)
         .bind(rec)
@@ -162,10 +174,12 @@ pub async fn upsert_plugin(
     id: &str,
     payload: &serde_json::Value,
 ) -> Result<i64, AppError> {
+    let q_plugins = qualified_private_table(PLUGINS_TABLE);
+    let q_plugins_history = qualified_private_table(PLUGINS_HISTORY_TABLE);
     let mut tx = pool.begin().await?;
     let current: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
         "SELECT payload, version FROM {} WHERE id = $1",
-        PLUGINS_TABLE
+        q_plugins
     ))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -180,7 +194,7 @@ pub async fn upsert_plugin(
     if let Some((old_payload, old_version)) = current {
         sqlx::query(&format!(
             "INSERT INTO {} (id, payload, version, created_at) VALUES ($1, $2, $3, NOW())",
-            PLUGINS_HISTORY_TABLE
+            q_plugins_history
         ))
         .bind(id)
         .bind(old_payload)
@@ -191,7 +205,7 @@ pub async fn upsert_plugin(
 
     sqlx::query(&format!(
         "DELETE FROM {} WHERE id = $1",
-        PLUGINS_TABLE
+        q_plugins
     ))
     .bind(id)
     .execute(&mut *tx)
@@ -199,7 +213,7 @@ pub async fn upsert_plugin(
 
     sqlx::query(&format!(
         "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
-        PLUGINS_TABLE
+        q_plugins
     ))
     .bind(id)
     .bind(payload)

@@ -1,30 +1,34 @@
 # PostgreSQL config schema: structure and usage
 
-This document describes the JSON/config format used to define and manage a PostgreSQL database declaratively. Configs are split by entity type (schemas, enums, tables, columns, indexes, relationships) and can be stored in separate database tables or separate JSON files.
+This document describes the JSON/config format used to define and manage a PostgreSQL database declaratively. Configs are split by entity type (enums, tables, columns, indexes, relationships) and can be stored in separate database tables or separate JSON files.
 
 ---
 
 ## 1. How the structure is organized
 
+### Schema from manifest (no separate schema table required)
+
+The **schema name** (PostgreSQL namespace, e.g. `public` or `sample`) is defined in the **plugin manifest**, not in a separate schemas config. The manifest must include a `schema` field (string). That schema is used for all configs (enums, tables, indexes, relationships); you do **not** need to point to the schema in each config. When loading from a plugin directory or installing a plugin zip, the runtime builds a single schema (id `"default"`, name = `manifest.schema`) and injects it so that enums, tables, and indexes can omit `schema_id`. Relationships require `from_schema_id` and `to_schema_id` (the plugin installer may inject these when uploading a zip). A separate `schemas.json` or schemas table is not required for plugin-based config.
+
 ### Separate configs per entity
 
-The database definition is **not** a single nested JSON document. Instead, there are six config types, each with its own structure and storage:
+The database definition is **not** a single nested JSON document. Instead, there are config types, each with its own structure and storage:
 
-| Config       | Purpose                    | References others by        |
-| ------------ | -------------------------- | --------------------------- |
-| `schemas`    | PostgreSQL schema (namespace) | —                           |
-| `enums`      | Custom enum types          | `schema_id`                 |
-| `tables`     | Table definitions          | `schema_id`                 |
-| `columns`    | Column definitions         | `table_id`                  |
-| `indexes`    | Index definitions          | `schema_id`, `table_id`     |
-| `relationships` | Foreign key definitions | `from_*` / `to_*` ids       |
+| Config         | Purpose                      | References others by                    |
+| --------------- | ---------------------------- | --------------------------------------- |
+| `schemas`       | (Optional) PostgreSQL schema; when using manifest, one schema is derived from `manifest.schema` | — |
+| `enums`         | Custom enum types            | `schema_id` (optional if manifest defines schema) |
+| `tables`        | Table definitions            | `schema_id` (optional if manifest defines schema) |
+| `columns`       | Column definitions           | `table_id`                              |
+| `indexes`       | Index definitions            | `schema_id` (optional), `table_id`      |
+| `relationships` | Foreign key definitions     | `from_schema_id`, `to_schema_id`, `from_*` / `to_*` ids |
 
-Each config is an **array of records**. One record = one schema, one enum, one table, one column, one index, or one foreign key.
+Each config is an **array of records**. One record = one enum, one table, one column, one index, or one foreign key.
 
 ### Storage: table vs file
 
-- **Database tables**: You can store each config type in its own table (e.g. `db_config_schemas`, `db_config_tables`). Each row is one record; complex fields (e.g. `columns` in an index, `check` on a table) can be JSON/JSONB columns.
-- **JSON files**: You can use one JSON file per config type. Each file contains a single JSON array of records. Example layout: `sample/schemas.json`, `sample/tables.json`, etc.
+- **Database tables**: You can store each config type in its own table (e.g. `_private_tables`). Each row is one record; complex fields can be JSON/JSONB columns.
+- **JSON files (plugin)**: Use one JSON file per config type inside a plugin directory or zip. The directory must contain `manifest.json` (with `schema`). Example layout: `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, `api_entities.json`. No `schemas.json` is required.
 
 The record shape is the same in both cases; only the storage medium changes.
 
@@ -40,7 +44,7 @@ The record shape is the same in both cases; only the storage medium changes.
 
 ### 2.1 Schemas
 
-Defines a PostgreSQL schema (namespace).
+When using a **manifest**, you do **not** need a separate schemas config. The manifest’s `schema` field (e.g. `"public"` or `"sample"`) is the PostgreSQL schema name; the runtime creates a single schema (id `"default"`, name = manifest’s `schema`) and uses it for all configs. When loading from the database (no plugin path), the `schemas` config can still be used to define one or more schemas.
 
 | Field     | Type   | Description                |
 | --------- | ------ | -------------------------- |
@@ -64,20 +68,20 @@ No references to other configs.
 
 Defines a custom enum type in a schema.
 
-| Field       | Type   | Description                      |
-| ----------- | ------ | -------------------------------- |
-| `id`        | string | Unique id                        |
-| `schema_id` | string | FK to `schemas.id`               |
-| `name`      | string | Enum type name                   |
-| `values`    | array  | Ordered list of labels (strings) |
-| `comment`   | string | Optional COMMENT                 |
+| Field       | Type    | Description                      |
+| ----------- | ------- | -------------------------------- |
+| `id`        | string  | Unique id                        |
+| `schema_id` | string? | FK to `schemas.id`; **optional** when manifest defines schema (default used) |
+| `name`      | string  | Enum type name                   |
+| `values`    | array   | Ordered list of labels (strings) |
+| `comment`   | string  | Optional COMMENT                 |
 
 **Allowed values**
 
 | Key         | Allowed / format                                      | Required |
 | ----------- | ------------------------------------------------------ | -------- |
 | `id`        | Non-empty string; unique across all enum records       | Yes      |
-| `schema_id` | Must equal `id` of a record in `schemas`               | Yes      |
+| `schema_id` | If present, must equal `id` of a record in `schemas`; if omitted, manifest schema (id `"default"`) is used | No (when using manifest) |
 | `name`      | Valid PostgreSQL identifier for the type name          | Yes      |
 | `values`    | Array of non-empty strings; order is significant       | Yes      |
 | `comment`   | Any string; omit or `null` if none                     | No       |
@@ -93,7 +97,7 @@ Defines a table in a schema. Column definitions live in the `columns` config; ta
 | Field         | Type            | Description                                                                 |
 | ------------- | --------------- | --------------------------------------------------------------------------- |
 | `id`          | string          | Unique id                                                                  |
-| `schema_id`   | string          | FK to `schemas.id`                                                         |
+| `schema_id`   | string?         | FK to `schemas.id`; **optional** when manifest defines schema (default used) |
 | `name`        | string          | Table name                                                                 |
 | `comment`     | string          | Optional COMMENT                                                            |
 | `primary_key` | string or array | Column name(s) for PRIMARY KEY (single or composite)                      |
@@ -105,7 +109,7 @@ Defines a table in a schema. Column definitions live in the `columns` config; ta
 | Key           | Allowed / format                                                    | Required |
 | ------------- | ------------------------------------------------------------------- | -------- |
 | `id`          | Non-empty string; unique across all table records                   | Yes      |
-| `schema_id`   | Must equal `id` of a record in `schemas`                            | Yes      |
+| `schema_id`   | If present, must equal `id` of a record in `schemas`; if omitted, manifest schema is used | No (when using manifest) |
 | `name`        | Valid PostgreSQL identifier for the table name                      | Yes      |
 | `comment`     | Any string; omit or `null` if none                                  | No       |
 | `primary_key` | String (single column name) or array of strings (composite); each must match a column `name` in `columns` for this table | Yes |
@@ -185,7 +189,7 @@ Defines an index on a table. References both schema and table.
 | Field       | Type    | Description                                                |
 | ----------- | ------- | ---------------------------------------------------------- |
 | `id`        | string  | Unique id                                                  |
-| `schema_id` | string  | FK to `schemas.id`                                         |
+| `schema_id` | string? | FK to `schemas.id`; **optional** when manifest defines schema |
 | `table_id`  | string  | FK to `tables.id`                                          |
 | `name`      | string  | Index name (unique per schema)                             |
 | `method`    | string  | Index method (see allowed values)                         |
@@ -200,7 +204,7 @@ Defines an index on a table. References both schema and table.
 | Key         | Allowed / format                                                                 | Required |
 | ----------- | -------------------------------------------------------------------------------- | -------- |
 | `id`        | Non-empty string; unique across all index records                               | Yes      |
-| `schema_id` | Must equal `id` of a record in `schemas`                                        | Yes      |
+| `schema_id` | If present, must equal `id` of a record in `schemas`; if omitted, manifest schema is used | No (when using manifest) |
 | `table_id`  | Must equal `id` of a record in `tables`                                          | Yes      |
 | `name`      | Valid PostgreSQL identifier; unique within the schema                            | Yes      |
 | `method`    | One of: `btree`, `hash`, `gin`, `gist`, `brin`, `spgist`; default `btree`        | No       |
@@ -265,11 +269,11 @@ Defines a foreign key: one column references another table’s column. Stored se
 
 Configs depend on each other as follows:
 
-1. **schemas** — no dependencies.
-2. **enums**, **tables** — depend on `schemas` (via `schema_id`).
+1. **schemas** — no dependencies (when using manifest, one schema is derived from `manifest.schema`).
+2. **enums**, **tables** — depend on `schemas` (via optional `schema_id`; default from manifest).
 3. **columns** — depend on `tables` (via `table_id`).
-4. **indexes** — depend on `schemas` and `tables` (`schema_id`, `table_id`).
-5. **relationships** — depend on `schemas`, `tables`, and `columns` (from_* and to_*).
+4. **indexes** — depend on `schemas` and `tables` (optional `schema_id`, `table_id`).
+5. **relationships** — depend on `schemas`, `tables`, and `columns` (required `from_schema_id`, `to_schema_id`, and from/to table/column ids).
 
 Recommended load order when reading from files or DB:
 
@@ -282,16 +286,16 @@ This order ensures that when you resolve references (e.g. look up a table by `ta
 
 ### 3.2 Resolving references
 
-- **By id**: For each record that has a `*_id` field, look up the referenced record in the corresponding config (e.g. `schema_id` → find in `schemas` by `id`). Use a map from id to record for O(1) lookup.
+- **By id**: For each record that has a `*_id` field, look up the referenced record in the corresponding config (e.g. `schema_id` → find in `schemas` by `id`; if `schema_id` is omitted, use the default schema from the manifest). Use a map from id to record for O(1) lookup.
 - **By name (optional)**: If you support natural keys, you can resolve e.g. `(schema_name, table_name)` to a table by scanning the `tables` array and matching names; for production, build indexes or maps keyed by (schema_name, table_name) after loading.
 
-All references (schema_id, table_id, from_*_id, to_*_id) must point to existing ids in the corresponding config; otherwise the dataset is invalid.
+All references (schema_id when present, table_id, from_*_id, to_*_id) must point to existing ids in the corresponding config; otherwise the dataset is invalid.
 
 ### 3.3 Validation (referential integrity)
 
 Before generating DDL or using the config as a single logical model, validate:
 
-- Every `schema_id` in `enums`, `tables`, `indexes`, and `relationships` exists in `schemas.id`.
+- Every `schema_id` in enums, tables, and indexes when present must exist in `schemas.id` (when omitted, default from manifest is used). Every `from_schema_id` and `to_schema_id` in relationships must exist in `schemas.id`.
 - Every `table_id` in `columns` and `indexes` exists in `tables.id`.
 - Every `from_column_id` and `to_column_id` in `relationships` exists in `columns.id`.
 - Every column name used in a table’s `primary_key` or `unique` exists among that table’s columns (in `columns` filtered by `table_id`).
@@ -336,19 +340,20 @@ If you create FKs before indexes or tables exist, or create tables that referenc
 
 A minimal but complete example lives under **`sample/`** in this repo:
 
-- `sample/schemas.json`
+- `sample/manifest.json` — includes `schema` (e.g. `"sample"`), the single PostgreSQL schema name used by all configs; no separate `schemas.json` is required.
 - `sample/enums.json`
 - `sample/tables.json`
 - `sample/columns.json`
 - `sample/indexes.json`
 - `sample/relationships.json`
+- `sample/api_entities.json`
 
-It defines one schema (`public`), one enum (`order_status`), two tables (`users`, `orders`), columns for both, two indexes, and one foreign key from `orders.user_id` to `users.id`. All ids are consistent across files so you can trace every reference.
+The manifest’s `schema` defines the namespace; enums, tables, indexes, and relationships do not need to set `schema_id` (they use the default). The sample defines one enum (`order_status`), two tables (`users`, `orders`), columns for both, two indexes, and one foreign key from `orders.user_id` to `users.id`. All ids are consistent across files so you can trace every reference.
 
 ### 4.2 One full chain (schema → table → columns → relationship → index)
 
-1. **Schema** `sch_public` in `schemas.json`: name `public`.
-2. **Table** `tbl_orders` in `tables.json`: `schema_id: "sch_public"`, name `orders`, primary_key `id`.
+1. **Schema** from `manifest.json`: `"schema": "sample"` (runtime creates schema id `"default"` with this name).
+2. **Table** `tbl_orders` in `tables.json`: no `schema_id` needed (default schema used), name `orders`, primary_key `id`.
 3. **Columns** in `columns.json`: e.g. `col_orders_id` (table_id `tbl_orders`, name `id`, type `bigserial`), `col_orders_user_id` (table_id `tbl_orders`, name `user_id`, type `uuid`).
 4. **Relationship** `rel_orders_user` in `relationships.json`: from `tbl_orders.col_orders_user_id` to `tbl_users.col_users_id`, ON DELETE CASCADE.
 5. **Index** `idx_orders_user_created` in `indexes.json`: table_id `tbl_orders`, columns `user_id` asc, `created_at` desc.
@@ -361,14 +366,14 @@ Together, these configs describe a table `public.orders` with a FK to `public.us
 
 | Concern       | Config          | Key references                          |
 | ------------- | --------------- | --------------------------------------- |
-| Schemas       | `schemas`       | —                                       |
-| Enums         | `enums`         | `schema_id`                             |
-| Tables        | `tables`        | `schema_id`                             |
+| Schema        | `manifest.schema` or `schemas` | — (manifest defines schema name; no separate schema table required) |
+| Enums         | `enums`         | `schema_id` (optional when using manifest) |
+| Tables        | `tables`        | `schema_id` (optional when using manifest) |
 | Columns       | `columns`       | `table_id`                              |
-| Indexes       | `indexes`       | `schema_id`, `table_id`                 |
-| Relationships | `relationships` | `from_*` / `to_*` schema/table/column ids |
+| Indexes       | `indexes`       | `schema_id` (optional), `table_id`      |
+| Relationships | `relationships` | `from_schema_id`, `to_schema_id` (required), `from_*` / `to_*` ids |
 
-Configs are **independent** and **stored separately** (tables or files). Use **stable ids** and **reference by id**; validate referential integrity; load in dependency order; generate DDL in the order schemas → enums → tables → indexes → FKs. The sample in `sample/` and this document are the reference for the format and how it works.
+Configs are **independent** and **stored separately** (tables or files). The **manifest** defines the schema name for all configs when using plugin-based config; no `schemas.json` or explicit `schema_id` in each config is required. Use **stable ids** and **reference by id**; validate referential integrity; load in dependency order; generate DDL in the order schemas → enums → tables → indexes → FKs. The sample in `sample/` and this document are the reference for the format and how it works.
 
 ---
 

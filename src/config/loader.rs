@@ -1,15 +1,17 @@
-//! Load config from in-memory structs or from _private_* tables in DB.
+//! Load config from in-memory structs or from architect._private_* tables in DB.
 
 use crate::config::resolved::{ColumnInfo, PkType, ResolvedEntity, ResolvedModel};
 use crate::config::types::*;
-use crate::config::{validate, FullConfig};
+use crate::config::{default_schema_id, validate, FullConfig};
 use crate::error::ConfigError;
+use crate::store::qualified_private_table;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 
 /// Build resolved model from full config (call after validate).
 pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
     validate(config)?;
+    let default_sid = default_schema_id(config)?;
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
@@ -31,11 +33,12 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 kind: "table",
                 id: api.entity_id.clone(),
             })?;
+        let table_sid = table.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id
-            .get(table.schema_id.as_str())
+            .get(table_sid)
             .ok_or_else(|| ConfigError::MissingReference {
                 kind: "schema",
-                id: table.schema_id.clone(),
+                id: table_sid.to_string(),
             })?;
         let table_columns = columns_by_table
             .get(table.id.as_str())
@@ -142,15 +145,22 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
     }
 }
 
-/// Load full config from _private_* tables. Tables must already exist (ensure_private_tables).
+/// Load full config from architect._private_* tables. Tables must already exist (ensure_private_tables).
 pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
-    let schemas = load_config_table::<SchemaConfig>(pool, "_private_schemas").await?;
-    let enums = load_config_table::<EnumConfig>(pool, "_private_enums").await?;
-    let tables = load_config_table::<TableConfig>(pool, "_private_tables").await?;
-    let columns = load_config_table::<ColumnConfig>(pool, "_private_columns").await?;
-    let indexes = load_config_table::<IndexConfig>(pool, "_private_indexes").await?;
-    let relationships = load_config_table::<RelationshipConfig>(pool, "_private_relationships").await?;
-    let api_entities = load_config_table::<ApiEntityConfig>(pool, "_private_api_entities").await?;
+    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_private_table("_private_schemas")).await?;
+    if schemas.is_empty() {
+        schemas = vec![SchemaConfig {
+            id: "default".into(),
+            name: "public".into(),
+            comment: None,
+        }];
+    }
+    let enums = load_config_table::<EnumConfig>(pool, &qualified_private_table("_private_enums")).await?;
+    let tables = load_config_table::<TableConfig>(pool, &qualified_private_table("_private_tables")).await?;
+    let columns = load_config_table::<ColumnConfig>(pool, &qualified_private_table("_private_columns")).await?;
+    let indexes = load_config_table::<IndexConfig>(pool, &qualified_private_table("_private_indexes")).await?;
+    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_private_table("_private_relationships")).await?;
+    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_private_table("_private_api_entities")).await?;
 
     let config = FullConfig {
         schemas,

@@ -75,12 +75,12 @@
                   "key": "file",
                   "type": "file",
                   "src": [],
-                  "description": "Zip file containing manifest.json at root plus schemas.json, enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json"
+                  "description": "Zip file containing manifest.json at root (must include 'schema', the PostgreSQL schema name used by all configs) plus enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json. No schemas.json needed."
                 }
               ]
             },
             "url": "{{base_url}}/api/v1/config/plugin",
-            "description": "Upload a plugin zip. Zip must have manifest.json (id, name, version) at root and config JSON files. Applies all configs in order and stores manifest in _private_plugins."
+            "description": "Upload a plugin zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _private_plugins."
           }
         },
         {
@@ -98,7 +98,7 @@
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "[\n  {\n    \"id\": \"sch_public\",\n    \"name\": \"public\",\n    \"comment\": \"Default schema\"\n  }\n]"
+              "raw": "[\n  {\n    \"id\": \"default\",\n    \"name\": \"public\",\n    \"comment\": \"Single schema (from manifest.schema when using plugin)\"\n  }\n]"
             },
             "url": "{{base_url}}/api/v1/config/schemas"
           }
@@ -118,7 +118,7 @@
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "[\n  {\n    \"id\": \"enum_order_status\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"order_status\",\n    \"values\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"],\n    \"comment\": \"Order lifecycle status\"\n  }\n]"
+              "raw": "[\n  {\n    \"id\": \"enum_order_status\",\n    \"name\": \"order_status\",\n    \"values\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"],\n    \"comment\": \"Order lifecycle status (schema from manifest)\"\n  }\n]"
             },
             "url": "{{base_url}}/api/v1/config/enums"
           }
@@ -134,7 +134,7 @@
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "[\n  {\n    \"id\": \"tbl_users\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"users\",\n    \"comment\": \"User accounts\",\n    \"primary_key\": \"id\",\n    \"unique\": [[\"email\"]],\n    \"check\": []\n  },\n  {\n    \"id\": \"tbl_orders\",\n    \"schema_id\": \"sch_public\",\n    \"name\": \"orders\",\n    \"comment\": \"Customer orders\",\n    \"primary_key\": \"id\",\n    \"unique\": [],\n    \"check\": [{\"name\": \"created_at_not_future\", \"expression\": \"created_at <= NOW()\"}]\n  }\n]"
+              "raw": "[\n  {\n    \"id\": \"tbl_users\",\n    \"name\": \"users\",\n    \"comment\": \"User accounts\",\n    \"primary_key\": \"id\",\n    \"unique\": [[\"email\"]],\n    \"check\": []\n  },\n  {\n    \"id\": \"tbl_orders\",\n    \"name\": \"orders\",\n    \"comment\": \"Customer orders\",\n    \"primary_key\": \"id\",\n    \"unique\": [],\n    \"check\": [{\"name\": \"created_at_not_future\", \"expression\": \"created_at <= NOW()\"}]\n  }\n]"
             },
             "url": "{{base_url}}/api/v1/config/tables"
           }

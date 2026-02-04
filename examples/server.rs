@@ -15,7 +15,7 @@ use architect_sdk::{
 };
 use axum::Router;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = resolve(&config)?;
     let state = AppState {
         pool: pool.clone(),
-        model: Arc::new(model),
+        model: Arc::new(RwLock::new(model)),
     };
 
     let api = Router::new()
@@ -77,15 +77,48 @@ async fn load_config_from_plugin_path(dir: &str) -> Result<FullConfig, Box<dyn s
     let _id = manifest_obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'id' (string)"))?;
     let _name = manifest_obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'name' (string)"))?;
     let _version = manifest_obj.get("version").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'version' (string)"))?;
-    tracing::info!("plugin manifest: id={:?} name={:?} version={:?}", _id, _name, _version);
+    let schema_name = manifest_obj.get("schema").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'schema' (string)"))?;
+    tracing::info!("plugin manifest: id={:?} name={:?} version={:?} schema={:?}", _id, _name, _version, schema_name);
 
-    let schemas: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("schemas.json")).await?)?;
-    let enums: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("enums.json")).await?)?;
-    let tables: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("tables.json")).await?)?;
-    let columns: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("columns.json")).await?)?;
-    let indexes: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("indexes.json")).await?)?;
-    let relationships: Vec<_> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("relationships.json")).await?)?;
-    let api_entities: Vec<_> = serde_json::from_str(
+    let schemas = vec![serde_json::json!({ "id": "default", "name": schema_name })];
+    let schemas: Vec<architect_sdk::config::SchemaConfig> = serde_json::from_value(serde_json::Value::Array(schemas))?;
+
+    let mut enums: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("enums.json")).await?)?;
+    for o in enums.iter_mut() {
+        if let Some(obj) = o.as_object_mut() {
+            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+        }
+    }
+    let enums: Vec<architect_sdk::config::EnumConfig> = serde_json::from_value(serde_json::Value::Array(enums))?;
+
+    let mut tables: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("tables.json")).await?)?;
+    for o in tables.iter_mut() {
+        if let Some(obj) = o.as_object_mut() {
+            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+        }
+    }
+    let tables: Vec<architect_sdk::config::TableConfig> = serde_json::from_value(serde_json::Value::Array(tables))?;
+
+    let columns: Vec<architect_sdk::config::ColumnConfig> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("columns.json")).await?)?;
+
+    let mut indexes: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("indexes.json")).await?)?;
+    for o in indexes.iter_mut() {
+        if let Some(obj) = o.as_object_mut() {
+            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+        }
+    }
+    let indexes: Vec<architect_sdk::config::IndexConfig> = serde_json::from_value(serde_json::Value::Array(indexes))?;
+
+    let mut relationships: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("relationships.json")).await?)?;
+    for o in relationships.iter_mut() {
+        if let Some(obj) = o.as_object_mut() {
+            obj.entry("from_schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("to_schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+        }
+    }
+    let relationships: Vec<architect_sdk::config::RelationshipConfig> = serde_json::from_value(serde_json::Value::Array(relationships))?;
+
+    let api_entities: Vec<architect_sdk::config::ApiEntityConfig> = serde_json::from_str(
         &tokio::fs::read_to_string(dir.join("api_entities.json")).await.unwrap_or_else(|_| "[]".into()),
     )?;
 

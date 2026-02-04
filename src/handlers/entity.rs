@@ -84,7 +84,7 @@ pub async fn list(
     Path(path_segment): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
@@ -104,14 +104,14 @@ pub async fn list(
             }
             _ => {
                 if column_names.contains(k.as_str()) {
-                    let val = query_value_for_column(entity, &k, &v);
+                    let val = query_value_for_column(&entity, &k, &v);
                     filters.push((k, val));
                 }
             }
         }
     }
 
-    let rows = CrudService::list(&state.pool, entity, &filters, limit, offset).await?;
+    let rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::OK,
@@ -127,13 +127,13 @@ pub async fn create(
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
     let body = body_to_map(body)?;
     RequestValidator::validate(&body, &entity.validation)?;
-    let row = CrudService::create(&state.pool, entity, &body).await?;
+    let row = CrudService::create(&state.pool, &entity, &body).await?;
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -141,12 +141,12 @@ pub async fn read(
     State(state): State<AppState>,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let row = CrudService::read(&state.pool, entity, &id).await?
+    let row = CrudService::read(&state.pool, &entity, &id).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
@@ -156,14 +156,14 @@ pub async fn update(
     Path((path_segment, id_str)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
     let body = body_to_map(body)?;
     RequestValidator::validate(&body, &entity.validation)?;
-    let row = CrudService::update(&state.pool, entity, &id, &body).await?
+    let row = CrudService::update(&state.pool, &entity, &id, &body).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
@@ -172,12 +172,12 @@ pub async fn delete(
     State(state): State<AppState>,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
-    CrudService::delete(&state.pool, entity, &id).await?;
+    CrudService::delete(&state.pool, &entity, &id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -186,7 +186,7 @@ pub async fn bulk_create(
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
@@ -203,7 +203,7 @@ pub async fn bulk_create(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let rows = CrudService::bulk_create(&state.pool, entity, &items).await?;
+    let rows = CrudService::bulk_create(&state.pool, &entity, &items).await?;
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::CREATED,
@@ -219,7 +219,7 @@ pub async fn bulk_update(
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let entity = state.model.entity_by_path(&path_segment).ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
@@ -236,7 +236,7 @@ pub async fn bulk_update(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let rows = CrudService::bulk_update(&state.pool, entity, &items).await?;
+    let rows = CrudService::bulk_update(&state.pool, &entity, &items).await?;
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::OK,

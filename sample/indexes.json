@@ -1,7 +1,6 @@
 [
   {
     "id": "idx_users_email",
-    "schema_id": "sch_public",
     "table_id": "tbl_users",
     "name": "idx_users_email",
     "method": "btree",
@@ -13,7 +12,6 @@
   },
   {
     "id": "idx_orders_user_created",
-    "schema_id": "sch_public",
     "table_id": "tbl_orders",
     "name": "idx_orders_user_created",
     "method": "btree",

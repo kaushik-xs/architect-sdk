@@ -206,9 +206,26 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
 
 fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     use sqlx::Row;
+    if let Ok(v) = row.try_get::<Option<i16>, _>(name) {
+        if let Some(n) = v {
+            return Value::Number(n.into());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<i32>, _>(name) {
+        if let Some(n) = v {
+            return Value::Number(n.into());
+        }
+    }
     if let Ok(v) = row.try_get::<Option<i64>, _>(name) {
         if let Some(n) = v {
             return Value::Number(n.into());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<f32>, _>(name) {
+        if let Some(n) = v {
+            if let Some(n) = serde_json::Number::from_f64(n as f64) {
+                return Value::Number(n);
+            }
         }
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(name) {
@@ -221,6 +238,26 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     if let Ok(v) = row.try_get::<Option<bool>, _>(name) {
         if let Some(b) = v {
             return Value::Bool(b);
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<uuid::Uuid>, _>(name) {
+        if let Some(u) = v {
+            return Value::String(u.to_string());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(name) {
+        if let Some(d) = v {
+            return Value::String(d.to_rfc3339());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(name) {
+        if let Some(d) = v {
+            return Value::String(d.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
+        }
+    }
+    if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(name) {
+        if let Some(d) = v {
+            return Value::String(d.format("%Y-%m-%d").to_string());
         }
     }
     if let Ok(v) = row.try_get::<Option<String>, _>(name) {
