@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, update, PgBindValue, QueryBuf};
+use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, IncludeSelect, update, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -22,6 +22,22 @@ impl CrudService {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
         let q = select_list(entity, filters, Some(limit), Some(offset));
+        Self::query_many(pool, &q.sql, &q.params).await
+    }
+
+    /// List rows with includes in a single query (scalar subqueries with json_agg/row_to_json). Returns rows with include keys already set (JSON).
+    pub async fn list_with_includes(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        filters: &[(String, Value)],
+        limit: Option<u32>,
+        offset: Option<u32>,
+        includes: &[IncludeSelect<'_>],
+    ) -> Result<Vec<Value>, AppError> {
+        const DEFAULT_LIMIT: u32 = 100;
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
+        let offset = offset.unwrap_or(0);
+        let q = select_list_with_includes(entity, filters, Some(limit), Some(offset), includes);
         Self::query_many(pool, &q.sql, &q.params).await
     }
 
@@ -145,6 +161,7 @@ impl CrudService {
         sql: &str,
         params: &[Value],
     ) -> Result<Option<Value>, AppError> {
+        tracing::debug!(sql = %sql, params = ?params, "query");
         let bind = Self::to_sqlx_param(&params[0]);
         let row = sqlx::query(sql)
             .bind(bind)
@@ -158,6 +175,7 @@ impl CrudService {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Value>, AppError> {
+        tracing::debug!(sql = %sql, params = ?params, "query");
         let mut query = sqlx::query(sql);
         for p in params {
             query = query.bind(Self::to_sqlx_param(p));
@@ -167,6 +185,7 @@ impl CrudService {
     }
 
     async fn execute_returning_one(pool: &PgPool, q: &QueryBuf) -> Result<Option<Value>, AppError> {
+        tracing::debug!(sql = %q.sql, params = ?q.params, "query");
         let mut query = sqlx::query(&q.sql);
         for p in &q.params {
             let b = Self::to_sqlx_param(p);
@@ -181,6 +200,7 @@ impl CrudService {
         sql: &str,
         params: &[Value],
     ) -> Result<Option<Value>, AppError> {
+        tracing::debug!(sql = %sql, params = ?params, "query");
         let mut query = sqlx::query(sql);
         for p in params {
             query = query.bind(Self::to_sqlx_param(p));
@@ -193,6 +213,7 @@ impl CrudService {
         tx: &mut sqlx::PgConnection,
         q: &QueryBuf,
     ) -> Result<Option<Value>, AppError> {
+        tracing::debug!(sql = %q.sql, params = ?q.params, "query (tx)");
         let mut query = sqlx::query(&q.sql);
         for p in &q.params {
             query = query.bind(Self::to_sqlx_param(p));

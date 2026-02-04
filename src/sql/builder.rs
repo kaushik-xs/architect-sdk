@@ -1,8 +1,17 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
-use crate::config::ResolvedEntity;
+use crate::config::{IncludeDirection, ResolvedEntity};
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Describes one include for single-query list: name, direction, related entity, our key column, their key column.
+pub struct IncludeSelect<'a> {
+    pub name: &'a str,
+    pub direction: IncludeDirection,
+    pub related: &'a ResolvedEntity,
+    pub our_key: &'a str,
+    pub their_key: &'a str,
+}
 
 /// Quote identifier for PostgreSQL (safe: only from config).
 fn quoted(s: &str) -> String {
@@ -58,6 +67,88 @@ pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
     let pk = &entity.pk_columns[0];
     let cols = select_column_list(entity);
     q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
+    q
+}
+
+/// SELECT list with includes in a single query: main table aliased as "main", each include as a scalar subquery (json_agg for to_many, row_to_json for to_one).
+pub fn select_list_with_includes(
+    entity: &ResolvedEntity,
+    filters: &[(String, Value)],
+    limit: Option<u32>,
+    offset: Option<u32>,
+    includes: &[IncludeSelect<'_>],
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
+    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let pk = &entity.pk_columns[0];
+    const MAIN_ALIAS: &str = "main";
+
+    let main_cols: Vec<String> = entity
+        .columns
+        .iter()
+        .map(|c| {
+            let q = quoted(&c.name);
+            let expr = if c.pg_type.as_deref().map_or(false, |t| t.contains('.')) {
+                format!("{}.{}::text", MAIN_ALIAS, q)
+            } else {
+                format!("{}.{}", MAIN_ALIAS, q)
+            };
+            format!("{} AS {}", expr, q)
+        })
+        .collect();
+
+    let mut select_parts = main_cols;
+    for inc in includes {
+        let rel_table = qualified_table(&inc.related.schema_name, &inc.related.table_name);
+        let rel_cols = select_column_list(inc.related);
+        let sub_from = format!("{} WHERE {} = {}.{}", rel_table, quoted(inc.their_key), MAIN_ALIAS, quoted(inc.our_key));
+        let subquery = match inc.direction {
+            IncludeDirection::ToOne => format!(
+                "(SELECT row_to_json(sub) FROM (SELECT {} FROM {}) sub)",
+                rel_cols, sub_from
+            ),
+            IncludeDirection::ToMany => format!(
+                "(SELECT COALESCE(json_agg(row_to_json(sub)), '[]'::json) FROM (SELECT {} FROM {}) sub)",
+                rel_cols, sub_from
+            ),
+        };
+        select_parts.push(format!("{} AS {}", subquery, quoted(inc.name)));
+    }
+
+    let mut where_parts = Vec::new();
+    for (col, val) in filters {
+        if col_names.contains(col.as_str()) {
+            let param_num = q.push_param(val.clone());
+            let ph = entity
+                .columns
+                .iter()
+                .find(|c| c.name == *col)
+                .and_then(|c| c.pg_type.as_deref())
+                .map(|t| format!("${}::{}", param_num, t))
+                .unwrap_or_else(|| format!("${}", param_num));
+            where_parts.push(format!("{}.{} = {}", MAIN_ALIAS, quoted(col), ph));
+        }
+    }
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    let order_clause = format!(" ORDER BY {}.{}", MAIN_ALIAS, quoted(pk));
+    let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
+    let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
+
+    q.sql = format!(
+        "SELECT {} FROM {} {}{}{}{}{}",
+        select_parts.join(", "),
+        table,
+        MAIN_ALIAS,
+        where_clause,
+        order_clause,
+        limit_clause,
+        offset_clause
+    );
     q
 }
 

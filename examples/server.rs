@@ -22,8 +22,10 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("architect_sdk=info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("architect_sdk=info".parse()?))
+        .with_env_filter(filter)
         .init();
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/architect".into());

@@ -42,7 +42,9 @@ pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
 async fn get_config(pool: &PgPool, kind: &str) -> Result<Vec<Value>, AppError> {
     let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let q_table = qualified_sys_table(table);
-    let rows = sqlx::query_scalar::<_, Value>(&format!("SELECT payload FROM {} ORDER BY id", q_table))
+    let sql = format!("SELECT payload FROM {} ORDER BY id", q_table);
+    tracing::debug!(sql = %sql, "query");
+    let rows = sqlx::query_scalar::<_, Value>(&sql)
         .fetch_all(pool)
         .await?;
     Ok(rows)

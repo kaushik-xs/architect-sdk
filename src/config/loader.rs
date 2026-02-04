@@ -236,10 +236,9 @@ async fn load_config_table<T>(pool: &PgPool, table: &str) -> Result<Vec<T>, Conf
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let rows = sqlx::query_scalar::<_, serde_json::Value>(&format!(
-        "SELECT payload FROM {} ORDER BY id",
-        table
-    ))
+    let sql = format!("SELECT payload FROM {} ORDER BY id", table);
+    tracing::debug!(sql = %sql, "query");
+    let rows = sqlx::query_scalar::<_, serde_json::Value>(&sql)
     .fetch_all(pool)
     .await
     .map_err(|e| ConfigError::Load(e.to_string()))?;

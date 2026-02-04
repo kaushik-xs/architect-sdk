@@ -73,6 +73,24 @@ pub fn value_keys_to_camel_case(value: &mut Value) {
     }
 }
 
+/// Recursively apply camelCase to all object keys in a Value (objects and arrays of objects).
+pub fn value_keys_to_camel_case_recursive(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            object_keys_to_camel_case(map);
+            for (_, v) in map.iter_mut() {
+                value_keys_to_camel_case_recursive(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                value_keys_to_camel_case_recursive(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Apply snake_case conversion to a Value. If it's an object, converts its keys; otherwise no-op.
 pub fn value_keys_to_snake_case(value: &mut Value) {
     if let Value::Object(ref mut map) = value {

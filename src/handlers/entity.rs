@@ -5,6 +5,7 @@ use crate::case::{hashmap_keys_to_snake_case, to_snake_case, value_keys_to_camel
 use crate::config::{IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
 use crate::error::AppError;
 use crate::service::{CrudService, RequestValidator};
+use crate::sql::IncludeSelect;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -112,6 +113,40 @@ fn resolve_includes(
         out.push((name.clone(), spec, related));
     }
     Ok(out)
+}
+
+/// Post-process rows from single-query list_with_includes: parse JSON include columns if string, strip sensitive and camelCase nested objects.
+fn post_process_include_columns(
+    rows: &mut [Value],
+    resolved_includes: &[(String, crate::config::IncludeSpec, ResolvedEntity)],
+) {
+    for row in rows.iter_mut() {
+        if let Value::Object(map) = row {
+            for (name, _spec, related) in resolved_includes {
+                let Some(included) = map.get_mut(name) else { continue };
+                if let Value::String(s) = included {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                        *included = parsed;
+                    }
+                }
+                match included {
+                    Value::Array(arr) => {
+                        for item in arr.iter_mut() {
+                            if let Value::Object(_) = item {
+                                strip_sensitive_columns(item, &related.sensitive_columns);
+                                value_keys_to_camel_case(item);
+                            }
+                        }
+                    }
+                    Value::Object(_) => {
+                        strip_sensitive_columns(included, &related.sensitive_columns);
+                        value_keys_to_camel_case(included);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Attach related-entity data to rows. Modifies each row in place. resolved_includes from resolve_includes (so lock can be dropped before calling).
@@ -238,12 +273,35 @@ pub async fn list(
         }
     }
 
-    let mut rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
-    let resolved = {
-        let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
-        resolve_includes(&model, &entity, &include_names)?
+    let mut rows = if include_names.is_empty() {
+        CrudService::list(&state.pool, &entity, &filters, limit, offset).await?
+    } else {
+        let resolved = {
+            let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+            resolve_includes(&model, &entity, &include_names)?
+        };
+        let includes: Vec<IncludeSelect> = resolved
+            .iter()
+            .map(|(name, spec, related)| IncludeSelect {
+                name: name.as_str(),
+                direction: spec.direction.clone(),
+                related,
+                our_key: spec.our_key_column.as_str(),
+                their_key: spec.their_key_column.as_str(),
+            })
+            .collect();
+        let mut rows = CrudService::list_with_includes(
+            &state.pool,
+            &entity,
+            &filters,
+            limit,
+            offset,
+            includes.as_slice(),
+        )
+        .await?;
+        post_process_include_columns(&mut rows, &resolved);
+        rows
     };
-    attach_includes(&state.pool, &entity, &mut rows, &resolved).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
