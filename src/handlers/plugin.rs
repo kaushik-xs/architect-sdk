@@ -1,17 +1,20 @@
-//! Plugin install handler: accept zip upload, extract manifest + configs, apply configs, store manifest, and reload model so new entities are available without restart.
+//! Plugin install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model.
 
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::handlers::config::replace_config;
+use crate::migration::apply_migrations;
 use crate::state::AppState;
 use crate::store::upsert_plugin;
 use axum::extract::{Multipart, State};
 use axum::Json;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Cursor;
 use zip::ZipArchive;
 
-const CONFIG_ORDER: &[&str] = &[
+/// All config kinds that may appear in a plugin zip (excluding schemas, which are derived from manifest).
+const CONFIG_KINDS: &[&str] = &[
     "schemas",
     "enums",
     "tables",
@@ -20,6 +23,46 @@ const CONFIG_ORDER: &[&str] = &[
     "relationships",
     "api_entities",
 ];
+
+/// Dependencies for each config kind: these must be applied before this kind.
+/// Order: most atomic and independent first (schemas, then enums/tables, then columns, etc.).
+fn dependencies(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "schemas" => &[],
+        "enums" => &["schemas"],
+        "tables" => &["schemas"],
+        "columns" => &["tables"],
+        "indexes" => &["schemas", "tables"],
+        "relationships" => &["schemas", "tables", "columns"],
+        "api_entities" => &["tables"],
+        _ => &[],
+    }
+}
+
+/// Topological sort of config kinds so that dependencies are applied first.
+/// Returns order to apply: most atomic and independent first.
+fn config_apply_order() -> Vec<&'static str> {
+    let mut order = Vec::with_capacity(CONFIG_KINDS.len());
+    let mut done: HashSet<&'static str> = HashSet::new();
+    while order.len() < CONFIG_KINDS.len() {
+        let mut made_progress = false;
+        for &kind in CONFIG_KINDS {
+            if done.contains(kind) {
+                continue;
+            }
+            let deps = dependencies(kind);
+            if deps.iter().all(|d| done.contains(d)) {
+                order.push(kind);
+                done.insert(kind);
+                made_progress = true;
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+    order
+}
 
 /// Schema id used when manifest provides the schema name (no separate schemas.json).
 const DEFAULT_SCHEMA_ID: &str = "default";
@@ -114,8 +157,9 @@ pub async fn install_plugin(
         "name": schema_name
     })];
 
-    let mut applied = Vec::with_capacity(CONFIG_ORDER.len());
-    for kind in CONFIG_ORDER {
+    let apply_order = config_apply_order();
+    let mut applied = Vec::with_capacity(apply_order.len());
+    for kind in &apply_order {
         let body: Vec<Value> = if *kind == "schemas" {
             serde_json::from_value(Value::Array(schemas_body.clone()))
                 .map_err(|e| AppError::BadRequest(format!("schemas body: {}", e)))?
@@ -135,13 +179,14 @@ pub async fn install_plugin(
             }
             body
         };
-        replace_config(&state.pool, kind, body).await?;
-        applied.push(kind.to_string());
+        replace_config(&state.pool, kind, body, false).await?;
+        applied.push((*kind).to_string());
     }
 
     upsert_plugin(&state.pool, id, &manifest_value).await?;
 
     let config = load_from_pool(&state.pool).await.map_err(AppError::Config)?;
+    apply_migrations(&state.pool, &config).await?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;

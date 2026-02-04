@@ -1,5 +1,6 @@
 //! Architect SDK: configuration-driven REST backend library.
 
+pub mod case;
 pub mod config;
 pub mod error;
 pub mod migration;

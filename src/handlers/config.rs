@@ -10,17 +10,20 @@ use axum::Json;
 use serde_json::Value;
 use sqlx::PgPool;
 
-/// Replace config for one kind. Returns (body, num_rows_written). When num_rows_written > 0, migrations are run.
+/// Replace config for one kind. Returns (body, num_rows_written).
+/// When run_migrations is true and num_rows_written > 0, loads full config and runs migrations (validates config; requires all dependent configs already in DB).
+/// When run_migrations is false (e.g. plugin install), only writes to _private_*; caller must run migrations once after all kinds are applied.
 pub(crate) async fn replace_config(
     pool: &PgPool,
     kind: &str,
     body: Vec<Value>,
+    run_migrations: bool,
 ) -> Result<(Vec<Value>, u64), AppError> {
     let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
     let (count, _version) = replace_config_rows(&mut tx, table, &body).await?;
     tx.commit().await?;
-    if count > 0 {
+    if run_migrations && count > 0 {
         let config = load_from_pool(pool).await.map_err(AppError::Config)?;
         apply_migrations(pool, &config).await?;
     }
@@ -51,7 +54,7 @@ macro_rules! config_handler {
             State(state): State<AppState>,
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
-            let (out, num_written) = replace_config(&state.pool, $kind, body).await?;
+            let (out, num_written) = replace_config(&state.pool, $kind, body, true).await?;
             if num_written > 0 {
                 reload_model(&state).await?;
             }

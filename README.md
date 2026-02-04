@@ -60,7 +60,7 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
 
 - **Common**: `GET /health`, `GET /ready`, `GET /version`, `GET /info`
 - **Config**: `POST /api/v1/config/plugin` (multipart zip: manifest.json + config JSONs), then `POST`/`GET` per kind: `schemas`, `enums`, `tables`, `columns`, `indexes`, `relationships`, `api_entities`
-- **Entities**: For each entity (e.g. `users`): `GET /api/v1/users` (list all, optional filters: `?col=value`, `?limit=100`, `?offset=0`), `POST /api/v1/users`, `GET /api/v1/users/:id`, `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`
+- **Entities**: For each entity (e.g. `users`): `GET /api/v1/users` (list all, optional filters: `?col=value`, `?limit=100`, `?offset=0`), `POST /api/v1/users`, `GET /api/v1/users/:id`, `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`. **Case**: Request bodies and query param keys accept **camelCase** (e.g. `userId`, `createdAt`) and are converted to snake_case for the DB; response row keys are returned in **camelCase**.
 
 ## License
 

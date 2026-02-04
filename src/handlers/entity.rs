@@ -1,5 +1,7 @@
 //! Entity CRUD handlers: create, read, update, delete, list, bulk.
+//! Request bodies and query param keys are accepted in camelCase and converted to snake_case for DB; response row keys are converted to camelCase.
 
+use crate::case::{hashmap_keys_to_snake_case, to_snake_case, value_keys_to_camel_case};
 use crate::config::{PkType, ResolvedEntity};
 use crate::error::AppError;
 use crate::service::{CrudService, RequestValidator};
@@ -113,9 +115,10 @@ pub async fn list(
                 offset = v.parse().ok();
             }
             _ => {
-                if column_names.contains(k.as_str()) {
-                    let val = query_value_for_column(&entity, &k, &v);
-                    filters.push((k, val));
+                let col_key = to_snake_case(&k);
+                if column_names.contains(col_key.as_str()) {
+                    let val = query_value_for_column(&entity, &col_key, &v);
+                    filters.push((col_key, val));
                 }
             }
         }
@@ -124,6 +127,7 @@ pub async fn list(
     let mut rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
     }
     let count = rows.len() as u64;
     Ok((
@@ -145,9 +149,11 @@ pub async fn create(
         return Err(AppError::BadRequest("create not allowed".into()));
     }
     let body = body_to_map(body)?;
+    let body = hashmap_keys_to_snake_case(&body);
     RequestValidator::validate(&body, &entity.validation)?;
     let mut row = CrudService::create(&state.pool, &entity, &body).await?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -163,6 +169,7 @@ pub async fn read(
     let mut row = CrudService::read(&state.pool, &entity, &id).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -177,10 +184,12 @@ pub async fn update(
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
     let body = body_to_map(body)?;
+    let body = hashmap_keys_to_snake_case(&body);
     RequestValidator::validate(&body, &entity.validation)?;
     let mut row = CrudService::update(&state.pool, &entity, &id, &body).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -210,7 +219,8 @@ pub async fn bulk_create(
         Value::Array(arr) => {
             let mut out = Vec::new();
             for v in arr {
-                out.push(body_to_map(v)?);
+                let map = body_to_map(v)?;
+                out.push(hashmap_keys_to_snake_case(&map));
             }
             out
         }
@@ -222,6 +232,7 @@ pub async fn bulk_create(
     let mut rows = CrudService::bulk_create(&state.pool, &entity, &items).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
     }
     let count = rows.len() as u64;
     Ok((
@@ -246,7 +257,8 @@ pub async fn bulk_update(
         Value::Array(arr) => {
             let mut out = Vec::new();
             for v in arr {
-                out.push(body_to_map(v)?);
+                let map = body_to_map(v)?;
+                out.push(hashmap_keys_to_snake_case(&map));
             }
             out
         }
@@ -258,6 +270,7 @@ pub async fn bulk_update(
     let mut rows = CrudService::bulk_update(&state.pool, &entity, &items).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
     }
     let count = rows.len() as u64;
     Ok((
