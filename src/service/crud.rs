@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{delete, insert, select_by_id, select_list, update, PgBindValue, QueryBuf};
+use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, update, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -34,6 +34,20 @@ impl CrudService {
         let q = select_by_id(entity);
         let row = Self::query_one(pool, &q.sql, &[id.clone()]).await?;
         Ok(row)
+    }
+
+    /// Fetch rows from entity where column IN (values). Used for batch-loading related rows.
+    pub async fn fetch_where_column_in(
+        pool: &PgPool,
+        entity: &ResolvedEntity,
+        column_name: &str,
+        values: &[Value],
+    ) -> Result<Vec<Value>, AppError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let q = select_by_column_in(entity, column_name, values);
+        Self::query_many(pool, &q.sql, &q.params).await
     }
 
     /// Insert one row; body may include or omit PK (if has default). Returns created row.

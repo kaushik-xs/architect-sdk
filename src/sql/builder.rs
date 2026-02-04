@@ -34,17 +34,30 @@ impl QueryBuf {
     }
 }
 
+/// SELECT list: each column as-is, except custom enum (schema.typename) columns as col::text so sqlx returns String.
+fn select_column_list(entity: &ResolvedEntity) -> String {
+    entity
+        .columns
+        .iter()
+        .map(|c| {
+            let q = quoted(&c.name);
+            if c.pg_type.as_deref().map_or(false, |t| t.contains('.')) {
+                format!("{}::text", q)
+            } else {
+                q
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
-/// Uses SELECT * so all table columns are returned.
 pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
     let mut q = QueryBuf::new();
     let table = qualified_table(&entity.schema_name, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    q.sql = format!(
-        "SELECT * FROM {} WHERE {} = $1",
-        table,
-        quoted(pk)
-    );
+    let cols = select_column_list(entity);
+    q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
     q
 }
 
@@ -65,15 +78,13 @@ pub fn select_list(
     for (col, val) in filters {
         if col_names.contains(col.as_str()) {
             let param_num = q.push_param(val.clone());
-            let ph = match entity.columns.iter().find(|c| c.name == *col) {
-                Some(c) => match c.pg_type.as_deref() {
-                    Some("timestamptz") | Some("timestamp") | Some("date") => {
-                        format!("${}::{}", param_num, c.pg_type.as_deref().unwrap())
-                    }
-                    _ => format!("${}", param_num),
-                },
-                None => format!("${}", param_num),
-            };
+            let ph = entity
+                .columns
+                .iter()
+                .find(|c| c.name == *col)
+                .and_then(|c| c.pg_type.as_deref())
+                .map(|t| format!("${}::{}", param_num, t))
+                .unwrap_or_else(|| format!("${}", param_num));
             where_parts.push(format!("{} = {}", quoted(col), ph));
         }
     }
@@ -86,14 +97,54 @@ pub fn select_list(
     let order_clause = format!(" ORDER BY {}", quoted(pk));
     let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
-
+    let cols = select_column_list(entity);
     q.sql = format!(
-        "SELECT * FROM {}{}{}{}{}",
+        "SELECT {} FROM {}{}{}{}{}",
+        cols,
         table,
         where_clause,
         order_clause,
         limit_clause,
         offset_clause
+    );
+    q
+}
+
+/// SELECT * FROM entity WHERE column IN ($1, $2, ...) ORDER BY pk. Used for batch-fetching related rows (to_many or to_one by key).
+pub fn select_by_column_in(
+    entity: &ResolvedEntity,
+    column_name: &str,
+    values: &[Value],
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let pk = &entity.pk_columns[0];
+    if values.is_empty() {
+        let cols = select_column_list(entity);
+        q.sql = format!("SELECT {} FROM {} WHERE 1 = 0", cols, table);
+        return q;
+    }
+    let placeholders: Vec<String> = values
+        .iter()
+        .map(|v| {
+            let n = q.push_param(v.clone());
+            entity
+                .columns
+                .iter()
+                .find(|c| c.name == column_name)
+                .and_then(|c| c.pg_type.as_deref())
+                .map(|t| format!("${}::{}", n, t))
+                .unwrap_or_else(|| format!("${}", n))
+        })
+        .collect();
+    let cols = select_column_list(entity);
+    q.sql = format!(
+        "SELECT {} FROM {} WHERE {} IN ({}) ORDER BY {}",
+        cols,
+        table,
+        quoted(column_name),
+        placeholders.join(", "),
+        quoted(pk)
     );
     q
 }
@@ -121,18 +172,21 @@ pub fn insert(
         }
         let val = val.unwrap_or(Value::Null);
         let param_num = q.push_param(val);
-        let ph = match c.pg_type.as_deref() {
-            Some("timestamptz") | Some("timestamp") | Some("date") => format!("${}::{}", param_num, c.pg_type.as_deref().unwrap()),
-            _ => format!("${}", param_num),
-        };
+        let ph = c
+            .pg_type
+            .as_deref()
+            .map(|t| format!("${}::{}", param_num, t))
+            .unwrap_or_else(|| format!("${}", param_num));
         cols.push(quoted(name));
         placeholders.push(ph);
     }
+    let returning = select_column_list(entity);
     q.sql = format!(
-        "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
+        "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
         table,
         cols.join(", "),
-        placeholders.join(", ")
+        placeholders.join(", "),
+        returning
     );
     q
 }
@@ -151,27 +205,31 @@ pub fn update(entity: &ResolvedEntity, id: &Value, body: &HashMap<String, Value>
         }
         let Some(c) = col_by_name.get(k.as_str()) else { continue };
         let param_num = q.push_param(v.clone());
-        let rhs = match c.pg_type.as_deref() {
-            Some("timestamptz") | Some("timestamp") | Some("date") => format!("${}::{}", param_num, c.pg_type.as_deref().unwrap()),
-            _ => format!("${}", param_num),
-        };
+        let rhs = c
+            .pg_type
+            .as_deref()
+            .map(|t| format!("${}::{}", param_num, t))
+            .unwrap_or_else(|| format!("${}", param_num));
         sets.push(format!("{} = {}", quoted(k), rhs));
     }
     sets.push(format!("{} = NOW()", quoted("updated_at")));
     if sets.is_empty() {
-        q.sql = format!("SELECT * FROM {} WHERE {} = $1", table, quoted(pk));
+        let cols = select_column_list(entity);
+        q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
         q.params.push(id.clone());
         return q;
     }
     let set_clause = sets.join(", ");
     let id_param = q.params.len() + 1;
     q.params.push(id.clone());
+    let returning = select_column_list(entity);
     q.sql = format!(
-        "UPDATE {} SET {} WHERE {} = ${} RETURNING *",
+        "UPDATE {} SET {} WHERE {} = ${} RETURNING {}",
         table,
         set_clause,
         quoted(pk),
-        id_param
+        id_param,
+        returning
     );
     q
 }
@@ -181,7 +239,8 @@ pub fn delete(entity: &ResolvedEntity) -> QueryBuf {
     let mut q = QueryBuf::new();
     let table = qualified_table(&entity.schema_name, &entity.table_name);
     let pk = &entity.pk_columns[0];
+    let returning = select_column_list(entity);
     q.params.push(Value::Null);
-    q.sql = format!("DELETE FROM {} WHERE {} = $1 RETURNING *", table, quoted(pk));
+    q.sql = format!("DELETE FROM {} WHERE {} = $1 RETURNING {}", table, quoted(pk), returning);
     q
 }

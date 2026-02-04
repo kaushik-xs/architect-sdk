@@ -1,5 +1,5 @@
-//! Example server: ensures _private_* tables exist, then loads config from PLUGIN_PATH (plugin directory with manifest.json) or from DB (config APIs).
-//! If PLUGIN_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _private_* tables (empty until fed via config APIs or plugin install).
+//! Example server: ensures _sys_* tables exist, then loads config from PLUGIN_PATH (plugin directory with manifest.json) or from DB (config APIs).
+//! If PLUGIN_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _sys_* tables (empty until fed via config APIs or plugin install).
 
 use architect_sdk::{
     apply_migrations,
@@ -7,7 +7,7 @@ use architect_sdk::{
     config_routes,
     entity_routes,
     ensure_database_exists,
-    ensure_private_tables,
+    ensure_sys_tables,
     load_from_pool,
     resolve,
     AppState,
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
-    ensure_private_tables(&pool).await?;
+    ensure_sys_tables(&pool).await?;
 
     let config = match std::env::var("PLUGIN_PATH") {
         Ok(plugin_path) => {
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             load_config_from_plugin_path(&plugin_path).await?
         }
         Err(_) => {
-            tracing::info!("PLUGIN_PATH not set; loading config from _private_* tables (use config APIs or POST /api/v1/config/plugin to insert)");
+            tracing::info!("PLUGIN_PATH not set; loading config from _sys_* tables (use config APIs or POST /api/v1/config/plugin to insert)");
             load_from_pool(&pool).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
         }
     };

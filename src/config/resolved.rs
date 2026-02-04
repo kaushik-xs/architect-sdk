@@ -3,6 +3,27 @@
 use crate::config::ValidationRule;
 use std::collections::{HashMap, HashSet};
 
+/// Direction of a related-include: to_one (we have FK to them) or to_many (they have FK to us).
+#[derive(Clone, Debug)]
+pub enum IncludeDirection {
+    ToOne,
+    ToMany,
+}
+
+/// Spec for including a related entity in list/read responses. Name is the related entity's path_segment (e.g. "orders", "users").
+#[derive(Clone, Debug)]
+pub struct IncludeSpec {
+    /// API name for the include (path_segment of the related entity).
+    pub name: String,
+    pub direction: IncludeDirection,
+    /// Path segment of the related entity (for lookup in model).
+    pub related_path_segment: String,
+    /// Our column used in the join (our FK for to_one; our PK for to_many).
+    pub our_key_column: String,
+    /// Their column used in the join (their PK for to_one; their FK for to_many).
+    pub their_key_column: String,
+}
+
 /// Primary key type for parsing path/body ids.
 #[derive(Clone, Debug)]
 pub enum PkType {
@@ -35,6 +56,8 @@ pub struct ResolvedEntity {
     pub operations: Vec<String>,
     /// Column names to strip from all API responses (sensitive data).
     pub sensitive_columns: HashSet<String>,
+    /// Available includes (related entities) for ?include= name1,name2. Built from relationships.
+    pub includes: Vec<IncludeSpec>,
     pub validation: HashMap<String, ValidationRule>,
 }
 

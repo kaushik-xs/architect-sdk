@@ -1,10 +1,10 @@
-//! Load config from in-memory structs or from architect._private_* tables in DB.
+//! Load config from in-memory structs or from architect._sys_* tables in DB.
 
-use crate::config::resolved::{ColumnInfo, PkType, ResolvedEntity, ResolvedModel};
+use crate::config::resolved::{ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel};
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
 use crate::error::ConfigError;
-use crate::store::qualified_private_table;
+use crate::store::qualified_sys_table;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +22,12 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             m.entry(c.table_id.as_str()).or_default().push(c);
             m
         });
+    let column_id_to_name: HashMap<&str, &str> = config.columns.iter().map(|c| (c.id.as_str(), c.name.as_str())).collect();
+    let table_id_to_path: HashMap<&str, &str> = config
+        .api_entities
+        .iter()
+        .map(|api| (api.entity_id.as_str(), api.path_segment.as_str()))
+        .collect();
 
     let mut entities = Vec::new();
     let mut entity_by_path = HashMap::new();
@@ -91,6 +97,12 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         }
 
         let sensitive_columns: HashSet<String> = api.sensitive_columns.iter().cloned().collect();
+        let includes = build_includes_for_table(
+            &table.id,
+            &config.relationships,
+            &column_id_to_name,
+            &table_id_to_path,
+        );
         let entity = ResolvedEntity {
             table_id: table.id.clone(),
             schema_name: schema.name.clone(),
@@ -101,6 +113,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             columns: columns,
             operations: api.operations.clone(),
             sensitive_columns,
+            includes,
             validation: api.validation.clone(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
@@ -111,6 +124,44 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         entities,
         entity_by_path,
     })
+}
+
+fn build_includes_for_table(
+    our_table_id: &str,
+    relationships: &[RelationshipConfig],
+    column_id_to_name: &HashMap<&str, &str>,
+    table_id_to_path: &HashMap<&str, &str>,
+) -> Vec<IncludeSpec> {
+    let mut includes = Vec::new();
+    for rel in relationships {
+        let from_col = column_id_to_name.get(rel.from_column_id.as_str()).map(|s| s.to_string());
+        let to_col = column_id_to_name.get(rel.to_column_id.as_str()).map(|s| s.to_string());
+        let from_path = table_id_to_path.get(rel.from_table_id.as_str()).map(|s| s.to_string());
+        let to_path = table_id_to_path.get(rel.to_table_id.as_str()).map(|s| s.to_string());
+        if let (Some(our_key), Some(their_key), Some(related_path)) = (from_col.clone(), to_col.clone(), to_path.clone()) {
+            if rel.from_table_id == our_table_id {
+                includes.push(IncludeSpec {
+                    name: related_path.clone(),
+                    direction: IncludeDirection::ToOne,
+                    related_path_segment: related_path,
+                    our_key_column: our_key,
+                    their_key_column: their_key,
+                });
+            }
+        }
+        if let (Some(our_key), Some(their_key), Some(related_path)) = (to_col, from_col, from_path) {
+            if rel.to_table_id == our_table_id {
+                includes.push(IncludeSpec {
+                    name: related_path.clone(),
+                    direction: IncludeDirection::ToMany,
+                    related_path_segment: related_path,
+                    our_key_column: our_key,
+                    their_key_column: their_key,
+                });
+            }
+        }
+    }
+    includes
 }
 
 fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
@@ -125,6 +176,11 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("timestamp".into())
     } else if lower == "date" {
         Some("date".into())
+    } else if lower.contains("uuid") {
+        Some("uuid".into())
+    } else if name.contains('.') {
+        // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
+        Some(name.to_string())
     } else {
         None
     }
@@ -147,9 +203,9 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
     }
 }
 
-/// Load full config from architect._private_* tables. Tables must already exist (ensure_private_tables).
+/// Load full config from architect._sys_* tables. Tables must already exist (ensure_sys_tables).
 pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
-    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_private_table("_private_schemas")).await?;
+    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas")).await?;
     if schemas.is_empty() {
         schemas = vec![SchemaConfig {
             id: "default".into(),
@@ -157,12 +213,12 @@ pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
             comment: None,
         }];
     }
-    let enums = load_config_table::<EnumConfig>(pool, &qualified_private_table("_private_enums")).await?;
-    let tables = load_config_table::<TableConfig>(pool, &qualified_private_table("_private_tables")).await?;
-    let columns = load_config_table::<ColumnConfig>(pool, &qualified_private_table("_private_columns")).await?;
-    let indexes = load_config_table::<IndexConfig>(pool, &qualified_private_table("_private_indexes")).await?;
-    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_private_table("_private_relationships")).await?;
-    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_private_table("_private_api_entities")).await?;
+    let enums = load_config_table::<EnumConfig>(pool, &qualified_sys_table("_sys_enums")).await?;
+    let tables = load_config_table::<TableConfig>(pool, &qualified_sys_table("_sys_tables")).await?;
+    let columns = load_config_table::<ColumnConfig>(pool, &qualified_sys_table("_sys_columns")).await?;
+    let indexes = load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes")).await?;
+    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_sys_table("_sys_relationships")).await?;
+    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_sys_table("_sys_api_entities")).await?;
 
     let config = FullConfig {
         schemas,

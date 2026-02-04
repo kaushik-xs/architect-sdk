@@ -80,7 +80,7 @@
               ]
             },
             "url": "{{base_url}}/api/v1/config/plugin",
-            "description": "Upload a plugin zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _private_plugins."
+            "description": "Upload a plugin zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_plugins."
           }
         },
         {

@@ -1,4 +1,4 @@
-//! _private_* table DDL and config persistence. All _private_* tables live in the `architect` schema.
+//! _sys_* table DDL and config persistence. All _sys_* tables live in a schema named from `ARCHITECT_SCHEMA` env (default `architect`).
 
 use crate::error::AppError;
 use sqlx::ConnectOptions;
@@ -6,33 +6,37 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-pub const ARCHITECT_SCHEMA: &str = "architect";
-
-/// Returns schema-qualified table name for _private_* tables (e.g. "architect._private_schemas").
-pub fn qualified_private_table(table: &str) -> String {
-    format!("{}.{}", ARCHITECT_SCHEMA, table)
+/// Schema name for _sys_* tables. From env `ARCHITECT_SCHEMA`, default `architect`. Must be a valid PostgreSQL identifier.
+pub fn architect_schema() -> String {
+    std::env::var("ARCHITECT_SCHEMA").unwrap_or_else(|_| "architect".into())
 }
 
-const PRIVATE_TABLES: &[&str] = &[
-    "_private_schemas",
-    "_private_enums",
-    "_private_tables",
-    "_private_columns",
-    "_private_indexes",
-    "_private_relationships",
-    "_private_api_entities",
-    "_private_plugins",
+/// Returns schema-qualified table name for _sys_* tables (e.g. "architect._sys_schemas").
+pub fn qualified_sys_table(table: &str) -> String {
+    format!("{}.{}", architect_schema(), table)
+}
+
+const SYS_TABLES: &[&str] = &[
+    "_sys_schemas",
+    "_sys_enums",
+    "_sys_tables",
+    "_sys_columns",
+    "_sys_indexes",
+    "_sys_relationships",
+    "_sys_api_entities",
+    "_sys_plugins",
 ];
 
-/// Create `architect` schema if not exists, then _private_* tables (with version) and _private_*_history tables inside it.
+/// Create schema from `ARCHITECT_SCHEMA` env if not exists, then _sys_* tables (with version) and _sys_*_history tables inside it.
 /// If tables already exist without a version column, adds it (PostgreSQL 11+).
-pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", ARCHITECT_SCHEMA))
+pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
+    let schema = architect_schema();
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
         .execute(pool)
         .await?;
 
-    for table in PRIVATE_TABLES {
-        let q_table = qualified_private_table(table);
+    for table in SYS_TABLES {
+        let q_table = qualified_sys_table(table);
         let ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -51,7 +55,7 @@ pub async fn ensure_private_tables(pool: &PgPool) -> Result<(), AppError> {
         );
         let _ = sqlx::query(&alter).execute(pool).await;
 
-        let history_table = qualified_private_table(&format!("{}_history", table));
+        let history_table = qualified_sys_table(&format!("{}_history", table));
         let history_ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
@@ -74,7 +78,7 @@ fn config_record_id(table: &str, rec: &serde_json::Value) -> Result<String, AppE
     let id = rec.get("id").and_then(|v| v.as_str());
     let entity_id = rec.get("entity_id").and_then(|v| v.as_str());
     match (table, id, entity_id) {
-        ("_private_api_entities", None, Some(eid)) => Ok(eid.to_string()),
+        ("_sys_api_entities", None, Some(eid)) => Ok(eid.to_string()),
         (_, Some(id), _) => Ok(id.to_string()),
         _ => Err(AppError::BadRequest(
             "each config record must have an 'id' field (or 'entity_id' for api_entities)".into(),
@@ -111,7 +115,7 @@ pub async fn replace_config_rows(
     table: &str,
     records: &[serde_json::Value],
 ) -> Result<(u64, i64), AppError> {
-    let q_table = qualified_private_table(table);
+    let q_table = qualified_sys_table(table);
     let current_version: (Option<i64>,) = sqlx::query_as(&format!(
         "SELECT COALESCE(MAX(version), 0) FROM {}",
         q_table
@@ -134,7 +138,7 @@ pub async fn replace_config_rows(
         return Ok((0, current_version));
     }
 
-    let history_table = qualified_private_table(&format!("{}_history", table));
+    let history_table = qualified_sys_table(&format!("{}_history", table));
     let new_version = current_version + 1;
 
     sqlx::query(&format!(
@@ -165,8 +169,8 @@ pub async fn replace_config_rows(
     Ok((count, new_version))
 }
 
-const PLUGINS_TABLE: &str = "_private_plugins";
-const PLUGINS_HISTORY_TABLE: &str = "_private_plugins_history";
+const PLUGINS_TABLE: &str = "_sys_plugins";
+const PLUGINS_HISTORY_TABLE: &str = "_sys_plugins_history";
 
 /// Upsert one plugin row by id: copy current to history if exists, then insert or replace with new payload and incremented version.
 pub async fn upsert_plugin(
@@ -174,8 +178,8 @@ pub async fn upsert_plugin(
     id: &str,
     payload: &serde_json::Value,
 ) -> Result<i64, AppError> {
-    let q_plugins = qualified_private_table(PLUGINS_TABLE);
-    let q_plugins_history = qualified_private_table(PLUGINS_HISTORY_TABLE);
+    let q_plugins = qualified_sys_table(PLUGINS_TABLE);
+    let q_plugins_history = qualified_sys_table(PLUGINS_HISTORY_TABLE);
     let mut tx = pool.begin().await?;
     let current: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
         "SELECT payload, version FROM {} WHERE id = $1",
@@ -263,15 +267,15 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-pub fn private_table_for_kind(kind: &str) -> Option<&'static str> {
+pub fn sys_table_for_kind(kind: &str) -> Option<&'static str> {
     match kind {
-        "schemas" => Some("_private_schemas"),
-        "enums" => Some("_private_enums"),
-        "tables" => Some("_private_tables"),
-        "columns" => Some("_private_columns"),
-        "indexes" => Some("_private_indexes"),
-        "relationships" => Some("_private_relationships"),
-        "api_entities" => Some("_private_api_entities"),
+        "schemas" => Some("_sys_schemas"),
+        "enums" => Some("_sys_enums"),
+        "tables" => Some("_sys_tables"),
+        "columns" => Some("_sys_columns"),
+        "indexes" => Some("_sys_indexes"),
+        "relationships" => Some("_sys_relationships"),
+        "api_entities" => Some("_sys_api_entities"),
         _ => None,
     }
 }

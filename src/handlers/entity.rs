@@ -2,7 +2,7 @@
 //! Request bodies and query param keys are accepted in camelCase and converted to snake_case for DB; response row keys are converted to camelCase.
 
 use crate::case::{hashmap_keys_to_snake_case, to_snake_case, value_keys_to_camel_case};
-use crate::config::{PkType, ResolvedEntity};
+use crate::config::{IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
 use crate::error::AppError;
 use crate::service::{CrudService, RequestValidator};
 use crate::state::AppState;
@@ -91,6 +91,116 @@ fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value 
     Value::String(s.to_string())
 }
 
+/// Resolve include names to (name, spec, related_entity). Call with model read lock held.
+fn resolve_includes(
+    model: &ResolvedModel,
+    entity: &ResolvedEntity,
+    include_names: &[String],
+) -> Result<Vec<(String, crate::config::IncludeSpec, ResolvedEntity)>, AppError> {
+    let mut out = Vec::new();
+    for name in include_names {
+        let spec = entity
+            .includes
+            .iter()
+            .find(|i| i.name.as_str() == name.as_str())
+            .ok_or_else(|| AppError::BadRequest(format!("unknown include: {}", name)))?
+            .clone();
+        let related = model
+            .entity_by_path(&spec.related_path_segment)
+            .cloned()
+            .ok_or_else(|| AppError::BadRequest(format!("related entity not found: {}", spec.related_path_segment)))?;
+        out.push((name.clone(), spec, related));
+    }
+    Ok(out)
+}
+
+/// Attach related-entity data to rows. Modifies each row in place. resolved_includes from resolve_includes (so lock can be dropped before calling).
+async fn attach_includes(
+    pool: &sqlx::PgPool,
+    _entity: &ResolvedEntity,
+    rows: &mut [Value],
+    resolved_includes: &[(String, crate::config::IncludeSpec, ResolvedEntity)],
+) -> Result<(), AppError> {
+    if resolved_includes.is_empty() || rows.is_empty() {
+        return Ok(());
+    }
+    for (name, spec, related) in resolved_includes {
+
+        match &spec.direction {
+            IncludeDirection::ToOne => {
+                let keys: Vec<Value> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&spec.our_key_column).cloned())
+                    .collect();
+                let related_rows = CrudService::fetch_where_column_in(
+                    pool,
+                    related,
+                    &spec.their_key_column,
+                    &keys,
+                )
+                .await?;
+                let mut key_to_row: HashMap<String, Value> = HashMap::new();
+                for mut r in related_rows {
+                    let k = r
+                        .get(&spec.their_key_column)
+                        .cloned()
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                        .unwrap_or_default();
+                    if !key_to_row.contains_key(&k) {
+                        strip_sensitive_columns(&mut r, &related.sensitive_columns);
+                        value_keys_to_camel_case(&mut r);
+                        key_to_row.insert(k, r);
+                    }
+                }
+                for row in rows.iter_mut() {
+                    if let Value::Object(ref mut map) = row {
+                        let key_val = map.get(&spec.our_key_column).cloned().unwrap_or(Value::Null);
+                        let key = serde_json::to_string(&key_val).unwrap_or_default();
+                        let included = key_to_row.get(&key).cloned().unwrap_or(Value::Null);
+                        map.insert(name.clone(), included);
+                    }
+                }
+            }
+            IncludeDirection::ToMany => {
+                let keys: Vec<Value> = rows
+                    .iter()
+                    .filter_map(|r| r.get(&spec.our_key_column).cloned())
+                    .collect();
+                let related_rows = CrudService::fetch_where_column_in(
+                    pool,
+                    related,
+                    &spec.their_key_column,
+                    &keys,
+                )
+                .await?;
+                let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
+                for mut r in related_rows {
+                    let k = r
+                        .get(&spec.their_key_column)
+                        .cloned()
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                        .unwrap_or_default();
+                    strip_sensitive_columns(&mut r, &related.sensitive_columns);
+                    value_keys_to_camel_case(&mut r);
+                    grouped.entry(k).or_default().push(r);
+                }
+                for row in rows.iter_mut() {
+                    if let Value::Object(ref mut map) = row {
+                        let key_val = map.get(&spec.our_key_column).cloned().unwrap_or(Value::Null);
+                        let key = serde_json::to_string(&key_val).unwrap_or_default();
+                        let arr = grouped
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_default();
+                        map.insert(name.clone(), Value::Array(arr));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Path(path_segment): Path<String>,
@@ -104,6 +214,7 @@ pub async fn list(
 
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
+    let mut include_names: Vec<String> = Vec::new();
     let mut filters: Vec<(String, Value)> = Vec::new();
 
     for (k, v) in params {
@@ -113,6 +224,9 @@ pub async fn list(
             }
             "offset" => {
                 offset = v.parse().ok();
+            }
+            "include" => {
+                include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
             _ => {
                 let col_key = to_snake_case(&k);
@@ -125,6 +239,11 @@ pub async fn list(
     }
 
     let mut rows = CrudService::list(&state.pool, &entity, &filters, limit, offset).await?;
+    let resolved = {
+        let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        resolve_includes(&model, &entity, &include_names)?
+    };
+    attach_includes(&state.pool, &entity, &mut rows, &resolved).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
@@ -160,6 +279,7 @@ pub async fn create(
 pub async fn read(
     State(state): State<AppState>,
     Path((path_segment, id_str)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "read") {
@@ -168,6 +288,19 @@ pub async fn read(
     let id = parse_id(&id_str, &entity.pk_type)?;
     let mut row = CrudService::read(&state.pool, &entity, &id).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
+    let include_names: Vec<String> = params
+        .get("include")
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    if !include_names.is_empty() {
+        let resolved = {
+            let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+            resolve_includes(&model, &entity, &include_names)?
+        };
+        let mut rows = [row];
+        attach_includes(&state.pool, &entity, &mut rows, &resolved).await?;
+        row = rows[0].clone();
+    }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))

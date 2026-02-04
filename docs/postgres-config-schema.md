@@ -27,7 +27,7 @@ Each config is an **array of records**. One record = one enum, one table, one co
 
 ### Storage: table vs file
 
-- **Database tables**: You can store each config type in its own table (e.g. `_private_tables`). Each row is one record; complex fields can be JSON/JSONB columns.
+- **Database tables**: You can store each config type in its own table (e.g. `_sys_tables`). Each row is one record; complex fields can be JSON/JSONB columns.
 - **JSON files (plugin)**: Use one JSON file per config type inside a plugin directory or zip. The directory must contain `manifest.json` (with `schema`). Example layout: `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, `api_entities.json`. No `schemas.json` is required.
 
 The record shape is the same in both cases; only the storage medium changes.

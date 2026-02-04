@@ -17,6 +17,6 @@ pub use error::{AppError, ConfigError};
 pub use migration::apply_migrations;
 pub use response::{success_one, success_many, error_body};
 pub use state::AppState;
-pub use store::{ensure_database_exists, ensure_private_tables};
+pub use store::{ensure_database_exists, ensure_sys_tables};
 pub use routes::{common_routes, common_routes_with_ready, config_routes, entity_routes};
 pub use service::CrudService;

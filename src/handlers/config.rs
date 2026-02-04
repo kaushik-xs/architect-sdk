@@ -4,7 +4,7 @@ use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
-use crate::store::{private_table_for_kind, qualified_private_table, replace_config_rows};
+use crate::store::{qualified_sys_table, replace_config_rows, sys_table_for_kind};
 use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
@@ -12,14 +12,14 @@ use sqlx::PgPool;
 
 /// Replace config for one kind. Returns (body, num_rows_written).
 /// When run_migrations is true and num_rows_written > 0, loads full config and runs migrations (validates config; requires all dependent configs already in DB).
-/// When run_migrations is false (e.g. plugin install), only writes to _private_*; caller must run migrations once after all kinds are applied.
+/// When run_migrations is false (e.g. plugin install), only writes to _sys_*; caller must run migrations once after all kinds are applied.
 pub(crate) async fn replace_config(
     pool: &PgPool,
     kind: &str,
     body: Vec<Value>,
     run_migrations: bool,
 ) -> Result<(Vec<Value>, u64), AppError> {
-    let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
+    let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
     let (count, _version) = replace_config_rows(&mut tx, table, &body).await?;
     tx.commit().await?;
@@ -40,8 +40,8 @@ pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
 }
 
 async fn get_config(pool: &PgPool, kind: &str) -> Result<Vec<Value>, AppError> {
-    let table = private_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
-    let q_table = qualified_private_table(table);
+    let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
+    let q_table = qualified_sys_table(table);
     let rows = sqlx::query_scalar::<_, Value>(&format!("SELECT payload FROM {} ORDER BY id", q_table))
         .fetch_all(pool)
         .await?;
