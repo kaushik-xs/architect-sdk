@@ -178,6 +178,8 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("date".into())
     } else if lower.contains("uuid") {
         Some("uuid".into())
+    } else if lower == "numeric" || lower.starts_with("numeric(") || lower == "decimal" || lower.starts_with("decimal(") {
+        Some("numeric".into())
     } else if name.contains('.') {
         // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
         Some(name.to_string())
@@ -203,9 +205,9 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
     }
 }
 
-/// Load full config from architect._sys_* tables. Tables must already exist (ensure_sys_tables).
-pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
-    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas")).await?;
+/// Load full config from architect._sys_* tables for one module. Tables must already exist (ensure_sys_tables).
+pub async fn load_from_pool(pool: &PgPool, module_id: &str) -> Result<FullConfig, ConfigError> {
+    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas"), module_id).await?;
     if schemas.is_empty() {
         schemas = vec![SchemaConfig {
             id: "default".into(),
@@ -213,12 +215,12 @@ pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
             comment: None,
         }];
     }
-    let enums = load_config_table::<EnumConfig>(pool, &qualified_sys_table("_sys_enums")).await?;
-    let tables = load_config_table::<TableConfig>(pool, &qualified_sys_table("_sys_tables")).await?;
-    let columns = load_config_table::<ColumnConfig>(pool, &qualified_sys_table("_sys_columns")).await?;
-    let indexes = load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes")).await?;
-    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_sys_table("_sys_relationships")).await?;
-    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_sys_table("_sys_api_entities")).await?;
+    let enums = load_config_table::<EnumConfig>(pool, &qualified_sys_table("_sys_enums"), module_id).await?;
+    let tables = load_config_table::<TableConfig>(pool, &qualified_sys_table("_sys_tables"), module_id).await?;
+    let columns = load_config_table::<ColumnConfig>(pool, &qualified_sys_table("_sys_columns"), module_id).await?;
+    let indexes = load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes"), module_id).await?;
+    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_sys_table("_sys_relationships"), module_id).await?;
+    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_sys_table("_sys_api_entities"), module_id).await?;
 
     let config = FullConfig {
         schemas,
@@ -232,16 +234,17 @@ pub async fn load_from_pool(pool: &PgPool) -> Result<FullConfig, ConfigError> {
     Ok(config)
 }
 
-async fn load_config_table<T>(pool: &PgPool, table: &str) -> Result<Vec<T>, ConfigError>
+async fn load_config_table<T>(pool: &PgPool, table: &str, module_id: &str) -> Result<Vec<T>, ConfigError>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let sql = format!("SELECT payload FROM {} ORDER BY id", table);
-    tracing::debug!(sql = %sql, "query");
+    let sql = format!("SELECT payload FROM {} WHERE module_id = $1 ORDER BY id", table);
+    tracing::debug!(sql = %sql, module_id = %module_id, "query");
     let rows = sqlx::query_scalar::<_, serde_json::Value>(&sql)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ConfigError::Load(e.to_string()))?;
+        .bind(module_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ConfigError::Load(e.to_string()))?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {

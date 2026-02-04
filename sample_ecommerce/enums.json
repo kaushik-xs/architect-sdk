@@ -1,0 +1,26 @@
+[
+  {
+    "id": "enum_order_status",
+    "name": "order_status",
+    "values": ["draft", "pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"],
+    "comment": "Order lifecycle status"
+  },
+  {
+    "id": "enum_payment_status",
+    "name": "payment_status",
+    "values": ["pending", "authorized", "captured", "failed", "refunded", "cancelled"],
+    "comment": "Payment state"
+  },
+  {
+    "id": "enum_address_kind",
+    "name": "address_kind",
+    "values": ["shipping", "billing", "both"],
+    "comment": "Address usage type"
+  },
+  {
+    "id": "enum_product_status",
+    "name": "product_status",
+    "values": ["draft", "active", "archived", "out_of_stock"],
+    "comment": "Product visibility and availability"
+  }
+]

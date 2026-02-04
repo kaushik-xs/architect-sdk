@@ -21,7 +21,7 @@ Responses include these fields. You do not need to send them on create; you can 
 ## Folders
 
 - **Common**: Health, Ready, Version, Info (no `/api/v1` prefix).
-- **Config**: Install Plugin (POST `/api/v1/config/plugin`, multipart zip with manifest.json + config JSONs), then GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities (under `/api/v1/config/...`). The sample config omits created_at/updated_at/archived_at; they are added automatically.
+- **Config**: Install Module (POST `/api/v1/config/module`, multipart zip with manifest.json + config JSONs), then GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities (under `/api/v1/config/...`). The sample config omits created_at/updated_at/archived_at; they are added automatically.
 - **Users**: List (with optional filters and limit/offset), Create, Read, Update, Delete, Bulk Create, Bulk Update (under `/api/v1/users`).
 - **Orders**: Same operations for orders (under `/api/v1/orders`). List supports filters (e.g. `?status=pending&user_id=...`).
 

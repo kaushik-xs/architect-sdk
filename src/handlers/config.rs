@@ -4,47 +4,49 @@ use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
-use crate::store::{qualified_sys_table, replace_config_rows, sys_table_for_kind};
+use crate::store::{qualified_sys_table, replace_config_rows, sys_table_for_kind, DEFAULT_MODULE_ID};
 use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
 use sqlx::PgPool;
 
-/// Replace config for one kind. Returns (body, num_rows_written).
-/// When run_migrations is true and num_rows_written > 0, loads full config and runs migrations (validates config; requires all dependent configs already in DB).
-/// When run_migrations is false (e.g. plugin install), only writes to _sys_*; caller must run migrations once after all kinds are applied.
+/// Replace config for one kind and module. Returns (body, num_rows_written).
+/// When run_migrations is true and num_rows_written > 0, loads full config for that module and runs migrations.
+/// When run_migrations is false (e.g. module install), only writes to _sys_*; caller must run migrations once after all kinds are applied.
 pub(crate) async fn replace_config(
     pool: &PgPool,
     kind: &str,
     body: Vec<Value>,
     run_migrations: bool,
+    module_id: &str,
 ) -> Result<(Vec<Value>, u64), AppError> {
     let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
-    let (count, _version) = replace_config_rows(&mut tx, table, &body).await?;
+    let (count, _version) = replace_config_rows(&mut tx, table, module_id, &body).await?;
     tx.commit().await?;
     if run_migrations && count > 0 {
-        let config = load_from_pool(pool).await.map_err(AppError::Config)?;
+        let config = load_from_pool(pool, module_id).await.map_err(AppError::Config)?;
         apply_migrations(pool, &config).await?;
     }
     Ok((body, count))
 }
 
-/// Reload in-memory model from DB so new/updated entities are available without restart.
+/// Reload in-memory model from DB so new/updated entities are available without restart. Loads config for DEFAULT_MODULE_ID.
 pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
-    let config = load_from_pool(&state.pool).await.map_err(AppError::Config)?;
+    let config = load_from_pool(&state.pool, DEFAULT_MODULE_ID).await.map_err(AppError::Config)?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
     *guard = new_model;
     Ok(())
 }
 
-async fn get_config(pool: &PgPool, kind: &str) -> Result<Vec<Value>, AppError> {
+async fn get_config(pool: &PgPool, kind: &str, module_id: &str) -> Result<Vec<Value>, AppError> {
     let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let q_table = qualified_sys_table(table);
-    let sql = format!("SELECT payload FROM {} ORDER BY id", q_table);
-    tracing::debug!(sql = %sql, "query");
+    let sql = format!("SELECT payload FROM {} WHERE module_id = $1 ORDER BY id", q_table);
+    tracing::debug!(sql = %sql, module_id = %module_id, "query");
     let rows = sqlx::query_scalar::<_, Value>(&sql)
+        .bind(module_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -56,7 +58,7 @@ macro_rules! config_handler {
             State(state): State<AppState>,
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
-            let (out, num_written) = replace_config(&state.pool, $kind, body, true).await?;
+            let (out, num_written) = replace_config(&state.pool, $kind, body, true, DEFAULT_MODULE_ID).await?;
             if num_written > 0 {
                 reload_model(&state).await?;
             }
@@ -77,7 +79,7 @@ macro_rules! get_config_handler {
         pub async fn $method(
             State(state): State<AppState>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
-            let out = get_config(&state.pool, $kind).await?;
+            let out = get_config(&state.pool, $kind, DEFAULT_MODULE_ID).await?;
             Ok((
                 axum::http::StatusCode::OK,
                 Json(crate::response::SuccessMany {

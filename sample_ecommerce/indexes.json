@@ -1,0 +1,206 @@
+[
+  {
+    "id": "idx_organizations_slug",
+    "table_id": "tbl_organizations",
+    "name": "idx_organizations_slug",
+    "method": "btree",
+    "unique": true,
+    "columns": ["slug"],
+    "include": [],
+    "where": null,
+    "comment": "Unique lookup by slug"
+  },
+  {
+    "id": "idx_users_org_email",
+    "table_id": "tbl_users",
+    "name": "idx_users_org_email",
+    "method": "btree",
+    "unique": true,
+    "columns": ["organization_id", "email"],
+    "include": [],
+    "where": null,
+    "comment": "Unique user email per organization"
+  },
+  {
+    "id": "idx_users_organization_id",
+    "table_id": "tbl_users",
+    "name": "idx_users_organization_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id"],
+    "include": [],
+    "where": null,
+    "comment": "List users by organization"
+  },
+  {
+    "id": "idx_customers_organization_id",
+    "table_id": "tbl_customers",
+    "name": "idx_customers_organization_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id"],
+    "include": [],
+    "where": null,
+    "comment": "List customers by organization"
+  },
+  {
+    "id": "idx_customers_email",
+    "table_id": "tbl_customers",
+    "name": "idx_customers_email",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id", "email"],
+    "include": [],
+    "where": null,
+    "comment": "Lookup customers by email"
+  },
+  {
+    "id": "idx_addresses_customer_id",
+    "table_id": "tbl_addresses",
+    "name": "idx_addresses_customer_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["customer_id"],
+    "include": [],
+    "where": null,
+    "comment": "Addresses by customer"
+  },
+  {
+    "id": "idx_warehouses_organization_id",
+    "table_id": "tbl_warehouses",
+    "name": "idx_warehouses_organization_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id"],
+    "include": [],
+    "where": null,
+    "comment": "Warehouses by organization"
+  },
+  {
+    "id": "idx_product_categories_organization_parent",
+    "table_id": "tbl_product_categories",
+    "name": "idx_product_categories_organization_parent",
+    "method": "btree",
+    "unique": false,
+    "columns": [
+      { "name": "organization_id", "direction": "asc" },
+      { "name": "parent_id", "direction": "asc" }
+    ],
+    "include": [],
+    "where": null,
+    "comment": "Category tree by organization"
+  },
+  {
+    "id": "idx_products_organization_id",
+    "table_id": "tbl_products",
+    "name": "idx_products_organization_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id"],
+    "include": [],
+    "where": null,
+    "comment": "Products by organization"
+  },
+  {
+    "id": "idx_products_status",
+    "table_id": "tbl_products",
+    "name": "idx_products_status",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id", "status"],
+    "include": [],
+    "where": null,
+    "comment": "Active products listing"
+  },
+  {
+    "id": "idx_product_category_mappings_product",
+    "table_id": "tbl_product_category_mappings",
+    "name": "idx_product_category_mappings_product",
+    "method": "btree",
+    "unique": false,
+    "columns": ["product_id"],
+    "include": [],
+    "where": null,
+    "comment": "Categories for a product"
+  },
+  {
+    "id": "idx_product_category_mappings_category",
+    "table_id": "tbl_product_category_mappings",
+    "name": "idx_product_category_mappings_category",
+    "method": "btree",
+    "unique": false,
+    "columns": ["category_id"],
+    "include": [],
+    "where": null,
+    "comment": "Products in a category"
+  },
+  {
+    "id": "idx_orders_organization_created",
+    "table_id": "tbl_orders",
+    "name": "idx_orders_organization_created",
+    "method": "btree",
+    "unique": false,
+    "columns": [
+      { "name": "organization_id", "direction": "asc" },
+      { "name": "created_at", "direction": "desc" }
+    ],
+    "include": [],
+    "where": null,
+    "comment": "Orders by organization and time"
+  },
+  {
+    "id": "idx_orders_customer_id",
+    "table_id": "tbl_orders",
+    "name": "idx_orders_customer_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["customer_id"],
+    "include": [],
+    "where": null,
+    "comment": "Orders by customer"
+  },
+  {
+    "id": "idx_orders_status",
+    "table_id": "tbl_orders",
+    "name": "idx_orders_status",
+    "method": "btree",
+    "unique": false,
+    "columns": ["organization_id", "status"],
+    "include": [],
+    "where": null,
+    "comment": "Orders by status"
+  },
+  {
+    "id": "idx_order_items_order_id",
+    "table_id": "tbl_order_items",
+    "name": "idx_order_items_order_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["order_id"],
+    "include": [],
+    "where": null,
+    "comment": "Line items by order"
+  },
+  {
+    "id": "idx_payments_order_id",
+    "table_id": "tbl_payments",
+    "name": "idx_payments_order_id",
+    "method": "btree",
+    "unique": false,
+    "columns": ["order_id"],
+    "include": [],
+    "where": null,
+    "comment": "Payments by order"
+  },
+  {
+    "id": "idx_inventory_product_warehouse",
+    "table_id": "tbl_inventory",
+    "name": "idx_inventory_product_warehouse",
+    "method": "btree",
+    "unique": true,
+    "columns": ["product_id", "warehouse_id"],
+    "include": [],
+    "where": null,
+    "comment": "Unique stock per product/warehouse"
+  }
+]

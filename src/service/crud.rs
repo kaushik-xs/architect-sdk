@@ -297,6 +297,12 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     }
     if let Ok(v) = row.try_get::<Option<String>, _>(name) {
         if let Some(s) = v {
+            // Numeric columns are selected as ::text; parse so we return a JSON number not string
+            if let Ok(n) = s.trim().parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(n) {
+                    return Value::Number(num);
+                }
+            }
             return Value::String(s);
         }
     }

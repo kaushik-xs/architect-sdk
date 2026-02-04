@@ -48,19 +48,19 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
 
 3. Run the example server. The server loads `.env` at startup. Optional env:
    - **`ARCHITECT_SCHEMA`**: PostgreSQL schema for _sys_* config tables (default `architect`). Must be a valid identifier.
-   - **`PLUGIN_PATH`**: If set, config is loaded from that plugin directory (must contain `manifest.json` + config JSONs, e.g. `sample`) and migrations are applied. If not set, only _sys_* tables are ensured and config is loaded from the DB (empty until you POST config via `/api/v1/config/...` or install a plugin via `POST /api/v1/config/plugin`).
+   - **`MODULE_PATH`**: If set, config is loaded from that module directory (must contain `manifest.json` + config JSONs, e.g. `sample`) and migrations are applied. If not set, only _sys_* tables are ensured and config is loaded from the DB (empty until you POST config via `/api/v1/config/...` or install a module via `POST /api/v1/config/module`).
 
    ```bash
    cp .env.example .env
-   # Optionally set PLUGIN_PATH=sample to load from sample/ (manifest.json + config JSONs)
+   # Optionally set MODULE_PATH=sample to load from sample/ (manifest.json + config JSONs)
    cargo run --example server
    ```
 
 ## API overview
 
 - **Common**: `GET /health`, `GET /ready`, `GET /version`, `GET /info`
-- **Config**: `POST /api/v1/config/plugin` (multipart zip: manifest.json + config JSONs), then `POST`/`GET` per kind: `schemas`, `enums`, `tables`, `columns`, `indexes`, `relationships`, `api_entities`
-- **Entities**: For each entity (e.g. `users`): `GET /api/v1/users` (list all, optional filters: `?col=value`, `?limit=100`, `?offset=0`, `?include=orders` to embed related entities as exploded JSON), `POST /api/v1/users`, `GET /api/v1/users/:id` (optional `?include=orders`), `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`. **Case**: Request bodies and query param keys accept **camelCase** (e.g. `userId`, `createdAt`) and are converted to snake_case for the DB; response row keys are returned in **camelCase**. **Includes**: Use `?include=path_segment1,path_segment2` on list and read; allowed values are the related entities’ path segments defined by relationships (e.g. `orders` for a to-many from users).
+- **Config**: `POST /api/v1/config/module` (multipart zip: manifest.json + config JSONs), then `POST`/`GET` per kind: `schemas`, `enums`, `tables`, `columns`, `indexes`, `relationships`, `api_entities`
+- **Entities**: For each entity (e.g. `users`): `GET /api/v1/users` (list all, optional filters: `?col=value`, `?limit=100`, `?offset=0`, `?include=orders` to embed related entities as exploded JSON), `POST /api/v1/users`, `GET /api/v1/users/:id` (optional `?include=orders`), `PATCH /api/v1/users/:id`, `DELETE /api/v1/users/:id`, `POST /api/v1/users/bulk`, `PATCH /api/v1/users/bulk`. **Case**: Request bodies and query param keys accept **camelCase** (e.g. `userId`, `createdAt`) and are converted to snake_case for the DB; response row keys are returned in **camelCase**. **Includes**: Use `?include=path_segment1,path_segment2` on list and read; allowed values are the related entities’ path segments defined by relationships (e.g. `orders` for a to-many from users). **Multiple modules**: When two modules both define an entity with the same path (e.g. `users`), use module-scoped routes so each module’s data is separate: `GET /api/v1/module/:module_id/users`, `POST /api/v1/module/:module_id/users`, `GET /api/v1/module/:module_id/users/:id`, etc. The default (unprefixed) routes use the default/active model; `module_id` is the module manifest `id` (e.g. `sample`, `sample_ecommerce`).
 
 ## License
 

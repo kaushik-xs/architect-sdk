@@ -1,0 +1,153 @@
+[
+  {
+    "entity_id": "tbl_organizations",
+    "path_segment": "organizations",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "name": { "required": true, "max_length": 255 },
+      "slug": { "required": true, "max_length": 100 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_users",
+    "path_segment": "users",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": ["email"],
+    "validation": {
+      "email": { "required": true, "format": "email", "max_length": 255 },
+      "organization_id": { "required": true, "format": "uuid" },
+      "first_name": { "required": true, "max_length": 255 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_customers",
+    "path_segment": "customers",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": ["email"],
+    "validation": {
+      "email": { "required": true, "format": "email", "max_length": 255 },
+      "organization_id": { "required": true, "format": "uuid" },
+      "first_name": { "required": true, "max_length": 255 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_addresses",
+    "path_segment": "addresses",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "customer_id": { "required": true, "format": "uuid" },
+      "kind": { "allowed": ["shipping", "billing", "both"] },
+      "street": { "required": true },
+      "city": { "required": true, "max_length": 255 },
+      "postal_code": { "required": true, "max_length": 20 },
+      "country": { "required": true, "max_length": 2 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_warehouses",
+    "path_segment": "warehouses",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "organization_id": { "required": true, "format": "uuid" },
+      "name": { "required": true, "max_length": 255 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_product_categories",
+    "path_segment": "product_categories",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "organization_id": { "required": true, "format": "uuid" },
+      "name": { "required": true, "max_length": 255 },
+      "slug": { "required": true, "max_length": 100 },
+      "parent_id": { "format": "uuid" },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_products",
+    "path_segment": "products",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "organization_id": { "required": true, "format": "uuid" },
+      "sku": { "required": true, "max_length": 100 },
+      "name": { "required": true, "max_length": 500 },
+      "status": { "allowed": ["draft", "active", "archived", "out_of_stock"] },
+      "price": { "required": true },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_product_category_mappings",
+    "path_segment": "product_category_mappings",
+    "operations": ["create", "read", "delete", "bulk_create"],
+    "sensitive_columns": [],
+    "validation": {
+      "product_id": { "required": true, "format": "uuid" },
+      "category_id": { "required": true, "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_orders",
+    "path_segment": "orders",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "organization_id": { "required": true, "format": "uuid" },
+      "customer_id": { "required": true, "format": "uuid" },
+      "status": { "allowed": ["draft", "pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"] },
+      "total_amount": { "required": true },
+      "shipping_address_id": { "format": "uuid" },
+      "billing_address_id": { "format": "uuid" },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_order_items",
+    "path_segment": "order_items",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "order_id": { "required": true, "format": "uuid" },
+      "product_id": { "required": true, "format": "uuid" },
+      "quantity": { "required": true },
+      "unit_price": { "required": true },
+      "total_price": { "required": true }
+    }
+  },
+  {
+    "entity_id": "tbl_payments",
+    "path_segment": "payments",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": ["reference"],
+    "validation": {
+      "order_id": { "required": true, "format": "uuid" },
+      "amount": { "required": true },
+      "status": { "allowed": ["pending", "authorized", "captured", "failed", "refunded", "cancelled"] },
+      "method": { "required": true, "max_length": 50 },
+      "id": { "format": "uuid" }
+    }
+  },
+  {
+    "entity_id": "tbl_inventory",
+    "path_segment": "inventory",
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "sensitive_columns": [],
+    "validation": {
+      "product_id": { "required": true, "format": "uuid" },
+      "warehouse_id": { "required": true, "format": "uuid" },
+      "quantity": { "required": true },
+      "reserved_quantity": { "required": true }
+    }
+  }
+]

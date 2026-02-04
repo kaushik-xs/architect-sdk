@@ -2,7 +2,7 @@
 //! Request bodies and query param keys are accepted in camelCase and converted to snake_case for DB; response row keys are converted to camelCase.
 
 use crate::case::{hashmap_keys_to_snake_case, to_snake_case, value_keys_to_camel_case};
-use crate::config::{IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
+use crate::config::{load_from_pool, resolve, IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
 use crate::error::AppError;
 use crate::service::{CrudService, RequestValidator};
 use crate::sql::IncludeSelect;
@@ -113,6 +113,24 @@ fn resolve_includes(
         out.push((name.clone(), spec, related));
     }
     Ok(out)
+}
+
+/// Get resolved model for a module_id from cache, or load from DB and cache it.
+pub(crate) async fn get_or_load_module_model(state: &AppState, module_id: &str) -> Result<ResolvedModel, AppError> {
+    {
+        let guard = state.module_models.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        if let Some(m) = guard.get(module_id) {
+            return Ok(m.clone());
+        }
+    }
+    let config = load_from_pool(&state.pool, module_id).await.map_err(AppError::Config)?;
+    let model = resolve(&config).map_err(AppError::Config)?;
+    state
+        .module_models
+        .write()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .insert(module_id.to_string(), model.clone());
+    Ok(model)
 }
 
 /// Post-process rows from single-query list_with_includes: parse JSON include columns if string, strip sensitive and camelCase nested objects.
@@ -471,4 +489,192 @@ pub async fn bulk_update(
             meta: crate::response::MetaCount { count },
         }),
     ))
+}
+
+// ---- Module-scoped handlers: /api/v1/module/:module_id/:path_segment ----
+
+pub async fn list_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "read") {
+        return Err(AppError::BadRequest("read not allowed".into()));
+    }
+    let column_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut limit: Option<u32> = None;
+    let mut offset: Option<u32> = None;
+    let mut include_names: Vec<String> = Vec::new();
+    let mut filters: Vec<(String, Value)> = Vec::new();
+    for (k, v) in params {
+        match k.as_str() {
+            "limit" => limit = v.parse().ok(),
+            "offset" => offset = v.parse().ok(),
+            "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            _ => {
+                let col_key = to_snake_case(&k);
+                if column_names.contains(col_key.as_str()) {
+                    filters.push((col_key.clone(), query_value_for_column(&entity, &col_key, &v)));
+                }
+            }
+        }
+    }
+    let mut rows = if include_names.is_empty() {
+        CrudService::list(&state.pool, &entity, &filters, limit, offset).await?
+    } else {
+        let resolved = resolve_includes(&model, &entity, &include_names)?;
+        let includes: Vec<IncludeSelect> = resolved.iter().map(|(name, spec, related)| IncludeSelect { name: name.as_str(), direction: spec.direction.clone(), related, our_key: spec.our_key_column.as_str(), their_key: spec.their_key_column.as_str() }).collect();
+        let mut rows = CrudService::list_with_includes(&state.pool, &entity, &filters, limit, offset, includes.as_slice()).await?;
+        post_process_include_columns(&mut rows, &resolved);
+        rows
+    };
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
+    }
+    let count = rows.len() as u64;
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
+}
+
+pub async fn create_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "create") {
+        return Err(AppError::BadRequest("create not allowed".into()));
+    }
+    let body = body_to_map(body)?;
+    let body = hashmap_keys_to_snake_case(&body);
+    RequestValidator::validate(&body, &entity.validation)?;
+    let mut row = CrudService::create(&state.pool, &entity, &body).await?;
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+pub async fn read_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "read") {
+        return Err(AppError::BadRequest("read not allowed".into()));
+    }
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let mut row = CrudService::read(&state.pool, &entity, &id).await?.ok_or_else(|| AppError::NotFound(id_str.clone()))?;
+    let include_names: Vec<String> = params.get("include").map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    if !include_names.is_empty() {
+        let resolved = resolve_includes(&model, &entity, &include_names)?;
+        let mut rows = [row];
+        attach_includes(&state.pool, &entity, &mut rows, &resolved).await?;
+        row = rows[0].clone();
+    }
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+pub async fn update_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "update") {
+        return Err(AppError::BadRequest("update not allowed".into()));
+    }
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let body = body_to_map(body)?;
+    let body = hashmap_keys_to_snake_case(&body);
+    RequestValidator::validate(&body, &entity.validation)?;
+    let mut row = CrudService::update(&state.pool, &entity, &id, &body).await?.ok_or_else(|| AppError::NotFound(id_str))?;
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+pub async fn delete_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "delete") {
+        return Err(AppError::BadRequest("delete not allowed".into()));
+    }
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    CrudService::delete(&state.pool, &entity, &id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub async fn bulk_create_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "bulk_create") {
+        return Err(AppError::BadRequest("bulk_create not allowed".into()));
+    }
+    let items: Vec<HashMap<String, Value>> = match body {
+        Value::Array(arr) => {
+            let mut out = Vec::new();
+            for v in arr {
+                out.push(hashmap_keys_to_snake_case(&body_to_map(v)?));
+            }
+            out
+        }
+        _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
+    };
+    for item in &items {
+        RequestValidator::validate(item, &entity.validation)?;
+    }
+    let mut rows = CrudService::bulk_create(&state.pool, &entity, &items).await?;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
+    }
+    let count = rows.len() as u64;
+    Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
+}
+
+pub async fn bulk_update_module(
+    State(state): State<AppState>,
+    Path((module_id, path_segment)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let model = get_or_load_module_model(&state, &module_id).await?;
+    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "bulk_update") {
+        return Err(AppError::BadRequest("bulk_update not allowed".into()));
+    }
+    let items: Vec<HashMap<String, Value>> = match body {
+        Value::Array(arr) => {
+            let mut out = Vec::new();
+            for v in arr {
+                out.push(hashmap_keys_to_snake_case(&body_to_map(v)?));
+            }
+            out
+        }
+        _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
+    };
+    for item in &items {
+        RequestValidator::validate(item, &entity.validation)?;
+    }
+    let mut rows = CrudService::bulk_update(&state.pool, &entity, &items).await?;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
+    }
+    let count = rows.len() as u64;
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
 }

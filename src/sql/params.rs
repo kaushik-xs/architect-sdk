@@ -48,11 +48,23 @@ impl<'q> Encode<'q, Postgres> for PgBindValue {
         &self,
         buf: &mut <Postgres as Database>::ArgumentBuffer<'q>,
     ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
+        // type_info() is TEXT, so we must only write valid UTF-8. Encoding I64/F64 as binary
+        // would send bytes that PostgreSQL interprets as UTF-8, causing "invalid byte sequence"
+        // (e.g. 0xff in f64 representation). Encode numbers as decimal strings; SQL casts
+        // like $1::numeric then convert them correctly.
         Ok(match self {
             PgBindValue::Null => <Option::<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
             PgBindValue::Bool(b) => <bool as Encode<Postgres>>::encode_by_ref(b, buf)?,
-            PgBindValue::I64(n) => <i64 as Encode<Postgres>>::encode_by_ref(n, buf)?,
-            PgBindValue::F64(n) => <f64 as Encode<Postgres>>::encode_by_ref(n, buf)?,
+            PgBindValue::I64(n) => {
+                let s = n.to_string();
+                let s_ref = s.as_str();
+                <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?
+            }
+            PgBindValue::F64(n) => {
+                let s = format!("{}", n);
+                let s_ref = s.as_str();
+                <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?
+            }
             PgBindValue::String(s) => {
                 let s_ref: &str = s.as_str();
                 <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?

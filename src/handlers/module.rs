@@ -1,11 +1,11 @@
-//! Plugin install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model.
+//! Module install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model.
 
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::handlers::config::replace_config;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
-use crate::store::upsert_plugin;
+use crate::store::upsert_module;
 use axum::extract::{Multipart, State};
 use axum::Json;
 use serde_json::Value;
@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use zip::ZipArchive;
 
-/// All config kinds that may appear in a plugin zip (excluding schemas, which are derived from manifest).
+/// All config kinds that may appear in a module zip (excluding schemas, which are derived from manifest).
 const CONFIG_KINDS: &[&str] = &[
     "schemas",
     "enums",
@@ -102,21 +102,21 @@ fn read_zip_entry_to_string<R: std::io::Read + std::io::Seek>(
     Ok(s)
 }
 
-/// POST /api/v1/config/plugin: multipart form with file field containing a zip (manifest.json + config JSONs).
-pub async fn install_plugin(
+/// POST /api/v1/config/module: multipart form with file field containing a zip (manifest.json + config JSONs).
+pub async fn install_module(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let mut zip_bytes: Option<Vec<u8>> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
-        if name == "file" || name == "plugin" {
+        if name == "file" || name == "module" {
             let data = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
             zip_bytes = Some(data.to_vec());
             break;
         }
     }
-    let zip_bytes = zip_bytes.ok_or_else(|| AppError::BadRequest("missing 'file' or 'plugin' field in multipart body".into()))?;
+    let zip_bytes = zip_bytes.ok_or_else(|| AppError::BadRequest("missing 'file' or 'module' field in multipart body".into()))?;
 
     let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
         .map_err(|e| AppError::BadRequest(format!("invalid zip: {}", e)))?;
@@ -179,30 +179,35 @@ pub async fn install_plugin(
             }
             body
         };
-        replace_config(&state.pool, kind, body, false).await?;
+        replace_config(&state.pool, kind, body, false, id).await?;
         applied.push((*kind).to_string());
     }
 
-    upsert_plugin(&state.pool, id, &manifest_value).await?;
+    upsert_module(&state.pool, id, &manifest_value).await?;
 
-    let config = load_from_pool(&state.pool).await.map_err(AppError::Config)?;
+    let config = load_from_pool(&state.pool, id).await.map_err(AppError::Config)?;
     apply_migrations(&state.pool, &config).await?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
-        *guard = new_model;
+        *guard = new_model.clone();
+        state
+            .module_models
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?
+            .insert(id.to_string(), new_model);
     }
 
     #[derive(serde::Serialize)]
-    struct PluginInstallResponse {
-        plugin: Value,
+    struct ModuleInstallResponse {
+        module: Value,
         applied: Vec<String>,
     }
     Ok((
         axum::http::StatusCode::OK,
         Json(crate::response::SuccessOne {
-            data: PluginInstallResponse {
-                plugin: manifest_value,
+            data: ModuleInstallResponse {
+                module: manifest_value,
                 applied,
             },
             meta: None,

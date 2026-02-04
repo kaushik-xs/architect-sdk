@@ -1,0 +1,111 @@
+[
+  {
+    "id": "tbl_organizations",
+    "name": "organizations",
+    "comment": "Tenant organizations (multi-tenant)",
+    "primary_key": "id",
+    "unique": [["slug"]],
+    "check": []
+  },
+  {
+    "id": "tbl_users",
+    "name": "users",
+    "comment": "User accounts per organization",
+    "primary_key": "id",
+    "unique": [["organization_id", "email"]],
+    "check": []
+  },
+  {
+    "id": "tbl_customers",
+    "name": "customers",
+    "comment": "Customer records per organization",
+    "primary_key": "id",
+    "unique": [],
+    "check": []
+  },
+  {
+    "id": "tbl_addresses",
+    "name": "addresses",
+    "comment": "Shipping and billing addresses for customers",
+    "primary_key": "id",
+    "unique": [],
+    "check": []
+  },
+  {
+    "id": "tbl_warehouses",
+    "name": "warehouses",
+    "comment": "Warehouse and stock locations",
+    "primary_key": "id",
+    "unique": [["organization_id", "name"]],
+    "check": []
+  },
+  {
+    "id": "tbl_product_categories",
+    "name": "product_categories",
+    "comment": "Hierarchical product categories",
+    "primary_key": "id",
+    "unique": [["organization_id", "slug"]],
+    "check": []
+  },
+  {
+    "id": "tbl_products",
+    "name": "products",
+    "comment": "Product catalog",
+    "primary_key": "id",
+    "unique": [["organization_id", "sku"]],
+    "check": [
+      { "name": "positive_price", "expression": "price >= 0" }
+    ]
+  },
+  {
+    "id": "tbl_product_category_mappings",
+    "name": "product_category_mappings",
+    "comment": "Product to category many-to-many",
+    "primary_key": ["product_id", "category_id"],
+    "unique": [],
+    "check": []
+  },
+  {
+    "id": "tbl_orders",
+    "name": "orders",
+    "comment": "Customer orders",
+    "primary_key": "id",
+    "unique": [],
+    "check": [
+      { "name": "total_non_negative", "expression": "total_amount >= 0" },
+      { "name": "created_at_not_future", "expression": "created_at <= NOW()" }
+    ]
+  },
+  {
+    "id": "tbl_order_items",
+    "name": "order_items",
+    "comment": "Order line items",
+    "primary_key": "id",
+    "unique": [],
+    "check": [
+      { "name": "positive_quantity", "expression": "quantity > 0" },
+      { "name": "positive_unit_price", "expression": "unit_price >= 0" }
+    ]
+  },
+  {
+    "id": "tbl_payments",
+    "name": "payments",
+    "comment": "Payments against orders",
+    "primary_key": "id",
+    "unique": [],
+    "check": [
+      { "name": "positive_amount", "expression": "amount > 0" }
+    ]
+  },
+  {
+    "id": "tbl_inventory",
+    "name": "inventory",
+    "comment": "Stock levels per product and warehouse",
+    "primary_key": "id",
+    "unique": [["product_id", "warehouse_id"]],
+    "check": [
+      { "name": "quantity_non_negative", "expression": "quantity >= 0" },
+      { "name": "reserved_lte_quantity", "expression": "reserved_quantity <= quantity" }
+    ]
+  }
+]
