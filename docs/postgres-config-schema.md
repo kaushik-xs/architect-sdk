@@ -8,7 +8,7 @@ This document describes the JSON/config format used to define and manage a Postg
 
 ### Schema from manifest (no separate schema table required)
 
-The **schema name** (PostgreSQL namespace, e.g. `public` or `sample`) is defined in the **module manifest**, not in a separate schemas config. The manifest must include a `schema` field (string). That schema is used for all configs (enums, tables, indexes, relationships); you do **not** need to point to the schema in each config. When loading from a module directory or installing a module zip, the runtime builds a single schema (id `"default"`, name = `manifest.schema`) and injects it so that enums, tables, and indexes can omit `schema_id`. Relationships require `from_schema_id` and `to_schema_id` (the module installer may inject these when uploading a zip). A separate `schemas.json` or schemas table is not required for module-based config.
+The **schema name** (PostgreSQL namespace, e.g. `public` or `sample`) is defined in the **package manifest**, not in a separate schemas config. The manifest must include a `schema` field (string). That schema is used for all configs (enums, tables, indexes, relationships); you do **not** need to point to the schema in each config. When loading from a package directory or installing a package zip, the runtime builds a single schema (id `"default"`, name = `manifest.schema`) and injects it so that enums, tables, and indexes can omit `schema_id`. Relationships require `from_schema_id` and `to_schema_id` (the package installer may inject these when uploading a zip). A separate `schemas.json` or schemas table is not required for package-based config.
 
 ### Separate configs per entity
 
@@ -28,7 +28,7 @@ Each config is an **array of records**. One record = one enum, one table, one co
 ### Storage: table vs file
 
 - **Database tables**: You can store each config type in its own table (e.g. `_sys_tables`). Each row is one record; complex fields can be JSON/JSONB columns.
-- **JSON files (module)**: Use one JSON file per config type inside a module directory or zip. The directory must contain `manifest.json` (with `schema`). Example layout: `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, `api_entities.json`. No `schemas.json` is required.
+- **JSON files (package)**: Use one JSON file per config type inside a package directory or zip. The directory must contain `manifest.json` (with `schema`). Example layout: `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, `api_entities.json`. No `schemas.json` is required.
 
 The record shape is the same in both cases; only the storage medium changes.
 
@@ -44,7 +44,7 @@ The record shape is the same in both cases; only the storage medium changes.
 
 ### 2.1 Schemas
 
-When using a **manifest**, you do **not** need a separate schemas config. The manifest’s `schema` field (e.g. `"public"` or `"sample"`) is the PostgreSQL schema name; the runtime creates a single schema (id `"default"`, name = manifest’s `schema`) and uses it for all configs. When loading from the database (no module path), the `schemas` config can still be used to define one or more schemas.
+When using a **manifest**, you do **not** need a separate schemas config. The manifest’s `schema` field (e.g. `"public"` or `"sample"`) is the PostgreSQL schema name; the runtime creates a single schema (id `"default"`, name = manifest’s `schema`) and uses it for all configs. When loading from the database (no package path), the `schemas` config can still be used to define one or more schemas.
 
 | Field     | Type   | Description                |
 | --------- | ------ | -------------------------- |
@@ -373,7 +373,7 @@ Together, these configs describe a table `public.orders` with a FK to `public.us
 | Indexes       | `indexes`       | `schema_id` (optional), `table_id`      |
 | Relationships | `relationships` | `from_schema_id`, `to_schema_id` (required), `from_*` / `to_*` ids |
 
-Configs are **independent** and **stored separately** (tables or files). The **manifest** defines the schema name for all configs when using module-based config; no `schemas.json` or explicit `schema_id` in each config is required. Use **stable ids** and **reference by id**; validate referential integrity; load in dependency order; generate DDL in the order schemas → enums → tables → indexes → FKs. The sample in `sample/` and this document are the reference for the format and how it works.
+Configs are **independent** and **stored separately** (tables or files). The **manifest** defines the schema name for all configs when using package-based config; no `schemas.json` or explicit `schema_id` in each config is required. Use **stable ids** and **reference by id**; validate referential integrity; load in dependency order; generate DDL in the order schemas → enums → tables → indexes → FKs. The sample in `sample/` and this document are the reference for the format and how it works.
 
 ---
 

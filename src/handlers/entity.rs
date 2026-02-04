@@ -115,21 +115,21 @@ fn resolve_includes(
     Ok(out)
 }
 
-/// Get resolved model for a module_id from cache, or load from DB and cache it.
-pub(crate) async fn get_or_load_module_model(state: &AppState, module_id: &str) -> Result<ResolvedModel, AppError> {
+/// Get resolved model for a package_id from cache, or load from DB and cache it.
+pub(crate) async fn get_or_load_package_model(state: &AppState, package_id: &str) -> Result<ResolvedModel, AppError> {
     {
-        let guard = state.module_models.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
-        if let Some(m) = guard.get(module_id) {
+        let guard = state.package_models.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        if let Some(m) = guard.get(package_id) {
             return Ok(m.clone());
         }
     }
-    let config = load_from_pool(&state.pool, module_id).await.map_err(AppError::Config)?;
+    let config = load_from_pool(&state.pool, package_id).await.map_err(AppError::Config)?;
     let model = resolve(&config).map_err(AppError::Config)?;
     state
-        .module_models
+        .package_models
         .write()
         .map_err(|_| AppError::BadRequest("state lock".into()))?
-        .insert(module_id.to_string(), model.clone());
+        .insert(package_id.to_string(), model.clone());
     Ok(model)
 }
 
@@ -491,14 +491,14 @@ pub async fn bulk_update(
     ))
 }
 
-// ---- Module-scoped handlers: /api/v1/module/:module_id/:path_segment ----
+// ---- Package-scoped handlers: /api/v1/package/:package_id/:path_segment ----
 
-pub async fn list_module(
+pub async fn list_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment)): Path<(String, String)>,
+    Path((package_id, path_segment)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
@@ -538,12 +538,12 @@ pub async fn list_module(
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
 }
 
-pub async fn create_module(
+pub async fn create_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment)): Path<(String, String)>,
+    Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
@@ -557,12 +557,12 @@ pub async fn create_module(
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
-pub async fn read_module(
+pub async fn read_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+    Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
@@ -581,12 +581,12 @@ pub async fn read_module(
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
-pub async fn update_module(
+pub async fn update_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+    Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
@@ -601,11 +601,11 @@ pub async fn update_module(
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
-pub async fn delete_module(
+pub async fn delete_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment, id_str)): Path<(String, String, String)>,
+    Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
@@ -615,12 +615,12 @@ pub async fn delete_module(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-pub async fn bulk_create_module(
+pub async fn bulk_create_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment)): Path<(String, String)>,
+    Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
@@ -647,12 +647,12 @@ pub async fn bulk_create_module(
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
 }
 
-pub async fn bulk_update_module(
+pub async fn bulk_update_package(
     State(state): State<AppState>,
-    Path((module_id, path_segment)): Path<(String, String)>,
+    Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let model = get_or_load_module_model(&state, &module_id).await?;
+    let model = get_or_load_package_model(&state, &package_id).await?;
     let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));

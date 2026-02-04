@@ -1,16 +1,16 @@
-//! Config ingestion routes: POST and GET per config kind, plus module install.
+//! Config ingestion routes: POST and GET per config kind, plus package install.
 
 use crate::handlers::config::{
     get_api_entities, get_columns, get_enums, get_indexes, get_relationships, get_schemas, get_tables,
     post_api_entities, post_columns, post_enums, post_indexes, post_relationships, post_schemas, post_tables,
 };
-use crate::handlers::module::install_module;
+use crate::handlers::package::install_package;
 use crate::state::AppState;
 use axum::{routing::post, Router};
 
 pub fn config_routes(state: AppState) -> Router {
     Router::new()
-        .route("/config/module", post(install_module))
+        .route("/config/package", post(install_package))
         .route("/config/schemas", post(post_schemas).get(get_schemas))
         .route("/config/enums", post(post_enums).get(get_enums))
         .route("/config/tables", post(post_tables).get(get_tables))

@@ -18,14 +18,14 @@
       "value": ""
     },
     {
-      "key": "module_sample",
+      "key": "package_sample",
       "value": "sample",
-      "description": "Module id for sample (users, orders)"
+      "description": "Package id for sample (users, orders)"
     },
     {
-      "key": "module_ecommerce",
+      "key": "package_ecommerce",
       "value": "sample_ecommerce",
-      "description": "Module id for sample_ecommerce"
+      "description": "Package id for sample_ecommerce"
     },
     {
       "key": "organization_id",
@@ -114,7 +114,7 @@
       "name": "Config",
       "item": [
         {
-          "name": "Install Module",
+          "name": "Install Package",
           "request": {
             "method": "POST",
             "header": [],
@@ -129,8 +129,8 @@
                 }
               ]
             },
-            "url": "{{base_url}}/api/v1/config/module",
-            "description": "Upload a module zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_modules."
+            "url": "{{base_url}}/api/v1/config/package",
+            "description": "Upload a package zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_packages."
           }
         },
         {
@@ -429,8 +429,8 @@
       ]
     },
     {
-      "name": "Sample (module: sample)",
-      "description": "Module-scoped entity API for the sample module (users, orders). Uses /api/v1/module/sample/:path_segment. Install the sample module zip first.",
+      "name": "Sample (package: sample)",
+      "description": "Module-scoped entity API for the sample module (users, orders). Uses /api/v1/package/sample/:path_segment. Install the sample module zip first.",
       "item": [
         {
           "name": "Users",
@@ -440,7 +440,7 @@
               "request": {
                 "method": "GET",
                 "header": [],
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/users?limit=100&offset=0"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/users?limit=100&offset=0"
               }
             },
             {
@@ -449,12 +449,12 @@
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"email\": \"user@example.com\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/users"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/users"
               }
             },
             {
               "name": "Read User",
-              "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_sample}}/users/{{user_id}}" }
+              "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_sample}}/users/{{user_id}}" }
             },
             {
               "name": "Update User",
@@ -462,12 +462,12 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"email\": \"updated@example.com\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/users/{{user_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/users/{{user_id}}"
               }
             },
             {
               "name": "Delete User",
-              "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_sample}}/users/{{user_id}}" }
+              "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_sample}}/users/{{user_id}}" }
             },
             {
               "name": "Bulk Create Users",
@@ -475,7 +475,7 @@
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"email\": \"bulk1@example.com\" },\n  { \"email\": \"bulk2@example.com\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/users/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/users/bulk"
               }
             },
             {
@@ -484,7 +484,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{user_id}}\", \"email\": \"bulk-updated@example.com\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/users/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/users/bulk"
               }
             }
           ]
@@ -497,7 +497,7 @@
               "request": {
                 "method": "GET",
                 "header": [],
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders?limit=100&offset=0"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders?limit=100&offset=0"
               }
             },
             {
@@ -506,12 +506,12 @@
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"status\": \"pending\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders"
               }
             },
             {
               "name": "Read Order",
-              "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders/{{order_id}}" }
+              "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders/{{order_id}}" }
             },
             {
               "name": "Update Order",
@@ -519,12 +519,12 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"status\": \"confirmed\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders/{{order_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders/{{order_id}}"
               }
             },
             {
               "name": "Delete Order",
-              "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders/{{order_id}}" }
+              "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders/{{order_id}}" }
             },
             {
               "name": "Bulk Create Orders",
@@ -532,7 +532,7 @@
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"user_id\": \"{{user_id}}\", \"status\": \"pending\" },\n  { \"user_id\": \"{{user_id}}\", \"status\": \"confirmed\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders/bulk"
               }
             },
             {
@@ -541,7 +541,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": 1, \"status\": \"shipped\" },\n  { \"id\": 2, \"status\": \"cancelled\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_sample}}/orders/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_sample}}/orders/bulk"
               }
             }
           ]
@@ -549,40 +549,40 @@
       ]
     },
     {
-      "name": "Sample E-commerce (module: sample_ecommerce)",
-      "description": "Module-scoped entity API for sample_ecommerce (organizations, users, customers, addresses, warehouses, products, orders, payments, inventory). Install the ecommerce module zip first. Create an organization and set the organization_id collection variable for most requests.",
+      "name": "Sample E-commerce (package: sample_ecommerce)",
+      "description": "Package-scoped entity API for sample_ecommerce (organizations, users, customers, addresses, warehouses, products, orders, payments, inventory). Install the ecommerce package zip first. Create an organization and set the organization_id collection variable for most requests.",
       "item": [
         {
           "name": "Organizations",
           "item": [
-            { "name": "List Organizations", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations?limit=100&offset=0" } },
+            { "name": "List Organizations", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations?limit=100&offset=0" } },
             {
               "name": "Create Organization",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"name\": \"Acme Corp\",\n  \"slug\": \"acme\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations"
               }
             },
-            { "name": "Read Organization", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations/{{organization_id}}" } },
+            { "name": "Read Organization", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations/{{organization_id}}" } },
             {
               "name": "Update Organization",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"name\": \"Acme Corporation\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations/{{organization_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations/{{organization_id}}"
               }
             },
-            { "name": "Delete Organization", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations/{{organization_id}}" } },
+            { "name": "Delete Organization", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations/{{organization_id}}" } },
             {
               "name": "Bulk Create Organizations",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"name\": \"Org A\", \"slug\": \"org-a\" },\n  { \"name\": \"Org B\", \"slug\": \"org-b\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations/bulk"
               }
             },
             {
@@ -591,7 +591,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{organization_id}}\", \"name\": \"Updated Name\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/organizations/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/organizations/bulk"
               }
             }
           ]
@@ -599,34 +599,34 @@
         {
           "name": "Users (ecommerce)",
           "item": [
-            { "name": "List Users", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users?limit=100&offset=0" } },
+            { "name": "List Users", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users?limit=100&offset=0" } },
             {
               "name": "Create User",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"email\": \"user@example.com\",\n  \"organization_id\": \"{{organization_id}}\",\n  \"first_name\": \"Jane\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users"
               }
             },
-            { "name": "Read User", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users/{{user_id}}" } },
+            { "name": "Read User", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users/{{user_id}}" } },
             {
               "name": "Update User",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"first_name\": \"Janet\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users/{{user_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users/{{user_id}}"
               }
             },
-            { "name": "Delete User", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users/{{user_id}}" } },
+            { "name": "Delete User", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users/{{user_id}}" } },
             {
               "name": "Bulk Create Users",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"email\": \"u1@example.com\", \"organization_id\": \"{{organization_id}}\", \"first_name\": \"Alice\" },\n  { \"email\": \"u2@example.com\", \"organization_id\": \"{{organization_id}}\", \"first_name\": \"Bob\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users/bulk"
               }
             },
             {
@@ -635,7 +635,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{user_id}}\", \"first_name\": \"Updated\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/users/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/users/bulk"
               }
             }
           ]
@@ -643,34 +643,34 @@
         {
           "name": "Customers",
           "item": [
-            { "name": "List Customers", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers?limit=100&offset=0" } },
+            { "name": "List Customers", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers?limit=100&offset=0" } },
             {
               "name": "Create Customer",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"email\": \"customer@example.com\",\n  \"organization_id\": \"{{organization_id}}\",\n  \"first_name\": \"John\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers"
               }
             },
-            { "name": "Read Customer", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers/{{customer_id}}" } },
+            { "name": "Read Customer", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers/{{customer_id}}" } },
             {
               "name": "Update Customer",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"first_name\": \"Johnny\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers/{{customer_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers/{{customer_id}}"
               }
             },
-            { "name": "Delete Customer", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers/{{customer_id}}" } },
+            { "name": "Delete Customer", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers/{{customer_id}}" } },
             {
               "name": "Bulk Create Customers",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"email\": \"c1@example.com\", \"organization_id\": \"{{organization_id}}\", \"first_name\": \"Alice\" },\n  { \"email\": \"c2@example.com\", \"organization_id\": \"{{organization_id}}\", \"first_name\": \"Bob\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers/bulk"
               }
             },
             {
@@ -679,7 +679,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{customer_id}}\", \"first_name\": \"Updated\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/customers/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/customers/bulk"
               }
             }
           ]
@@ -687,34 +687,34 @@
         {
           "name": "Addresses",
           "item": [
-            { "name": "List Addresses", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses?limit=100&offset=0" } },
+            { "name": "List Addresses", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses?limit=100&offset=0" } },
             {
               "name": "Create Address",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"customer_id\": \"{{customer_id}}\",\n  \"kind\": \"shipping\",\n  \"street\": \"123 Main St\",\n  \"city\": \"Boston\",\n  \"postal_code\": \"02101\",\n  \"country\": \"US\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses"
               }
             },
-            { "name": "Read Address", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses/{{address_id}}" } },
+            { "name": "Read Address", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses/{{address_id}}" } },
             {
               "name": "Update Address",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"city\": \"Cambridge\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses/{{address_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses/{{address_id}}"
               }
             },
-            { "name": "Delete Address", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses/{{address_id}}" } },
+            { "name": "Delete Address", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses/{{address_id}}" } },
             {
               "name": "Bulk Create Addresses",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"customer_id\": \"{{customer_id}}\", \"kind\": \"shipping\", \"street\": \"1 Oak St\", \"city\": \"Boston\", \"postal_code\": \"02102\", \"country\": \"US\" },\n  { \"customer_id\": \"{{customer_id}}\", \"kind\": \"billing\", \"street\": \"2 Pine St\", \"city\": \"Boston\", \"postal_code\": \"02103\", \"country\": \"US\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses/bulk"
               }
             },
             {
@@ -723,7 +723,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{address_id}}\", \"city\": \"Updated City\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/addresses/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/addresses/bulk"
               }
             }
           ]
@@ -731,34 +731,34 @@
         {
           "name": "Warehouses",
           "item": [
-            { "name": "List Warehouses", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses?limit=100&offset=0" } },
+            { "name": "List Warehouses", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses?limit=100&offset=0" } },
             {
               "name": "Create Warehouse",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"organization_id\": \"{{organization_id}}\",\n  \"name\": \"Boston Warehouse\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses"
               }
             },
-            { "name": "Read Warehouse", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses/{{warehouse_id}}" } },
+            { "name": "Read Warehouse", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses/{{warehouse_id}}" } },
             {
               "name": "Update Warehouse",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"name\": \"Boston Hub\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses/{{warehouse_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses/{{warehouse_id}}"
               }
             },
-            { "name": "Delete Warehouse", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses/{{warehouse_id}}" } },
+            { "name": "Delete Warehouse", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses/{{warehouse_id}}" } },
             {
               "name": "Bulk Create Warehouses",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"organization_id\": \"{{organization_id}}\", \"name\": \"WH-A\" },\n  { \"organization_id\": \"{{organization_id}}\", \"name\": \"WH-B\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses/bulk"
               }
             },
             {
@@ -767,7 +767,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{warehouse_id}}\", \"name\": \"Updated WH\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/warehouses/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/warehouses/bulk"
               }
             }
           ]
@@ -775,34 +775,34 @@
         {
           "name": "Product Categories",
           "item": [
-            { "name": "List Product Categories", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories?limit=100&offset=0" } },
+            { "name": "List Product Categories", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories?limit=100&offset=0" } },
             {
               "name": "Create Product Category",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"organization_id\": \"{{organization_id}}\",\n  \"name\": \"Electronics\",\n  \"slug\": \"electronics\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories"
               }
             },
-            { "name": "Read Product Category", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories/{{category_id}}" } },
+            { "name": "Read Product Category", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories/{{category_id}}" } },
             {
               "name": "Update Product Category",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"name\": \"Consumer Electronics\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories/{{category_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories/{{category_id}}"
               }
             },
-            { "name": "Delete Product Category", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories/{{category_id}}" } },
+            { "name": "Delete Product Category", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories/{{category_id}}" } },
             {
               "name": "Bulk Create Product Categories",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"organization_id\": \"{{organization_id}}\", \"name\": \"Cat A\", \"slug\": \"cat-a\" },\n  { \"organization_id\": \"{{organization_id}}\", \"name\": \"Cat B\", \"slug\": \"cat-b\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories/bulk"
               }
             },
             {
@@ -811,7 +811,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{category_id}}\", \"name\": \"Updated Category\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_categories/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_categories/bulk"
               }
             }
           ]
@@ -819,34 +819,34 @@
         {
           "name": "Products",
           "item": [
-            { "name": "List Products", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products?limit=100&offset=0" } },
+            { "name": "List Products", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products?limit=100&offset=0" } },
             {
               "name": "Create Product",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"organization_id\": \"{{organization_id}}\",\n  \"sku\": \"SKU-001\",\n  \"name\": \"Widget\",\n  \"status\": \"active\",\n  \"price\": 19.99\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products"
               }
             },
-            { "name": "Read Product", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products/{{product_id}}" } },
+            { "name": "Read Product", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products/{{product_id}}" } },
             {
               "name": "Update Product",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"status\": \"archived\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products/{{product_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products/{{product_id}}"
               }
             },
-            { "name": "Delete Product", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products/{{product_id}}" } },
+            { "name": "Delete Product", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products/{{product_id}}" } },
             {
               "name": "Bulk Create Products",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"organization_id\": \"{{organization_id}}\", \"sku\": \"SKU-002\", \"name\": \"Gadget\", \"status\": \"active\", \"price\": 29.99 },\n  { \"organization_id\": \"{{organization_id}}\", \"sku\": \"SKU-003\", \"name\": \"Gizmo\", \"status\": \"draft\", \"price\": 9.99 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products/bulk"
               }
             },
             {
@@ -855,7 +855,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{product_id}}\", \"status\": \"out_of_stock\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/products/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/products/bulk"
               }
             }
           ]
@@ -863,24 +863,24 @@
         {
           "name": "Product Category Mappings",
           "item": [
-            { "name": "List Product Category Mappings", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_category_mappings?limit=100&offset=0" } },
+            { "name": "List Product Category Mappings", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_category_mappings?limit=100&offset=0" } },
             {
               "name": "Create Product Category Mapping",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"product_id\": \"{{product_id}}\",\n  \"category_id\": \"{{category_id}}\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_category_mappings"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_category_mappings"
               }
             },
-            { "name": "Delete Product Category Mapping", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_category_mappings/{{mapping_id}}" } },
+            { "name": "Delete Product Category Mapping", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_category_mappings/{{mapping_id}}" } },
             {
               "name": "Bulk Create Product Category Mappings",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"product_id\": \"{{product_id}}\", \"category_id\": \"{{category_id}}\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/product_category_mappings/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/product_category_mappings/bulk"
               }
             }
           ]
@@ -888,34 +888,34 @@
         {
           "name": "Orders (ecommerce)",
           "item": [
-            { "name": "List Orders", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders?limit=100&offset=0" } },
+            { "name": "List Orders", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders?limit=100&offset=0" } },
             {
               "name": "Create Order",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"organization_id\": \"{{organization_id}}\",\n  \"customer_id\": \"{{customer_id}}\",\n  \"status\": \"draft\",\n  \"total_amount\": 99.99\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders"
               }
             },
-            { "name": "Read Order", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders/{{order_id}}" } },
+            { "name": "Read Order", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders/{{order_id}}" } },
             {
               "name": "Update Order",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"status\": \"pending\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders/{{order_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders/{{order_id}}"
               }
             },
-            { "name": "Delete Order", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders/{{order_id}}" } },
+            { "name": "Delete Order", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders/{{order_id}}" } },
             {
               "name": "Bulk Create Orders",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"organization_id\": \"{{organization_id}}\", \"customer_id\": \"{{customer_id}}\", \"status\": \"draft\", \"total_amount\": 50.00 },\n  { \"organization_id\": \"{{organization_id}}\", \"customer_id\": \"{{customer_id}}\", \"status\": \"pending\", \"total_amount\": 75.00 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders/bulk"
               }
             },
             {
@@ -924,7 +924,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{order_id}}\", \"status\": \"confirmed\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/orders/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/orders/bulk"
               }
             }
           ]
@@ -932,34 +932,34 @@
         {
           "name": "Order Items",
           "item": [
-            { "name": "List Order Items", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items?limit=100&offset=0" } },
+            { "name": "List Order Items", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items?limit=100&offset=0" } },
             {
               "name": "Create Order Item",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"order_id\": \"{{order_id}}\",\n  \"product_id\": \"{{product_id}}\",\n  \"quantity\": 2,\n  \"unit_price\": 19.99,\n  \"total_price\": 39.98\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items"
               }
             },
-            { "name": "Read Order Item", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items/{{order_item_id}}" } },
+            { "name": "Read Order Item", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items/{{order_item_id}}" } },
             {
               "name": "Update Order Item",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"quantity\": 3,\n  \"total_price\": 59.97\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items/{{order_item_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items/{{order_item_id}}"
               }
             },
-            { "name": "Delete Order Item", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items/{{order_item_id}}" } },
+            { "name": "Delete Order Item", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items/{{order_item_id}}" } },
             {
               "name": "Bulk Create Order Items",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"order_id\": \"{{order_id}}\", \"product_id\": \"{{product_id}}\", \"quantity\": 1, \"unit_price\": 19.99, \"total_price\": 19.99 },\n  { \"order_id\": \"{{order_id}}\", \"product_id\": \"{{product_id}}\", \"quantity\": 2, \"unit_price\": 9.99, \"total_price\": 19.98 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items/bulk"
               }
             },
             {
@@ -968,7 +968,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{order_item_id}}\", \"quantity\": 5, \"total_price\": 99.95 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/order_items/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/order_items/bulk"
               }
             }
           ]
@@ -976,34 +976,34 @@
         {
           "name": "Payments",
           "item": [
-            { "name": "List Payments", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments?limit=100&offset=0" } },
+            { "name": "List Payments", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments?limit=100&offset=0" } },
             {
               "name": "Create Payment",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"order_id\": \"{{order_id}}\",\n  \"amount\": 99.99,\n  \"status\": \"pending\",\n  \"method\": \"card\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments"
               }
             },
-            { "name": "Read Payment", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments/{{payment_id}}" } },
+            { "name": "Read Payment", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments/{{payment_id}}" } },
             {
               "name": "Update Payment",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"status\": \"captured\"\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments/{{payment_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments/{{payment_id}}"
               }
             },
-            { "name": "Delete Payment", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments/{{payment_id}}" } },
+            { "name": "Delete Payment", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments/{{payment_id}}" } },
             {
               "name": "Bulk Create Payments",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"order_id\": \"{{order_id}}\", \"amount\": 50.00, \"status\": \"pending\", \"method\": \"card\" },\n  { \"order_id\": \"{{order_id}}\", \"amount\": 25.00, \"status\": \"pending\", \"method\": \"bank\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments/bulk"
               }
             },
             {
@@ -1012,7 +1012,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{payment_id}}\", \"status\": \"authorized\" }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/payments/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/payments/bulk"
               }
             }
           ]
@@ -1020,34 +1020,34 @@
         {
           "name": "Inventory",
           "item": [
-            { "name": "List Inventory", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory?limit=100&offset=0" } },
+            { "name": "List Inventory", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory?limit=100&offset=0" } },
             {
               "name": "Create Inventory",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"product_id\": \"{{product_id}}\",\n  \"warehouse_id\": \"{{warehouse_id}}\",\n  \"quantity\": 100,\n  \"reserved_quantity\": 0\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory"
               }
             },
-            { "name": "Read Inventory", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory/{{inventory_id}}" } },
+            { "name": "Read Inventory", "request": { "method": "GET", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory/{{inventory_id}}" } },
             {
               "name": "Update Inventory",
               "request": {
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "{\n  \"quantity\": 80,\n  \"reserved_quantity\": 5\n}" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory/{{inventory_id}}"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory/{{inventory_id}}"
               }
             },
-            { "name": "Delete Inventory", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory/{{inventory_id}}" } },
+            { "name": "Delete Inventory", "request": { "method": "DELETE", "header": [], "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory/{{inventory_id}}" } },
             {
               "name": "Bulk Create Inventory",
               "request": {
                 "method": "POST",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"product_id\": \"{{product_id}}\", \"warehouse_id\": \"{{warehouse_id}}\", \"quantity\": 50, \"reserved_quantity\": 0 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory/bulk"
               }
             },
             {
@@ -1056,7 +1056,7 @@
                 "method": "PATCH",
                 "header": [{"key": "Content-Type", "value": "application/json"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{inventory_id}}\", \"quantity\": 60, \"reserved_quantity\": 10 }\n]" },
-                "url": "{{base_url}}/api/v1/module/{{module_ecommerce}}/inventory/bulk"
+                "url": "{{base_url}}/api/v1/package/{{module_ecommerce}}/inventory/bulk"
               }
             }
           ]

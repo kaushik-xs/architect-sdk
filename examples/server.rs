@@ -1,5 +1,5 @@
-//! Example server: ensures _sys_* tables exist, then loads config from MODULE_PATH (module directory with manifest.json) or from DB (config APIs).
-//! If MODULE_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _sys_* tables (empty until fed via config APIs or module install).
+//! Example server: ensures _sys_* tables exist, then loads config from PACKAGE_PATH (package directory with manifest.json) or from DB (config APIs).
+//! If PACKAGE_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _sys_* tables (empty until fed via config APIs or package install).
 
 use architect_sdk::{
     apply_migrations,
@@ -11,7 +11,7 @@ use architect_sdk::{
     load_from_pool,
     resolve,
     AppState,
-    DEFAULT_MODULE_ID,
+    DEFAULT_PACKAGE_ID,
     FullConfig,
 };
 use axum::Router;
@@ -39,26 +39,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_sys_tables(&pool).await?;
 
-    let (config, module_id) = match std::env::var("MODULE_PATH") {
-        Ok(module_path) => {
-            tracing::info!("loading config from module path: {}", module_path);
-            let (cfg, id) = load_config_from_module_path(&module_path).await?;
+    let (config, package_id) = match std::env::var("PACKAGE_PATH") {
+        Ok(package_path) => {
+            tracing::info!("loading config from package path: {}", package_path);
+            let (cfg, id) = load_config_from_package_path(&package_path).await?;
             (cfg, id)
         }
         Err(_) => {
-            tracing::info!("MODULE_PATH not set; loading config from _sys_* tables (use config APIs or POST /api/v1/config/module to insert)");
-            let cfg = load_from_pool(&pool, DEFAULT_MODULE_ID).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-            (cfg, DEFAULT_MODULE_ID.to_string())
+            tracing::info!("PACKAGE_PATH not set; loading config from _sys_* tables (use config APIs or POST /api/v1/config/package to insert)");
+            let cfg = load_from_pool(&pool, DEFAULT_PACKAGE_ID).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            (cfg, DEFAULT_PACKAGE_ID.to_string())
         }
     };
     apply_migrations(&pool, &config).await?;
     let model = resolve(&config)?;
-    let mut module_models = HashMap::new();
-    module_models.insert(module_id.clone(), model.clone());
+    let mut package_models = HashMap::new();
+    package_models.insert(package_id.clone(), model.clone());
     let state = AppState {
         pool: pool.clone(),
         model: Arc::new(RwLock::new(model)),
-        module_models: Arc::new(RwLock::new(module_models)),
+        package_models: Arc::new(RwLock::new(package_models)),
     };
 
     let api = Router::new()
@@ -75,19 +75,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn load_config_from_module_path(dir: &str) -> Result<(FullConfig, String), Box<dyn std::error::Error>> {
+async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(dir);
     let manifest_path = dir.join("manifest.json");
     let manifest_json = tokio::fs::read_to_string(&manifest_path).await.map_err(|e| {
-        format!("module path must contain manifest.json: {}", e)
+        format!("package path must contain manifest.json: {}", e)
     })?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
     let manifest_obj = manifest.as_object().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest.json must be an object"))?;
-    let module_id = manifest_obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'id' (string)"))?.to_string();
+    let package_id = manifest_obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'id' (string)"))?.to_string();
     let _name = manifest_obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'name' (string)"))?;
     let _version = manifest_obj.get("version").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'version' (string)"))?;
     let schema_name = manifest_obj.get("schema").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'schema' (string)"))?;
-    tracing::info!("module manifest: id={:?} name={:?} version={:?} schema={:?}", module_id, _name, _version, schema_name);
+    tracing::info!("package manifest: id={:?} name={:?} version={:?} schema={:?}", package_id, _name, _version, schema_name);
 
     let schemas = vec![serde_json::json!({ "id": "default", "name": schema_name })];
     let schemas: Vec<architect_sdk::config::SchemaConfig> = serde_json::from_value(serde_json::Value::Array(schemas))?;
@@ -141,6 +141,6 @@ async fn load_config_from_module_path(dir: &str) -> Result<(FullConfig, String),
             relationships,
             api_entities,
         },
-        module_id,
+        package_id,
     ))
 }

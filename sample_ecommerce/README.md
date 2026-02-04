@@ -1,6 +1,6 @@
-# Sample E‑commerce Module
+# Sample E‑commerce Package
 
-A more complex sample module for the Architect SDK: multi-tenant e‑commerce with **12 tables**, **4 enums**, **18 relationships**, and **18 indexes**.
+A more complex sample package for the Architect SDK: multi-tenant e‑commerce with **12 tables**, **4 enums**, **18 relationships**, and **18 indexes**.
 
 ## Schema: `ecommerce`
 
@@ -39,4 +39,4 @@ A more complex sample module for the Architect SDK: multi-tenant e‑commerce wi
 
 ### Usage
 
-Use this folder as the module directory (or zip it) when installing the module. The SDK will create the `ecommerce` schema and all objects from `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, and `api_entities.json`.
+Use this folder as the package directory (or zip it) when installing the package. The SDK will create the `ecommerce` schema and all objects from `manifest.json`, `enums.json`, `tables.json`, `columns.json`, `indexes.json`, `relationships.json`, and `api_entities.json`.

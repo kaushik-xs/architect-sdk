@@ -3,5 +3,5 @@
   "name": "Sample",
   "version": "1.0.0",
   "schema": "sample",
-  "description": "Sample plugin with users and orders entities"
+  "description": "Sample package with users and orders entities"
 }

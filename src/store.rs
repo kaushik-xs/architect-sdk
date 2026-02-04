@@ -16,7 +16,7 @@ pub fn qualified_sys_table(table: &str) -> String {
     format!("{}.{}", architect_schema(), table)
 }
 
-/// Config tables (each row is keyed by id + module_id). Excludes _sys_modules.
+/// Config tables (each row is keyed by id + package_id). Excludes _sys_packages.
 const CONFIG_TABLES: &[&str] = &[
     "_sys_schemas",
     "_sys_enums",
@@ -27,11 +27,11 @@ const CONFIG_TABLES: &[&str] = &[
     "_sys_api_entities",
 ];
 
-/// Module id used when config is posted directly (no module install). Ensures (id, module_id) is unique per module.
-pub const DEFAULT_MODULE_ID: &str = "_default";
+/// Package id used when config is posted directly (no package install). Ensures (id, package_id) is unique per package.
+pub const DEFAULT_PACKAGE_ID: &str = "_default";
 
 /// Create schema from `ARCHITECT_SCHEMA` env if not exists, then _sys_* tables.
-/// Config tables have (id, module_id) as composite primary key; _sys_modules has id only.
+/// Config tables have (id, package_id) as composite primary key; _sys_packages has id only.
 pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     let schema = architect_schema();
     sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
@@ -44,11 +44,11 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             r#"
             CREATE TABLE IF NOT EXISTS {} (
                 id TEXT NOT NULL,
-                module_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
                 payload JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 version BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (id, module_id)
+                PRIMARY KEY (id, package_id)
             )
             "#,
             q_table
@@ -59,36 +59,36 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             q_table
         );
         let _ = sqlx::query(&alter_version).execute(pool).await;
-        let alter_module = format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS module_id TEXT NOT NULL DEFAULT '{}'",
-            q_table, DEFAULT_MODULE_ID
+        let alter_package = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS package_id TEXT NOT NULL DEFAULT '{}'",
+            q_table, DEFAULT_PACKAGE_ID
         );
-        let _ = sqlx::query(&alter_module).execute(pool).await;
+        let _ = sqlx::query(&alter_package).execute(pool).await;
 
         let history_table = qualified_sys_table(&format!("{}_history", table));
         let history_ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS {} (
                 id TEXT NOT NULL,
-                module_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
                 payload JSONB NOT NULL,
                 version BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (id, module_id, version)
+                PRIMARY KEY (id, package_id, version)
             )
             "#,
             history_table
         );
         sqlx::query(&history_ddl).execute(pool).await?;
-        let alter_history_module = format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS module_id TEXT NOT NULL DEFAULT '{}'",
-            history_table, DEFAULT_MODULE_ID
+        let alter_history_package = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS package_id TEXT NOT NULL DEFAULT '{}'",
+            history_table, DEFAULT_PACKAGE_ID
         );
-        let _ = sqlx::query(&alter_history_module).execute(pool).await;
+        let _ = sqlx::query(&alter_history_package).execute(pool).await;
     }
 
-    let q_modules = qualified_sys_table("_sys_modules");
-    let modules_ddl = format!(
+    let q_packages = qualified_sys_table("_sys_packages");
+    let packages_ddl = format!(
         r#"
         CREATE TABLE IF NOT EXISTS {} (
             id TEXT PRIMARY KEY,
@@ -97,11 +97,11 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             version BIGINT NOT NULL DEFAULT 1
         )
         "#,
-        q_modules
+        q_packages
     );
-    sqlx::query(&modules_ddl).execute(pool).await?;
-    let q_modules_history = qualified_sys_table("_sys_modules_history");
-    let modules_history_ddl = format!(
+    sqlx::query(&packages_ddl).execute(pool).await?;
+    let q_packages_history = qualified_sys_table("_sys_packages_history");
+    let packages_history_ddl = format!(
         r#"
         CREATE TABLE IF NOT EXISTS {} (
             id TEXT NOT NULL,
@@ -111,9 +111,9 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             PRIMARY KEY (id, version)
         )
         "#,
-        q_modules_history
+        q_packages_history
     );
-    sqlx::query(&modules_history_ddl).execute(pool).await?;
+    sqlx::query(&packages_history_ddl).execute(pool).await?;
     Ok(())
 }
 
@@ -151,31 +151,31 @@ fn config_payloads_unchanged(
     Ok(true)
 }
 
-/// Replace all rows for a config type for one module: copy current (for this module_id) to history, delete, insert with new version.
+/// Replace all rows for a config type for one package: copy current (for this package_id) to history, delete, insert with new version.
 /// If incoming payloads are deep-equal to current, no write is performed and no new version is created.
 /// Returns (count inserted, version). Call within transaction for atomicity.
 pub async fn replace_config_rows(
     tx: &mut sqlx::PgConnection,
     table: &str,
-    module_id: &str,
+    package_id: &str,
     records: &[serde_json::Value],
 ) -> Result<(u64, i64), AppError> {
     let q_table = qualified_sys_table(table);
     let current_version: (Option<i64>,) = sqlx::query_as(&format!(
-        "SELECT COALESCE(MAX(version), 0) FROM {} WHERE module_id = $1",
+        "SELECT COALESCE(MAX(version), 0) FROM {} WHERE package_id = $1",
         q_table
     ))
-    .bind(module_id)
+    .bind(package_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(AppError::Db)?;
     let current_version = current_version.0.unwrap_or(0);
 
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(&format!(
-        "SELECT id, payload FROM {} WHERE module_id = $1",
+        "SELECT id, payload FROM {} WHERE package_id = $1",
         q_table
     ))
-    .bind(module_id)
+    .bind(package_id)
     .fetch_all(&mut *tx)
     .await
     .map_err(AppError::Db)?;
@@ -189,15 +189,15 @@ pub async fn replace_config_rows(
     let new_version = current_version + 1;
 
     sqlx::query(&format!(
-        "INSERT INTO {} (id, module_id, payload, version, created_at) SELECT id, module_id, payload, version, updated_at FROM {} WHERE module_id = $1",
+        "INSERT INTO {} (id, package_id, payload, version, created_at) SELECT id, package_id, payload, version, updated_at FROM {} WHERE package_id = $1",
         history_table, q_table
     ))
-    .bind(module_id)
+    .bind(package_id)
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!("DELETE FROM {} WHERE module_id = $1", q_table))
-        .bind(module_id)
+    sqlx::query(&format!("DELETE FROM {} WHERE package_id = $1", q_table))
+        .bind(package_id)
         .execute(&mut *tx)
         .await?;
 
@@ -205,11 +205,11 @@ pub async fn replace_config_rows(
     for rec in records {
         let id = config_record_id(table, rec)?;
         sqlx::query(&format!(
-            "INSERT INTO {} (id, module_id, payload, updated_at, version) VALUES ($1, $2, $3, NOW(), $4)",
+            "INSERT INTO {} (id, package_id, payload, updated_at, version) VALUES ($1, $2, $3, NOW(), $4)",
             q_table
         ))
         .bind(&id)
-        .bind(module_id)
+        .bind(package_id)
         .bind(rec)
         .bind(new_version)
         .execute(&mut *tx)
@@ -219,21 +219,21 @@ pub async fn replace_config_rows(
     Ok((count, new_version))
 }
 
-const MODULES_TABLE: &str = "_sys_modules";
-const MODULES_HISTORY_TABLE: &str = "_sys_modules_history";
+const PACKAGES_TABLE: &str = "_sys_packages";
+const PACKAGES_HISTORY_TABLE: &str = "_sys_packages_history";
 
-/// Upsert one module row by id: copy current to history if exists, then insert or replace with new payload and incremented version.
-pub async fn upsert_module(
+/// Upsert one package row by id: copy current to history if exists, then insert or replace with new payload and incremented version.
+pub async fn upsert_package(
     pool: &PgPool,
     id: &str,
     payload: &serde_json::Value,
 ) -> Result<i64, AppError> {
-    let q_modules = qualified_sys_table(MODULES_TABLE);
-    let q_modules_history = qualified_sys_table(MODULES_HISTORY_TABLE);
+    let q_packages = qualified_sys_table(PACKAGES_TABLE);
+    let q_packages_history = qualified_sys_table(PACKAGES_HISTORY_TABLE);
     let mut tx = pool.begin().await?;
     let current: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
         "SELECT payload, version FROM {} WHERE id = $1",
-        q_modules
+        q_packages
     ))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -248,7 +248,7 @@ pub async fn upsert_module(
     if let Some((old_payload, old_version)) = current {
         sqlx::query(&format!(
             "INSERT INTO {} (id, payload, version, created_at) VALUES ($1, $2, $3, NOW())",
-            q_modules_history
+            q_packages_history
         ))
         .bind(id)
         .bind(old_payload)
@@ -259,7 +259,7 @@ pub async fn upsert_module(
 
     sqlx::query(&format!(
         "DELETE FROM {} WHERE id = $1",
-        q_modules
+        q_packages
     ))
     .bind(id)
     .execute(&mut *tx)
@@ -267,7 +267,7 @@ pub async fn upsert_module(
 
     sqlx::query(&format!(
         "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
-        q_modules
+        q_packages
     ))
     .bind(id)
     .bind(payload)

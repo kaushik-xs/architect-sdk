@@ -1,11 +1,11 @@
 //! Entity CRUD routes built from resolved model.
 //! Uses parameterized paths so Path extractors receive the segment and id; handlers resolve the entity by path.
-//! Unprefixed routes use the default/active model; /module/:module_id/... use that module's model (same entity names, different modules).
+//! Unprefixed routes use the default/active model; /package/:package_id/... use that package's model (same entity names, different packages).
 
 use crate::handlers::entity::{
-    bulk_create, bulk_create_module, bulk_update, bulk_update_module, create, create_module,
-    delete as delete_handler, delete_module, list, list_module, read, read_module, update,
-    update_module,
+    bulk_create, bulk_create_package, bulk_update, bulk_update_package, create, create_package,
+    delete as delete_handler, delete_package, list, list_package, read, read_package, update,
+    update_package,
 };
 use crate::state::AppState;
 use axum::{routing::get, routing::post, Router};
@@ -18,14 +18,14 @@ pub fn entity_routes(state: AppState) -> Router {
             "/:path_segment/:id",
             get(read).patch(update).delete(delete_handler),
         )
-        .route("/module/:module_id/:path_segment", get(list_module).post(create_module))
+        .route("/package/:package_id/:path_segment", get(list_package).post(create_package))
         .route(
-            "/module/:module_id/:path_segment/bulk",
-            post(bulk_create_module).patch(bulk_update_module),
+            "/package/:package_id/:path_segment/bulk",
+            post(bulk_create_package).patch(bulk_update_package),
         )
         .route(
-            "/module/:module_id/:path_segment/:id",
-            get(read_module).patch(update_module).delete(delete_module),
+            "/package/:package_id/:path_segment/:id",
+            get(read_package).patch(update_package).delete(delete_package),
         )
         .with_state(state)
 }
