@@ -135,7 +135,7 @@
               ]
             },
             "url": "{{base_url}}/api/v1/config/package",
-            "description": "Upload a package zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_packages."
+            "description": "Upload a package zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_packages.\n\nUse Body → form-data, key 'file', type File, select your zip. Do NOT add a Content-Type header (Postman sets multipart/form-data with boundary automatically)."
           }
         },
         {

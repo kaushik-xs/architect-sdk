@@ -20,6 +20,12 @@ Every table gets three columns added by default (no need to put them in config):
 
 Responses include these fields. You do not need to send them on create; you can optionally set **archived_at** when archiving a row.
 
+## Install Package (POST /api/v1/config/package)
+
+Use **Body → form-data** (not raw). Add a row with key **file** (or **package**), set type to **File**, and select your .zip file. Set **X-Tenant-ID** (e.g. `default-mode-1`). **Do not add a Content-Type header** — Postman will send `multipart/form-data` with the correct boundary. If you see "Invalid boundary for multipart/form-data", remove any manual Content-Type header for this request.
+
+**curl:** `curl -X POST "http://localhost:3000/api/v1/config/package" -H "X-Tenant-ID: default-mode-1" -F "file=@/path/to/ecommerce.zip"` (do not set `-H "Content-Type: ..."`; curl adds the boundary automatically with `-F`).
+
 ## Folders
 
 - **Common**: Health, Ready, Version, Info (no `/api/v1` prefix).
