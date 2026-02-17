@@ -39,7 +39,7 @@ pub(crate) async fn replace_config(
     tx.commit().await?;
     if run_migrations && count > 0 {
         let config = load_from_pool(pool, package_id).await.map_err(AppError::Config)?;
-        apply_migrations(pool, &config, None).await?;
+        apply_migrations(pool, &config, None, None).await?;
     }
     Ok((body, count))
 }

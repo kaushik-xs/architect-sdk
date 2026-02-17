@@ -260,11 +260,13 @@ pub fn select_by_column_in(
 /// INSERT: columns and placeholders from entity; values from body. Excludes PK if has_default.
 /// Omits columns with DB default when body does not provide a value (so DB uses default).
 /// Uses SQL cast (e.g. $n::timestamptz) for timestamp columns so string values bind correctly.
+/// When `rls_tenant_id` is Some, appends tenant_id column and value (for RLS strategy).
 pub fn insert(
     entity: &ResolvedEntity,
     body: &HashMap<String, Value>,
     include_pk: bool,
     schema_override: Option<&str>,
+    rls_tenant_id: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -290,7 +292,16 @@ pub fn insert(
         cols.push(quoted(name));
         placeholders.push(ph);
     }
-    let returning = select_column_list(entity);
+    if let Some(tid) = rls_tenant_id {
+        let param_num = q.push_param(Value::String(tid.to_string()));
+        cols.push(quoted("tenant_id"));
+        placeholders.push(format!("${}", param_num));
+    }
+    let mut returning = select_column_list(entity);
+    if rls_tenant_id.is_some() {
+        returning.push_str(", ");
+        returning.push_str(&quoted("tenant_id"));
+    }
     q.sql = format!(
         "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
         table,
@@ -317,6 +328,9 @@ pub fn update(
     let mut sets = Vec::new();
     for (k, v) in body {
         if *k == *pk {
+            continue;
+        }
+        if k == "tenant_id" {
             continue;
         }
         let Some(c) = col_by_name.get(k.as_str()) else { continue };

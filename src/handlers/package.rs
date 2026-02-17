@@ -205,7 +205,7 @@ pub async fn install_package(
     upsert_package(config_pool, id, &manifest_value).await?;
 
     let config = load_from_pool(config_pool, id).await.map_err(AppError::Config)?;
-    apply_migrations(migration_pool, &config, schema_override).await?;
+    apply_migrations(migration_pool, &config, schema_override, ctx.rls_tenant_column()).await?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;

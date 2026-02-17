@@ -76,14 +76,16 @@ impl CrudService {
     }
 
     /// Insert one row; body may include or omit PK (if has default). Returns created row.
+    /// When rls_tenant_id is Some (RLS strategy), tenant_id column is set automatically.
     pub async fn create<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         body: &HashMap<String, Value>,
         schema_override: Option<&str>,
+        rls_tenant_id: Option<&str>,
     ) -> Result<Value, AppError> {
         let include_pk = body.contains_key(&entity.pk_columns[0]);
-        let q = insert(entity, body, include_pk, schema_override);
+        let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
         let row = Self::execute_returning_one_exec(executor, &q).await?
             .ok_or_else(|| AppError::Db(sqlx::Error::RowNotFound))?;
         Ok(row)
@@ -113,11 +115,13 @@ impl CrudService {
     }
 
     /// Bulk create in a transaction (when using pool) or on the same connection (when using conn). Returns vec of created rows.
+    /// When rls_tenant_id is Some (RLS strategy), tenant_id column is set automatically on each row.
     pub async fn bulk_create<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         items: &[HashMap<String, Value>],
         schema_override: Option<&str>,
+        rls_tenant_id: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -132,7 +136,7 @@ impl CrudService {
                 let mut tx = pool.begin().await?;
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
                     let row = Self::execute_returning_one_tx(&mut tx, &q).await?.unwrap_or(Value::Null);
                     out.push(row);
                 }
@@ -141,7 +145,7 @@ impl CrudService {
             TenantExecutor::Conn(conn) => {
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
                     let row = Self::execute_returning_one_conn(&mut **conn, &q).await?.unwrap_or(Value::Null);
                     out.push(row);
                 }

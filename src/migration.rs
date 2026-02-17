@@ -11,13 +11,18 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Name of the column added to app tables when RLS is enabled. Used by migration and CRUD.
+pub const RLS_TENANT_COLUMN: &str = "tenant_id";
+
 /// Apply full config to the database: CREATE SCHEMA, CREATE TYPE, CREATE TABLE, CREATE INDEX, ADD FK.
 /// Validates config first. Idempotent for schemas and types (IF NOT EXISTS); tables are CREATE TABLE only (fails if exists).
 /// When `schema_override` is `Some(s)`, app tables/indexes/FKs are created in schema `s` instead of config schema names (e.g. for schema-strategy tenants).
+/// When `rls_tenant_column` is `Some(col)`, each table gets that column (if missing), RLS enabled, and policies using `current_setting('app.tenant_id', true)`.
 pub async fn apply_migrations(
     pool: &PgPool,
     config: &FullConfig,
     schema_override: Option<&str>,
+    rls_tenant_column: Option<&str>,
 ) -> Result<(), AppError> {
     validate(config)?;
     let default_sid = config
@@ -149,6 +154,47 @@ pub async fn apply_migrations(
             col_defs.join(",\n  ")
         );
         sqlx::query(&sql).execute(pool).await?;
+
+        if let Some(col) = rls_tenant_column {
+            if !config_col_names.contains(col) {
+                let q_col = quote(col);
+                let add_col = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT", full_name, q_col);
+                sqlx::query(&add_col).execute(pool).await?;
+            }
+            let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
+            sqlx::query(&enable_rls).execute(pool).await?;
+            let q_col = quote(col);
+            let setting = "current_setting('app.tenant_id', true)";
+            let cond = format!("{} = {}", q_col, setting);
+            let policy_prefix = format!("rls_tenant_{}", t.name);
+            let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+                ("select", "SELECT", Some(cond.as_str()), None),
+                ("insert", "INSERT", None, Some(cond.as_str())),
+                ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
+                ("delete", "DELETE", Some(cond.as_str()), None),
+            ];
+            for (suffix, cmd, using_cond, with_check) in policies.iter() {
+                let policy_name = format!("{}_{}", policy_prefix, suffix);
+                let drop_sql = format!("DROP POLICY IF EXISTS {} ON {}", quote(&policy_name), full_name);
+                let _ = sqlx::query(&drop_sql).execute(pool).await;
+                let create_sql = match (using_cond, with_check) {
+                    (Some(u), Some(w)) => format!(
+                        "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
+                        quote(&policy_name), full_name, cmd, u, w
+                    ),
+                    (Some(u), None) => format!(
+                        "CREATE POLICY {} ON {} FOR {} USING ( {} )",
+                        quote(&policy_name), full_name, cmd, u
+                    ),
+                    (None, Some(w)) => format!(
+                        "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
+                        quote(&policy_name), full_name, cmd, w
+                    ),
+                    (None, None) => continue,
+                };
+                sqlx::query(&create_sql).execute(pool).await?;
+            }
+        }
     }
 
     for idx in &config.indexes {

@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (cfg, DEFAULT_PACKAGE_ID.to_string())
         }
     };
-    apply_migrations(&pool, &config, None).await?;
+    apply_migrations(&pool, &config, None, None).await?;
     let model = resolve(&config)?;
     let mut package_models = HashMap::new();
     package_models.insert(package_id.clone(), model.clone());

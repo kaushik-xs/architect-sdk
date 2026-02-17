@@ -160,6 +160,20 @@ impl TenantContext {
             TenantContext::Pool { package_cache_key, .. } | TenantContext::Rls { package_cache_key, .. } => package_cache_key,
         }
     }
+    /// When RLS strategy: column name to set on INSERT (e.g. "tenant_id"). Used by migrations and CRUD.
+    pub fn rls_tenant_column(&self) -> Option<&'static str> {
+        match self {
+            TenantContext::Rls { .. } => Some(crate::migration::RLS_TENANT_COLUMN),
+            TenantContext::Pool { .. } => None,
+        }
+    }
+    /// When RLS strategy: value to set for tenant_id on INSERT (the tenant id from X-Tenant-ID).
+    pub fn rls_tenant_id(&self) -> Option<&str> {
+        match self {
+            TenantContext::Rls { tenant_id, .. } => Some(tenant_id),
+            TenantContext::Pool { .. } => None,
+        }
+    }
 }
 
 /// Resolve execution context from tenant id. X-Tenant-ID is required; returns 400 if missing, 404 if tenant unknown.
@@ -495,7 +509,7 @@ pub async fn create(
     let body = body_to_map(body)?;
     let body = hashmap_keys_to_snake_case(&body);
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override).await?;
+    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
@@ -638,7 +652,7 @@ pub async fn bulk_create(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override).await?;
+    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
@@ -789,7 +803,7 @@ pub async fn create_package(
     let body = body_to_map(body)?;
     let body = hashmap_keys_to_snake_case(&body);
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override).await?;
+    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
@@ -928,7 +942,7 @@ pub async fn bulk_create_package(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override).await?;
+    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
