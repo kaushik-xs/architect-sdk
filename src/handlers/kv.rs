@@ -1,4 +1,5 @@
 //! KV store data API: list keys, get, set, delete by package_id and namespace.
+//! All data is tenant-isolated: rows in _sys_kv_data are keyed by (tenant_id, package_id, namespace, key).
 
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
@@ -24,14 +25,15 @@ pub async fn kv_list_keys(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
-    let pool = ctx.migration_pool();
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let pool = &state.pool;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
-        "SELECT key, value FROM {} WHERE package_id = $1 AND namespace = $2 ORDER BY key",
+        "SELECT key, value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 ORDER BY key",
         q_table
     );
     let rows: Vec<(String, Value)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)
         .fetch_all(pool)
@@ -57,14 +59,15 @@ pub async fn kv_get(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
-    let pool = ctx.migration_pool();
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let pool = &state.pool;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
-        "SELECT value FROM {} WHERE package_id = $1 AND namespace = $2 AND key = $3",
+        "SELECT value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
         q_table
     );
     let row: Option<(Value,)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)
         .bind(&key)
@@ -89,19 +92,20 @@ pub async fn kv_put(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
-    let pool = ctx.migration_pool();
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let pool = &state.pool;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         r#"
-        INSERT INTO {} (package_id, namespace, key, value, updated_at)
-        VALUES ($1, $2, $3, $4, NOW())
-        ON CONFLICT (package_id, namespace, key)
-        DO UPDATE SET value = $4, updated_at = NOW()
+        INSERT INTO {} (tenant_id, package_id, namespace, key, value, updated_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (tenant_id, package_id, namespace, key)
+        DO UPDATE SET value = $5, updated_at = NOW()
         "#,
         q_table
     );
     sqlx::query(&sql)
+        .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)
         .bind(&key)
@@ -125,14 +129,15 @@ pub async fn kv_delete(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
-    let pool = ctx.migration_pool();
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let pool = &state.pool;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
-        "DELETE FROM {} WHERE package_id = $1 AND namespace = $2 AND key = $3",
+        "DELETE FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
         q_table
     );
     let result: sqlx::postgres::PgQueryResult = sqlx::query(&sql)
+        .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)
         .bind(&key)

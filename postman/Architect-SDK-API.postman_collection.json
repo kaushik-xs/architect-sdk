@@ -1110,7 +1110,17 @@
                 "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
                 "body": { "mode": "raw", "raw": "\"dark\"" },
                 "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs/theme",
-                "description": "Set value for key 'theme'. Body is JSON (string, number, object, or array)."
+                "description": "Set value for key 'theme'. Body must be valid JSON; value is stored as JSON/JSONB. Examples: string \"dark\", number 42, object {\"theme\":\"dark\"}, array [1,2]."
+              }
+            },
+            {
+              "name": "Put Key (JSON object)",
+              "request": {
+                "method": "PUT",
+                "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+                "body": { "mode": "raw", "raw": "{\n  \"theme\": \"dark\",\n  \"locale\": \"en-US\"\n}" },
+                "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs/settings",
+                "description": "Store a JSON object as the value (value column is JSON type)."
               }
             },
             {

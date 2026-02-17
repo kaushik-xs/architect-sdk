@@ -143,17 +143,37 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     let kv_data_ddl = format!(
         r#"
         CREATE TABLE IF NOT EXISTS {} (
+            tenant_id TEXT NOT NULL,
             package_id TEXT NOT NULL,
             namespace TEXT NOT NULL,
             key TEXT NOT NULL,
             value JSONB NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (package_id, namespace, key)
+            PRIMARY KEY (tenant_id, package_id, namespace, key)
         )
         "#,
         q_kv_data
     );
     sqlx::query(&kv_data_ddl).execute(pool).await?;
+    // Migrate existing tables that had no tenant_id: add column and new PK.
+    let alter_kv_tenant = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '_shared'",
+        q_kv_data
+    );
+    let _ = sqlx::query(&alter_kv_tenant).execute(pool).await;
+    let drop_pk = format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_kv_data_pkey", q_kv_data);
+    let _ = sqlx::query(&drop_pk).execute(pool).await;
+    let add_pk = format!(
+        "ALTER TABLE {} ADD PRIMARY KEY (tenant_id, package_id, namespace, key)",
+        q_kv_data
+    );
+    let _ = sqlx::query(&add_pk).execute(pool).await;
+    // Ensure value column is JSON type (for existing tables that had value as text).
+    let alter_value_json = format!(
+        "ALTER TABLE {} ALTER COLUMN value TYPE JSONB USING value::jsonb",
+        q_kv_data
+    );
+    let _ = sqlx::query(&alter_value_json).execute(pool).await;
 
     Ok(())
 }
