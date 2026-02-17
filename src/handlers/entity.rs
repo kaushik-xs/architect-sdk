@@ -582,7 +582,7 @@ pub async fn update(
     let id = parse_id(&id_str, &entity.pk_type)?;
     let body = body_to_map(body)?;
     let body = hashmap_keys_to_snake_case(&body);
-    RequestValidator::validate(&body, &entity.validation)?;
+    RequestValidator::validate_partial(&body, &entity.validation)?;
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
@@ -871,7 +871,7 @@ pub async fn update_package(
     let id = parse_id(&id_str, &entity.pk_type)?;
     let body = body_to_map(body)?;
     let body = hashmap_keys_to_snake_case(&body);
-    RequestValidator::validate(&body, &entity.validation)?;
+    RequestValidator::validate_partial(&body, &entity.validation)?;
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str))?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);

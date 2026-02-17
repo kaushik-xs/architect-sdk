@@ -1,6 +1,6 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
-use crate::config::{IncludeDirection, ResolvedEntity};
+use crate::config::{IncludeDirection, PkType, ResolvedEntity};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -68,6 +68,14 @@ fn resolve_schema<'a>(entity: &'a ResolvedEntity, schema_override: Option<&'a st
     schema_override.unwrap_or(&entity.schema_name)
 }
 
+/// Placeholder for PK in WHERE (e.g. $1 or $1::uuid) so bound text is cast when column is UUID.
+fn pk_placeholder(entity: &ResolvedEntity, param_num: u32) -> String {
+    match &entity.pk_type {
+        PkType::Uuid => format!("${}::uuid", param_num),
+        _ => format!("${}", param_num),
+    }
+}
+
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
 pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
     let mut q = QueryBuf::new();
@@ -75,7 +83,8 @@ pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> Q
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let cols = select_column_list(entity);
-    q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
+    let ph = pk_placeholder(entity, 1);
+    q.sql = format!("SELECT {} FROM {} WHERE {} = {}", cols, table, quoted(pk), ph);
     q
 }
 
@@ -345,20 +354,22 @@ pub fn update(
     sets.push(format!("{} = NOW()", quoted("updated_at")));
     if sets.is_empty() {
         let cols = select_column_list(entity);
-        q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
+        let ph = pk_placeholder(entity, 1);
+        q.sql = format!("SELECT {} FROM {} WHERE {} = {}", cols, table, quoted(pk), ph);
         q.params.push(id.clone());
         return q;
     }
     let set_clause = sets.join(", ");
     let id_param = q.params.len() + 1;
     q.params.push(id.clone());
+    let ph = pk_placeholder(entity, id_param as u32);
     let returning = select_column_list(entity);
     q.sql = format!(
-        "UPDATE {} SET {} WHERE {} = ${} RETURNING {}",
+        "UPDATE {} SET {} WHERE {} = {} RETURNING {}",
         table,
         set_clause,
         quoted(pk),
-        id_param,
+        ph,
         returning
     );
     q
@@ -371,7 +382,8 @@ pub fn delete(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBu
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let returning = select_column_list(entity);
+    let ph = pk_placeholder(entity, 1);
     q.params.push(Value::Null);
-    q.sql = format!("DELETE FROM {} WHERE {} = $1 RETURNING {}", table, quoted(pk), returning);
+    q.sql = format!("DELETE FROM {} WHERE {} = {} RETURNING {}", table, quoted(pk), ph, returning);
     q
 }
