@@ -10,8 +10,6 @@ use std::collections::HashMap;
 pub enum TenantStrategy {
     /// Tenant has its own PostgreSQL database (own pool).
     Database,
-    /// Tenant shares DB but has its own schema (same pool, schema override).
-    Schema,
     /// Tenant shares DB and schema; isolation via RLS and app.tenant_id.
     Rls,
 }
@@ -22,10 +20,9 @@ impl std::str::FromStr for TenantStrategy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "database" => Ok(TenantStrategy::Database),
-            "schema" => Ok(TenantStrategy::Schema),
             "rls" => Ok(TenantStrategy::Rls),
             _ => Err(AppError::BadRequest(format!(
-                "invalid tenant strategy: {} (expected database, schema, or rls)",
+                "invalid tenant strategy: {} (expected database or rls)",
                 s
             ))),
         }
@@ -36,10 +33,8 @@ impl std::str::FromStr for TenantStrategy {
 #[derive(Clone, Debug)]
 pub struct TenantEntry {
     pub strategy: TenantStrategy,
-    /// Required when strategy = Database.
+    /// Required when strategy = Database. Optional for RLS (when set, app data uses that DB; config stays in architect DB).
     pub database_url: Option<String>,
-    /// Required when strategy = Schema.
-    pub schema_name: Option<String>,
 }
 
 /// In-memory tenant registry loaded from central DB. Thread-safe via Arc.
@@ -64,38 +59,33 @@ impl TenantRegistry {
     }
 }
 
-/// Load tenant registry from architect._sys_tenants. Invalid rows are skipped
-/// (missing database_url for database, missing schema_name for schema).
+/// Load tenant registry from architect._sys_tenants. Invalid rows are skipped (missing database_url for database strategy).
 pub async fn load_registry_from_pool(pool: &PgPool) -> Result<TenantRegistry, AppError> {
     let q_table = qualified_sys_table("_sys_tenants");
     let sql = format!(
-        "SELECT id, strategy, database_url, schema_name FROM {} ORDER BY id",
+        "SELECT id, strategy, database_url FROM {} ORDER BY id",
         q_table
     );
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(&sql)
+    let rows = sqlx::query_as::<_, (String, String, Option<String>)>(&sql)
         .fetch_all(pool)
         .await?;
 
     let mut by_id = HashMap::new();
-    for (id, strategy_str, database_url, schema_name) in rows {
+    for (id, strategy_str, database_url) in rows {
+        if strategy_str.eq_ignore_ascii_case("schema") {
+            tracing::warn!("tenant {}: strategy 'schema' is no longer supported, skipping", id);
+            continue;
+        }
         let strategy: TenantStrategy = strategy_str.parse().map_err(|e: AppError| e)?;
-        match &strategy {
-            TenantStrategy::Database if database_url.as_ref().map(|s| s.is_empty()).unwrap_or(true) => {
-                tracing::warn!("tenant {}: strategy database requires database_url, skipping", id);
-                continue;
-            }
-            TenantStrategy::Schema if schema_name.as_ref().map(|s| s.is_empty()).unwrap_or(true) => {
-                tracing::warn!("tenant {}: strategy schema requires schema_name, skipping", id);
-                continue;
-            }
-            _ => {}
+        if matches!(&strategy, TenantStrategy::Database) && database_url.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            tracing::warn!("tenant {}: strategy database requires database_url, skipping", id);
+            continue;
         }
         by_id.insert(
             id,
             TenantEntry {
                 strategy,
                 database_url: database_url.filter(|s| !s.is_empty()),
-                schema_name: schema_name.filter(|s| !s.is_empty()),
             },
         );
     }

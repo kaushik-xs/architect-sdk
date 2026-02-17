@@ -5,7 +5,7 @@ Import **Architect-SDK-API.postman_collection.json** into Postman (File → Impo
 ## Collection variables
 
 - **base_url**: `http://localhost:3000` — change if your server runs elsewhere.
-- **tenant_id**: **Required.** Must match a tenant id in `architect._sys_tenants`. Sent as `X-Tenant-ID` on all config, package, and entity API requests. The example server seeds three tenants: **default-mode-1** (database), **default-mode-2** (schema), **default-mode-3** (rls). Collection default is `default-mode-3`.
+- **tenant_id**: **Required.** Must match a tenant id in `architect._sys_tenants`. Sent as `X-Tenant-ID` on all config, package, and entity API requests. The example server seeds two tenants: **default-mode-1** (database), **default-mode-3** (rls). Collection default is `default-mode-3`.
 - **user_id**: Set after creating a user (e.g. from the Create User response) so Read/Update/Delete User and Create Order can use it.
 - **order_id**: Set after creating an order so Read/Update/Delete Order can use it.
 - **package_sample**, **package_ecommerce**: Package ids for sample and sample_ecommerce (used in `/api/v1/package/{{package_sample}}/...` and `/api/v1/package/{{package_ecommerce}}/...`).
@@ -28,4 +28,4 @@ Responses include these fields. You do not need to send them on create; you can 
 - **Orders**: Same operations for orders (under `/api/v1/orders`). List supports filters (e.g. `?status=pending&user_id=...`).
 - **Sample (package: sample)**, **Sample E-commerce (package: sample_ecommerce)**: Package-scoped entity APIs; use **package_sample** and **package_ecommerce** variables in URLs.
 
-Start the server with `cargo run --example server` before running requests. The server seeds three tenants automatically (default-mode-1, default-mode-2, default-mode-3). Use `X-Tenant-ID: default-mode-3` for RLS, or switch to default-mode-1 / default-mode-2 to test other strategies.
+Start the server with `cargo run --example server` before running requests. The server seeds two tenants automatically (default-mode-1, default-mode-3). Use `X-Tenant-ID: default-mode-3` for RLS, or `default-mode-1` for database strategy.

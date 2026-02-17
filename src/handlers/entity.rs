@@ -142,6 +142,19 @@ impl TenantContext {
             TenantContext::Pool { config_pool, .. } | TenantContext::Rls { config_pool, .. } => config_pool,
         }
     }
+    /// Pool used for DDL (migrations) and entity data. For schema/rls with database_url this is the tenant DB; otherwise architect DB.
+    pub fn migration_pool(&self) -> &sqlx::PgPool {
+        match self {
+            TenantContext::Pool { pool, .. } | TenantContext::Rls { pool, .. } => pool,
+        }
+    }
+    /// When set (schema strategy), create schemas/tables in this schema on the migration pool.
+    pub fn schema_override(&self) -> Option<&str> {
+        match self {
+            TenantContext::Pool { schema_override, .. } => schema_override.as_deref(),
+            TenantContext::Rls { .. } => None,
+        }
+    }
     pub fn package_cache_key(&self) -> &str {
         match self {
             TenantContext::Pool { package_cache_key, .. } | TenantContext::Rls { package_cache_key, .. } => package_cache_key,
@@ -165,7 +178,7 @@ pub async fn resolve_tenant_context(
 
     let entry = state.tenant_registry.get(tenant_id).ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
 
-    // Architect DB (from .env DATABASE_URL) is where config lives for schema/rls. If tenant has database_url, use that DB for app data only.
+    // Architect schema and _sys_* config tables exist only in DATABASE_URL (from .env), always in the architect schema. Tenant DBs are used for app data/migrations only.
     let architect_pool = state.pool.clone();
 
     match &entry.strategy {
@@ -175,21 +188,8 @@ pub async fn resolve_tenant_context(
             Ok(TenantContext::Pool {
                 pool: pool.clone(),
                 schema_override: None,
-                config_pool: pool,
-                package_cache_key: format!("{}:{}", package_id, tenant_id),
-            })
-        }
-        TenantStrategy::Schema => {
-            let schema_name = entry.schema_name.clone().ok_or_else(|| AppError::BadRequest(format!("tenant {}: strategy schema requires schema_name", tenant_id)))?;
-            let pool = match entry.database_url.as_deref() {
-                Some(url) => get_or_create_tenant_pool(state, tenant_id, url).await?,
-                None => architect_pool.clone(),
-            };
-            Ok(TenantContext::Pool {
-                pool,
-                schema_override: Some(schema_name),
                 config_pool: architect_pool,
-                package_cache_key,
+                package_cache_key: format!("{}:{}", package_id, tenant_id),
             })
         }
         TenantStrategy::Rls => {

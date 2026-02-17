@@ -122,7 +122,6 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             id TEXT PRIMARY KEY,
             strategy TEXT NOT NULL,
             database_url TEXT,
-            schema_name TEXT,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             comment TEXT
         )
@@ -130,6 +129,8 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_tenants
     );
     sqlx::query(&tenants_ddl).execute(pool).await?;
+    let drop_schema_name = format!("ALTER TABLE {} DROP COLUMN IF EXISTS schema_name", q_tenants);
+    let _ = sqlx::query(&drop_schema_name).execute(pool).await;
 
     Ok(())
 }
@@ -338,9 +339,9 @@ fn database_url_with_name(base_url: &str, new_db_name: &str) -> Result<String, A
     Ok(format!("{}{}{}", base, new_db_name, query))
 }
 
-/// Seed default tenants for the three strategies (idempotent). Inserts default-mode-1 (database),
-/// default-mode-2 (schema), default-mode-3 (rls). For database tenant, creates the DB if missing
-/// and uses a URL derived from `central_database_url` with database name `{central_db}_tenant_default_mode_1`.
+/// Seed default tenants for database and rls strategies (idempotent). Inserts default-mode-1 (database),
+/// default-mode-3 (rls). For database tenant, creates the DB if missing and uses a URL derived from
+/// `central_database_url` with database name `{central_db}_tenant_default_mode_1`.
 pub async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> Result<(), AppError> {
     let q_table = qualified_sys_table("_sys_tenants");
 
@@ -354,21 +355,16 @@ pub async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> 
     let database_url = database_url_with_name(central_database_url, &tenant_db_name)?;
     ensure_database_exists(&database_url).await?;
 
-    // default-mode-2 (schema): use temp_1 DB
-    let database_url_mode2 = database_url_with_name(central_database_url, "temp_1")?;
-    ensure_database_exists(&database_url_mode2).await?;
-
     // default-mode-3 (rls): use temp_2 DB
     let database_url_mode3 = database_url_with_name(central_database_url, "temp_2")?;
     ensure_database_exists(&database_url_mode3).await?;
 
     let insert_sql = format!(
         r#"
-        INSERT INTO {} (id, strategy, database_url, schema_name, updated_at, comment)
+        INSERT INTO {} (id, strategy, database_url, updated_at, comment)
         VALUES
-            ($1, $2, $3, $4, NOW(), $5),
-            ($6, $7, $8, $9, NOW(), $10),
-            ($11, $12, $13, $14, NOW(), $15)
+            ($1, $2, $3, NOW(), $4),
+            ($5, $6, $7, NOW(), $8)
         ON CONFLICT (id) DO NOTHING
         "#,
         q_table
@@ -377,17 +373,10 @@ pub async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> 
         .bind("default-mode-1")
         .bind("database")
         .bind(&database_url)
-        .bind::<Option<String>>(None)
         .bind("Tenant with own database (seed)")
-        .bind("default-mode-2")
-        .bind("schema")
-        .bind(&database_url_mode2)
-        .bind("tenant_default_mode_2")
-        .bind("Tenant with own schema in shared DB (seed)")
         .bind("default-mode-3")
         .bind("rls")
         .bind(&database_url_mode3)
-        .bind::<Option<String>>(None)
         .bind("Tenant with RLS in shared DB (seed)")
         .execute(pool)
         .await?;

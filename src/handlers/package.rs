@@ -1,9 +1,11 @@
 //! Package install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model. X-Tenant-ID is required.
+//! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in the tenant's target DB (for database/RLS with database_url).
 
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::replace_config;
+use crate::handlers::entity::resolve_tenant_context;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
 use crate::store::upsert_package;
@@ -163,6 +165,12 @@ pub async fn install_package(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest must have 'schema' (string) - the schema name for all configs".into()))?;
 
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
+    let config_pool = ctx.config_pool();
+    let migration_pool = ctx.migration_pool();
+    let schema_override = ctx.schema_override();
+    let package_cache_key = ctx.package_cache_key().to_string();
+
     let schemas_body = vec![serde_json::json!({
         "id": DEFAULT_SCHEMA_ID,
         "name": schema_name
@@ -190,14 +198,14 @@ pub async fn install_package(
             }
             body
         };
-        replace_config(&state.pool, kind, body, false, id).await?;
+        replace_config(config_pool, kind, body, false, id).await?;
         applied.push((*kind).to_string());
     }
 
-    upsert_package(&state.pool, id, &manifest_value).await?;
+    upsert_package(config_pool, id, &manifest_value).await?;
 
-    let config = load_from_pool(&state.pool, id).await.map_err(AppError::Config)?;
-    apply_migrations(&state.pool, &config, None).await?;
+    let config = load_from_pool(config_pool, id).await.map_err(AppError::Config)?;
+    apply_migrations(migration_pool, &config, schema_override).await?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
@@ -206,7 +214,7 @@ pub async fn install_package(
             .package_models
             .write()
             .map_err(|_| AppError::BadRequest("state lock".into()))?
-            .insert(id.to_string(), new_model);
+            .insert(package_cache_key, new_model);
     }
 
     #[derive(serde::Serialize)]
