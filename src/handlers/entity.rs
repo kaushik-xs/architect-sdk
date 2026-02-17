@@ -405,8 +405,7 @@ pub async fn list(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1")
-                .bind(tenant_id)
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''")))
                 .execute(&mut *conn)
                 .await?;
             rls_conn = Some(conn);
@@ -497,7 +496,7 @@ pub async fn create(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -528,7 +527,7 @@ pub async fn read(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -571,7 +570,7 @@ pub async fn update(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -603,7 +602,7 @@ pub async fn delete(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -630,7 +629,7 @@ pub async fn bulk_create(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -680,7 +679,7 @@ pub async fn bulk_update(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -733,7 +732,7 @@ pub async fn list_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -791,7 +790,7 @@ pub async fn create_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -823,7 +822,7 @@ pub async fn read_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -860,7 +859,7 @@ pub async fn update_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -892,7 +891,7 @@ pub async fn delete_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -920,7 +919,7 @@ pub async fn bulk_create_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -965,7 +964,7 @@ pub async fn bulk_update_package(
         TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
         TenantContext::Rls { tenant_id, pool, .. } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query("SET LOCAL app.tenant_id = $1").bind(tenant_id).execute(&mut *conn).await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
