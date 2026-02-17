@@ -20,12 +20,22 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
 
 ## Quick start
 
-1. Add to `Cargo.toml`:
+1. Add the SDK to your project’s `Cargo.toml` (private package — use **path** or **git** only):
 
+   **From a local path (same machine or monorepo):**
    ```toml
    [dependencies]
-   architect-sdk = { path = "path/to/architect-sdk" }
+   architect-sdk = { path = "/path/to/architect-sdk" }
    ```
+
+   **From this Git repo (e.g. another repository or CI):**
+   ```toml
+   [dependencies]
+   architect-sdk = { git = "https://github.com/kaushik-xs/architect-sdk" }
+   ```
+   Optional: use `branch = "multi-tenant"`, `rev = "abc1234"`, or `tag = "v0.1.0"` to pin a ref.
+
+   **Example consumer:** The `example_consumer` crate depends on the SDK from this GitHub repo (see [Private GitHub and CI](#private-github-and-ci)). Run from repo root: `cargo run -p example-consumer`, or `cd example_consumer && cargo run`. For local development against uncommitted SDK changes, switch to `architect-sdk = { path = ".." }` in `example_consumer/Cargo.toml`.
 
 2. Load config (from files or `load_from_pool`), resolve, build router:
 
@@ -55,6 +65,19 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Entities, fi
    # Optionally set PACKAGE_PATH=sample to load from sample/ (manifest.json + config JSONs)
    cargo run --example server
    ```
+
+## Private GitHub and CI
+
+- **Using this repo as a private dependency:** In another project’s `Cargo.toml`, add `architect-sdk = { git = "https://github.com/kaushik-xs/architect-sdk" }`. For a private repo you must authenticate:
+  - **Local:** Use SSH (`git = "ssh://git@github.com/kaushik-xs/architect-sdk"`) with SSH keys, or HTTPS with a [personal access token (PAT)](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) (e.g. `git config --global url."https://<PAT>@github.com/".insteadOf "https://github.com/"`).
+  - **CI (e.g. GitHub Actions):** Configure Git to use the job token so Cargo can fetch the private dependency:
+    ```yaml
+    - run: |
+        git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+    ```
+    For cross-repo access use a PAT stored as a repository secret and substitute it for `GITHUB_TOKEN`.
+
+- **Build pipeline:** The repo includes a GitHub Actions workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) that runs on push/PR to `main`, `master`, and `multi-tenant`. It checks formatting, builds the workspace (including `example-consumer` which pulls the SDK via git), runs tests, and runs Clippy. The workflow uses `GITHUB_TOKEN` so the private git dependency can be fetched during the build.
 
 ## API overview
 

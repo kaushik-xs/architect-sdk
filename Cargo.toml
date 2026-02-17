@@ -1,8 +1,13 @@
+[workspace]
+members = [".", "example_consumer"]
+
 [package]
 name = "architect-sdk"
 version = "0.1.0"
 edition = "2021"
 description = "Configuration-driven REST backend with PostgreSQL"
+publish = false  # private package; use path or git dependency
+repository = "https://github.com/kaushik-xs/architect-sdk"
 
 [lib]
 name = "architect_sdk"
