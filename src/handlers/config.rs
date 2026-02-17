@@ -1,7 +1,8 @@
-//! Config ingestion handlers: POST/GET for each config type.
+//! Config ingestion handlers: POST/GET for each config type. X-Tenant-ID is required.
 
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
+use crate::extractors::tenant::TenantId;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
 use crate::store::{qualified_sys_table, replace_config_rows, sys_table_for_kind, DEFAULT_PACKAGE_ID};
@@ -9,6 +10,18 @@ use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
 use sqlx::PgPool;
+
+fn require_tenant(state: &AppState, tenant_id_opt: &Option<String>) -> Result<(), AppError> {
+    let tenant_id = tenant_id_opt
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
+    state
+        .tenant_registry
+        .get(tenant_id)
+        .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
+    Ok(())
+}
 
 /// Replace config for one kind and package. Returns (body, num_rows_written).
 /// When run_migrations is true and num_rows_written > 0, loads full config for that package and runs migrations.
@@ -26,7 +39,7 @@ pub(crate) async fn replace_config(
     tx.commit().await?;
     if run_migrations && count > 0 {
         let config = load_from_pool(pool, package_id).await.map_err(AppError::Config)?;
-        apply_migrations(pool, &config).await?;
+        apply_migrations(pool, &config, None).await?;
     }
     Ok((body, count))
 }
@@ -55,9 +68,11 @@ async fn get_config(pool: &PgPool, kind: &str, package_id: &str) -> Result<Vec<V
 macro_rules! config_handler {
     ($method:ident, $kind:expr) => {
         pub async fn $method(
+            TenantId(tenant_id_opt): TenantId,
             State(state): State<AppState>,
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
+            require_tenant(&state, &tenant_id_opt)?;
             let (out, num_written) = replace_config(&state.pool, $kind, body, true, DEFAULT_PACKAGE_ID).await?;
             if num_written > 0 {
                 reload_model(&state).await?;
@@ -77,8 +92,10 @@ macro_rules! config_handler {
 macro_rules! get_config_handler {
     ($method:ident, $kind:expr) => {
         pub async fn $method(
+            TenantId(tenant_id_opt): TenantId,
             State(state): State<AppState>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
+            require_tenant(&state, &tenant_id_opt)?;
             let out = get_config(&state.pool, $kind, DEFAULT_PACKAGE_ID).await?;
             Ok((
                 axum::http::StatusCode::OK,

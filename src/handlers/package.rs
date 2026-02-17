@@ -1,7 +1,8 @@
-//! Package install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model.
+//! Package install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model. X-Tenant-ID is required.
 
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
+use crate::extractors::tenant::TenantId;
 use crate::handlers::config::replace_config;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
@@ -102,11 +103,21 @@ fn read_zip_entry_to_string<R: std::io::Read + std::io::Seek>(
     Ok(s)
 }
 
-/// POST /api/v1/config/package: multipart form with file field containing a zip (manifest.json + config JSONs).
+/// POST /api/v1/config/package: multipart form with file field containing a zip (manifest.json + config JSONs). X-Tenant-ID required.
 pub async fn install_package(
+    TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id = tenant_id_opt
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
+    state
+        .tenant_registry
+        .get(tenant_id)
+        .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
+
     let mut zip_bytes: Option<Vec<u8>> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -186,7 +197,7 @@ pub async fn install_package(
     upsert_package(&state.pool, id, &manifest_value).await?;
 
     let config = load_from_pool(&state.pool, id).await.map_err(AppError::Config)?;
-    apply_migrations(&state.pool, &config).await?;
+    apply_migrations(&state.pool, &config, None).await?;
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;

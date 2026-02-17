@@ -3,12 +3,14 @@
 pub mod case;
 pub mod config;
 pub mod error;
+pub mod extractors;
 pub mod migration;
 pub mod response;
 pub mod sql;
 pub mod state;
 pub mod store;
 pub mod service;
+pub mod tenant;
 pub mod handlers;
 pub mod routes;
 
@@ -17,6 +19,7 @@ pub use error::{AppError, ConfigError};
 pub use migration::apply_migrations;
 pub use response::{success_one, success_many, error_body};
 pub use state::AppState;
-pub use store::{ensure_database_exists, ensure_sys_tables, DEFAULT_PACKAGE_ID};
+pub use store::{ensure_database_exists, ensure_sys_tables, seed_default_tenants, DEFAULT_PACKAGE_ID};
+pub use tenant::{load_registry_from_pool, TenantEntry, TenantRegistry, TenantStrategy};
 pub use routes::{common_routes, common_routes_with_ready, config_routes, entity_routes};
-pub use service::CrudService;
+pub use service::{CrudService, TenantExecutor};

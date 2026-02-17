@@ -9,7 +9,9 @@ use architect_sdk::{
     ensure_database_exists,
     ensure_sys_tables,
     load_from_pool,
+    load_registry_from_pool,
     resolve,
+    seed_default_tenants,
     AppState,
     DEFAULT_PACKAGE_ID,
     FullConfig,
@@ -38,6 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     ensure_sys_tables(&pool).await?;
+    seed_default_tenants(&pool, &database_url).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    tracing::info!("seeded default tenants: default-mode-1 (database), default-mode-2 (schema), default-mode-3 (rls)");
+
+    let tenant_registry = load_registry_from_pool(&pool).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    tracing::info!("loaded tenant registry (X-Tenant-ID required for config and entity APIs)");
 
     let (config, package_id) = match std::env::var("PACKAGE_PATH") {
         Ok(package_path) => {
@@ -51,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (cfg, DEFAULT_PACKAGE_ID.to_string())
         }
     };
-    apply_migrations(&pool, &config).await?;
+    apply_migrations(&pool, &config, None).await?;
     let model = resolve(&config)?;
     let mut package_models = HashMap::new();
     package_models.insert(package_id.clone(), model.clone());
@@ -59,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool: pool.clone(),
         model: Arc::new(RwLock::new(model)),
         package_models: Arc::new(RwLock::new(package_models)),
+        tenant_pools: Arc::new(RwLock::new(HashMap::new())),
+        tenant_registry: Arc::new(tenant_registry),
     };
 
     let api = Router::new()

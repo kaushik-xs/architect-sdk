@@ -63,10 +63,16 @@ fn select_column_list(entity: &ResolvedEntity) -> String {
         .join(", ")
 }
 
+/// Resolve schema: override if present, else entity's schema.
+fn resolve_schema<'a>(entity: &'a ResolvedEntity, schema_override: Option<&'a str>) -> &'a str {
+    schema_override.unwrap_or(&entity.schema_name)
+}
+
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
-pub fn select_by_id(entity: &ResolvedEntity) -> QueryBuf {
+pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let cols = select_column_list(entity);
     q.sql = format!("SELECT {} FROM {} WHERE {} = $1", cols, table, quoted(pk));
@@ -80,10 +86,12 @@ pub fn select_list_with_includes(
     limit: Option<u32>,
     offset: Option<u32>,
     includes: &[IncludeSelect<'_>],
+    schema_override: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     const MAIN_ALIAS: &str = "main";
 
@@ -104,7 +112,8 @@ pub fn select_list_with_includes(
 
     let mut select_parts = main_cols;
     for inc in includes {
-        let rel_table = qualified_table(&inc.related.schema_name, &inc.related.table_name);
+        let rel_schema = resolve_schema(inc.related, schema_override);
+        let rel_table = qualified_table(rel_schema, &inc.related.table_name);
         let rel_cols = select_column_list(inc.related);
         let sub_from = format!("{} WHERE {} = {}.{}", rel_table, quoted(inc.their_key), MAIN_ALIAS, quoted(inc.our_key));
         let subquery = match inc.direction {
@@ -163,10 +172,12 @@ pub fn select_list(
     filters: &[(String, Value)],
     limit: Option<u32>,
     offset: Option<u32>,
+    schema_override: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
 
     let mut where_parts = Vec::new();
@@ -210,9 +221,11 @@ pub fn select_by_column_in(
     entity: &ResolvedEntity,
     column_name: &str,
     values: &[Value],
+    schema_override: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     if values.is_empty() {
         let cols = select_column_list(entity);
@@ -251,9 +264,11 @@ pub fn insert(
     entity: &ResolvedEntity,
     body: &HashMap<String, Value>,
     include_pk: bool,
+    schema_override: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let mut cols = Vec::new();
     let mut placeholders = Vec::new();
     for c in &entity.columns {
@@ -288,9 +303,15 @@ pub fn insert(
 
 /// UPDATE by id: SET only columns present in body (and in entity columns).
 /// Uses SQL cast for timestamp columns so string values bind correctly.
-pub fn update(entity: &ResolvedEntity, id: &Value, body: &HashMap<String, Value>) -> QueryBuf {
+pub fn update(
+    entity: &ResolvedEntity,
+    id: &Value,
+    body: &HashMap<String, Value>,
+    schema_override: Option<&str>,
+) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let col_by_name: std::collections::HashMap<_, _> = entity.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut sets = Vec::new();
@@ -330,9 +351,10 @@ pub fn update(entity: &ResolvedEntity, id: &Value, body: &HashMap<String, Value>
 }
 
 /// DELETE by id.
-pub fn delete(entity: &ResolvedEntity) -> QueryBuf {
+pub fn delete(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
     let mut q = QueryBuf::new();
-    let table = qualified_table(&entity.schema_name, &entity.table_name);
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let returning = select_column_list(entity);
     q.params.push(Value::Null);

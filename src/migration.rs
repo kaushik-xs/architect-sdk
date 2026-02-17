@@ -13,13 +13,25 @@ fn quote(s: &str) -> String {
 
 /// Apply full config to the database: CREATE SCHEMA, CREATE TYPE, CREATE TABLE, CREATE INDEX, ADD FK.
 /// Validates config first. Idempotent for schemas and types (IF NOT EXISTS); tables are CREATE TABLE only (fails if exists).
-pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), AppError> {
+/// When `schema_override` is `Some(s)`, app tables/indexes/FKs are created in schema `s` instead of config schema names (e.g. for schema-strategy tenants).
+pub async fn apply_migrations(
+    pool: &PgPool,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+) -> Result<(), AppError> {
     validate(config)?;
     let default_sid = config
         .schemas
         .first()
         .map(|s| s.id.as_str())
         .ok_or_else(|| AppError::Config(crate::error::ConfigError::Validation("at least one schema required".into())))?;
+
+    if let Some(s) = schema_override {
+        let name = quote(s);
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", name))
+            .execute(pool)
+            .await?;
+    }
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
@@ -31,17 +43,20 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
         },
     );
 
-    for s in &config.schemas {
-        let name = quote(&s.name);
-        let comment = s
-            .comment
-            .as_ref()
-            .map(|c| format!("COMMENT ON SCHEMA {} IS '{}'", name, c.replace('\'', "''")));
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", name))
-            .execute(pool)
-            .await?;
-        if let Some(sql) = comment {
-            let _ = sqlx::query(&sql).execute(pool).await;
+    // When schema_override is set, we only create the override schema; otherwise create config schemas.
+    if schema_override.is_none() {
+        for s in &config.schemas {
+            let name = quote(&s.name);
+            let comment = s
+                .comment
+                .as_ref()
+                .map(|c| format!("COMMENT ON SCHEMA {} IS '{}'", name, c.replace('\'', "''")));
+            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", name))
+                .execute(pool)
+                .await?;
+            if let Some(sql) = comment {
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
         }
     }
 
@@ -53,7 +68,7 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
                 kind: "schema",
                 id: sid.to_string(),
             }))?;
-        let schema_name = quote(&schema.name);
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let type_name = quote(&e.name);
         let values: Vec<String> = e.values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
         let sql = format!(
@@ -73,7 +88,7 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
                 kind: "schema",
                 id: sid.to_string(),
             }))?;
-        let schema_name = quote(&schema.name);
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let table_name = quote(&t.name);
         let full_name = format!("{}.{}", schema_name, table_name);
 
@@ -150,7 +165,7 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
                 id: idx.table_id.clone(),
             })
         })?;
-        let schema_name = quote(&schema.name);
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let table_name = quote(&table.name);
         let full_table = format!("{}.{}", schema_name, table_name);
         let index_name = quote(&idx.name);
@@ -224,6 +239,9 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
             })
         })?;
 
+        let from_schema_name = schema_override.unwrap_or(&from_schema.name);
+        let to_schema_name = schema_override.unwrap_or(&to_schema.name);
+
         let from_col = config
             .columns
             .iter()
@@ -243,8 +261,8 @@ pub async fn apply_migrations(pool: &PgPool, config: &FullConfig) -> Result<(), 
                 id: rel.to_column_id.clone(),
             }))?;
 
-        let from_full = format!("{}.{}", quote(&from_schema.name), quote(&from_table.name));
-        let to_full = format!("{}.{}", quote(&to_schema.name), quote(&to_table.name));
+        let from_full = format!("{}.{}", quote(from_schema_name), quote(&from_table.name));
+        let to_full = format!("{}.{}", quote(to_schema_name), quote(&to_table.name));
         let constraint_name = rel
             .name
             .as_deref()

@@ -114,6 +114,23 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_packages_history
     );
     sqlx::query(&packages_history_ddl).execute(pool).await?;
+
+    let q_tenants = qualified_sys_table("_sys_tenants");
+    let tenants_ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {} (
+            id TEXT PRIMARY KEY,
+            strategy TEXT NOT NULL,
+            database_url TEXT,
+            schema_name TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            comment TEXT
+        )
+        "#,
+        q_tenants
+    );
+    sqlx::query(&tenants_ddl).execute(pool).await?;
+
     Ok(())
 }
 
@@ -311,6 +328,71 @@ fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
     let base = url.get(..path_start).unwrap_or(url);
     let admin_url = format!("{}postgres", base);
     Ok((admin_url, db_name.to_string()))
+}
+
+/// Build a new database URL with the same host/credentials but a different database name.
+fn database_url_with_name(base_url: &str, new_db_name: &str) -> Result<String, AppError> {
+    let path_start = base_url.rfind('/').ok_or_else(|| AppError::BadRequest("DATABASE_URL: no path".into()))? + 1;
+    let base = base_url.get(..path_start).unwrap_or(base_url);
+    let query = base_url.get(path_start..).and_then(|s| s.find('?').map(|i| &s[i..])).unwrap_or("");
+    Ok(format!("{}{}{}", base, new_db_name, query))
+}
+
+/// Seed default tenants for the three strategies (idempotent). Inserts default-mode-1 (database),
+/// default-mode-2 (schema), default-mode-3 (rls). For database tenant, creates the DB if missing
+/// and uses a URL derived from `central_database_url` with database name `{central_db}_tenant_default_mode_1`.
+pub async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> Result<(), AppError> {
+    let q_table = qualified_sys_table("_sys_tenants");
+
+    // default-mode-1: database strategy — derive tenant DB URL and ensure DB exists
+    let (_, central_db) = parse_db_name_from_url(central_database_url)?;
+    let tenant_db_name = if central_db.is_empty() || central_db == "postgres" {
+        "architect_tenant_default_mode_1".to_string()
+    } else {
+        format!("{}_tenant_default_mode_1", central_db)
+    };
+    let database_url = database_url_with_name(central_database_url, &tenant_db_name)?;
+    ensure_database_exists(&database_url).await?;
+
+    // default-mode-2 (schema): use temp_1 DB
+    let database_url_mode2 = database_url_with_name(central_database_url, "temp_1")?;
+    ensure_database_exists(&database_url_mode2).await?;
+
+    // default-mode-3 (rls): use temp_2 DB
+    let database_url_mode3 = database_url_with_name(central_database_url, "temp_2")?;
+    ensure_database_exists(&database_url_mode3).await?;
+
+    let insert_sql = format!(
+        r#"
+        INSERT INTO {} (id, strategy, database_url, schema_name, updated_at, comment)
+        VALUES
+            ($1, $2, $3, $4, NOW(), $5),
+            ($6, $7, $8, $9, NOW(), $10),
+            ($11, $12, $13, $14, NOW(), $15)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+        q_table
+    );
+    sqlx::query(&insert_sql)
+        .bind("default-mode-1")
+        .bind("database")
+        .bind(&database_url)
+        .bind::<Option<String>>(None)
+        .bind("Tenant with own database (seed)")
+        .bind("default-mode-2")
+        .bind("schema")
+        .bind(&database_url_mode2)
+        .bind("tenant_default_mode_2")
+        .bind("Tenant with own schema in shared DB (seed)")
+        .bind("default-mode-3")
+        .bind("rls")
+        .bind(&database_url_mode3)
+        .bind::<Option<String>>(None)
+        .bind("Tenant with RLS in shared DB (seed)")
+        .execute(pool)
+        .await?;
+
+    Ok(())
 }
 
 fn quote_ident(name: &str) -> String {
