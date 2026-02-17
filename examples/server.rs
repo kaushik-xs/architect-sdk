@@ -11,12 +11,12 @@ use architect_sdk::{
     load_from_pool,
     load_registry_from_pool,
     resolve,
-    seed_default_tenants,
     AppState,
     DEFAULT_PACKAGE_ID,
     FullConfig,
 };
 use axum::Router;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     ensure_sys_tables(&pool).await?;
-    seed_default_tenants(&pool, &database_url).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-    tracing::info!("seeded default tenants: default-mode-1 (database), default-mode-2 (schema), default-mode-3 (rls)");
+    seed_default_tenants(&pool, &database_url).await?;
+    tracing::info!("seeded default tenants: default-mode-1 (database), default-mode-3 (rls)");
 
     let tenant_registry = load_registry_from_pool(&pool).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
     tracing::info!("loaded tenant registry (X-Tenant-ID required for config and entity APIs)");
@@ -152,4 +152,63 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
         },
         package_id,
     ))
+}
+
+/// Seed default tenants for the example server (database and rls strategies). Isolated from the core library.
+async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = std::env::var("ARCHITECT_SCHEMA").unwrap_or_else(|_| "architect".into());
+    let q_table = format!("{}.{}", schema, "_sys_tenants");
+
+    let (_, central_db) = parse_db_name_from_url(central_database_url)
+        .map_err(|e| format!("DATABASE_URL: {}", e))?;
+    let tenant_db_name = if central_db.is_empty() || central_db == "postgres" {
+        "architect_tenant_default_mode_1".to_string()
+    } else {
+        format!("{}_tenant_default_mode_1", central_db)
+    };
+    let database_url = database_url_with_name(central_database_url, &tenant_db_name)?;
+    ensure_database_exists(&database_url).await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
+    let database_url_mode3 = database_url_with_name(central_database_url, "temp_2")?;
+    ensure_database_exists(&database_url_mode3).await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
+    let insert_sql = format!(
+        r#"
+        INSERT INTO {} (id, strategy, database_url, updated_at, comment)
+        VALUES
+            ($1, $2, $3, NOW(), $4),
+            ($5, $6, $7, NOW(), $8)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+        q_table
+    );
+    sqlx::query(&insert_sql)
+        .bind("default-mode-1")
+        .bind("database")
+        .bind(&database_url)
+        .bind("Tenant with own database (seed)")
+        .bind("default-mode-3")
+        .bind("rls")
+        .bind(&database_url_mode3)
+        .bind("Tenant with RLS in shared DB (seed)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn parse_db_name_from_url(url: &str) -> Result<(String, String), String> {
+    let path_start = url.rfind('/').ok_or("no path")? + 1;
+    let path_and_query = url.get(path_start..).unwrap_or("");
+    let db_name = path_and_query.split('?').next().unwrap_or("").trim();
+    let base = url.get(..path_start).unwrap_or(url);
+    Ok((format!("{}postgres", base), db_name.to_string()))
+}
+
+fn database_url_with_name(base_url: &str, new_db_name: &str) -> Result<String, String> {
+    let path_start = base_url.rfind('/').ok_or("no path")? + 1;
+    let base = base_url.get(..path_start).unwrap_or(base_url);
+    let query = base_url.get(path_start..).and_then(|s| s.find('?').map(|i| &s[i..])).unwrap_or("");
+    Ok(format!("{}{}{}", base, new_db_name, query))
 }

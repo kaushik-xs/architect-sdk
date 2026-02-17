@@ -94,12 +94,15 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             id TEXT PRIMARY KEY,
             payload JSONB NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            version BIGINT NOT NULL DEFAULT 1
+            version BIGINT NOT NULL DEFAULT 1,
+            semantic_version TEXT
         )
         "#,
         q_packages
     );
     sqlx::query(&packages_ddl).execute(pool).await?;
+    let alter_pkg_semver = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT", q_packages);
+    let _ = sqlx::query(&alter_pkg_semver).execute(pool).await;
     let q_packages_history = qualified_sys_table("_sys_packages_history");
     let packages_history_ddl = format!(
         r#"
@@ -108,12 +111,15 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
             payload JSONB NOT NULL,
             version BIGINT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            semantic_version TEXT,
             PRIMARY KEY (id, version)
         )
         "#,
         q_packages_history
     );
     sqlx::query(&packages_history_ddl).execute(pool).await?;
+    let alter_pkg_hist_semver = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT", q_packages_history);
+    let _ = sqlx::query(&alter_pkg_hist_semver).execute(pool).await;
 
     let q_tenants = qualified_sys_table("_sys_tenants");
     let tenants_ddl = format!(
@@ -240,17 +246,24 @@ pub async fn replace_config_rows(
 const PACKAGES_TABLE: &str = "_sys_packages";
 const PACKAGES_HISTORY_TABLE: &str = "_sys_packages_history";
 
-/// Upsert one package row by id: copy current to history if exists, then insert or replace with new payload and incremented version.
+/// Upsert one package row by id: copy current to history if exists, then insert or replace with new payload.
+/// Semantic version is read from payload.version (e.g. manifest "version": "1.0.0"). Version is only incremented when semantic_version changes.
 pub async fn upsert_package(
     pool: &PgPool,
     id: &str,
     payload: &serde_json::Value,
 ) -> Result<i64, AppError> {
+    let semantic_version = payload
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+        .unwrap_or_default();
+
     let q_packages = qualified_sys_table(PACKAGES_TABLE);
     let q_packages_history = qualified_sys_table(PACKAGES_HISTORY_TABLE);
     let mut tx = pool.begin().await?;
-    let current: Option<(serde_json::Value, i64)> = sqlx::query_as(&format!(
-        "SELECT payload, version FROM {} WHERE id = $1",
+    let current: Option<(serde_json::Value, i64, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT payload, version, semantic_version FROM {} WHERE id = $1",
         q_packages
     ))
     .bind(id)
@@ -259,18 +272,20 @@ pub async fn upsert_package(
     .map_err(AppError::Db)?;
 
     let new_version = match &current {
-        Some((_, v)) => v + 1,
+        Some((_, v, Some(ref old_semver))) if *old_semver == semantic_version => *v,
+        Some((_, v, _)) => v + 1,
         None => 1,
     };
 
-    if let Some((old_payload, old_version)) = current {
+    if let Some((old_payload, old_version, old_semver)) = current {
         sqlx::query(&format!(
-            "INSERT INTO {} (id, payload, version, created_at) VALUES ($1, $2, $3, NOW())",
+            "INSERT INTO {} (id, payload, version, created_at, semantic_version) VALUES ($1, $2, $3, NOW(), $4)",
             q_packages_history
         ))
         .bind(id)
         .bind(old_payload)
         .bind(old_version)
+        .bind(old_semver)
         .execute(&mut *tx)
         .await?;
     }
@@ -283,13 +298,19 @@ pub async fn upsert_package(
     .execute(&mut *tx)
     .await?;
 
+    let semver_param: Option<&str> = if semantic_version.is_empty() {
+        None
+    } else {
+        Some(semantic_version.as_str())
+    };
     sqlx::query(&format!(
-        "INSERT INTO {} (id, payload, updated_at, version) VALUES ($1, $2, NOW(), $3)",
+        "INSERT INTO {} (id, payload, updated_at, version, semantic_version) VALUES ($1, $2, NOW(), $3, $4)",
         q_packages
     ))
     .bind(id)
     .bind(payload)
     .bind(new_version)
+    .bind(semver_param)
     .execute(&mut *tx)
     .await?;
 
@@ -329,59 +350,6 @@ fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
     let base = url.get(..path_start).unwrap_or(url);
     let admin_url = format!("{}postgres", base);
     Ok((admin_url, db_name.to_string()))
-}
-
-/// Build a new database URL with the same host/credentials but a different database name.
-fn database_url_with_name(base_url: &str, new_db_name: &str) -> Result<String, AppError> {
-    let path_start = base_url.rfind('/').ok_or_else(|| AppError::BadRequest("DATABASE_URL: no path".into()))? + 1;
-    let base = base_url.get(..path_start).unwrap_or(base_url);
-    let query = base_url.get(path_start..).and_then(|s| s.find('?').map(|i| &s[i..])).unwrap_or("");
-    Ok(format!("{}{}{}", base, new_db_name, query))
-}
-
-/// Seed default tenants for database and rls strategies (idempotent). Inserts default-mode-1 (database),
-/// default-mode-3 (rls). For database tenant, creates the DB if missing and uses a URL derived from
-/// `central_database_url` with database name `{central_db}_tenant_default_mode_1`.
-pub async fn seed_default_tenants(pool: &PgPool, central_database_url: &str) -> Result<(), AppError> {
-    let q_table = qualified_sys_table("_sys_tenants");
-
-    // default-mode-1: database strategy — derive tenant DB URL and ensure DB exists
-    let (_, central_db) = parse_db_name_from_url(central_database_url)?;
-    let tenant_db_name = if central_db.is_empty() || central_db == "postgres" {
-        "architect_tenant_default_mode_1".to_string()
-    } else {
-        format!("{}_tenant_default_mode_1", central_db)
-    };
-    let database_url = database_url_with_name(central_database_url, &tenant_db_name)?;
-    ensure_database_exists(&database_url).await?;
-
-    // default-mode-3 (rls): use temp_2 DB
-    let database_url_mode3 = database_url_with_name(central_database_url, "temp_2")?;
-    ensure_database_exists(&database_url_mode3).await?;
-
-    let insert_sql = format!(
-        r#"
-        INSERT INTO {} (id, strategy, database_url, updated_at, comment)
-        VALUES
-            ($1, $2, $3, NOW(), $4),
-            ($5, $6, $7, NOW(), $8)
-        ON CONFLICT (id) DO NOTHING
-        "#,
-        q_table
-    );
-    sqlx::query(&insert_sql)
-        .bind("default-mode-1")
-        .bind("database")
-        .bind(&database_url)
-        .bind("Tenant with own database (seed)")
-        .bind("default-mode-3")
-        .bind("rls")
-        .bind(&database_url_mode3)
-        .bind("Tenant with RLS in shared DB (seed)")
-        .execute(pool)
-        .await?;
-
-    Ok(())
 }
 
 fn quote_ident(name: &str) -> String {
