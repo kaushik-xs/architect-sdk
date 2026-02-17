@@ -1,0 +1,4 @@
+[
+  { "id": "user_prefs", "namespace": "user_prefs" },
+  { "id": "app_settings", "namespace": "app_settings" }
+]

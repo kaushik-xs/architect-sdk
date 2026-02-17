@@ -117,6 +117,7 @@ config_handler!(post_columns, "columns");
 config_handler!(post_indexes, "indexes");
 config_handler!(post_relationships, "relationships");
 config_handler!(post_api_entities, "api_entities");
+config_handler!(post_kv_stores, "kv_stores");
 
 get_config_handler!(get_schemas, "schemas");
 get_config_handler!(get_enums, "enums");
@@ -125,3 +126,4 @@ get_config_handler!(get_columns, "columns");
 get_config_handler!(get_indexes, "indexes");
 get_config_handler!(get_relationships, "relationships");
 get_config_handler!(get_api_entities, "api_entities");
+get_config_handler!(get_kv_stores, "kv_stores");

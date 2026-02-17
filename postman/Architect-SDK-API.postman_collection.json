@@ -130,7 +130,7 @@
                   "key": "file",
                   "type": "file",
                   "src": [],
-                  "description": "Zip file containing manifest.json at root (must include 'schema', the PostgreSQL schema name used by all configs) plus enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json. No schemas.json needed."
+                  "description": "Zip file containing manifest.json at root (must include 'schema', the PostgreSQL schema name used by all configs) plus enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json, and optionally kv_stores.json. No schemas.json needed."
                 }
               ]
             },
@@ -251,6 +251,22 @@
               "raw": "[\n  {\n    \"entity_id\": \"tbl_users\",\n    \"path_segment\": \"users\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"email\": { \"required\": true, \"format\": \"email\", \"max_length\": 255 },\n      \"id\": { \"format\": \"uuid\" }\n    }\n  },\n  {\n    \"entity_id\": \"tbl_orders\",\n    \"path_segment\": \"orders\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"status\": { \"allowed\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"] },\n      \"user_id\": { \"required\": true, \"format\": \"uuid\" }\n    }\n  }\n]"
             },
             "url": "{{base_url}}/api/v1/config/api_entities"
+          }
+        },
+        {
+          "name": "GET KV Stores",
+          "request": { "method": "GET", "header": [{"key":"X-Tenant-ID","value":"{{tenant_id}}","description":"Required for config, package, and entity APIs"}], "url": "{{base_url}}/api/v1/config/kv_stores" }
+        },
+        {
+          "name": "POST KV Stores",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"id\": \"user_prefs\", \"namespace\": \"user_prefs\" },\n  { \"id\": \"feature_flags\", \"namespace\": \"feature_flags\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/kv_stores"
           }
         }
       ]
@@ -1062,6 +1078,48 @@
                 "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
                 "body": { "mode": "raw", "raw": "[\n  { \"id\": \"{{inventory_id}}\", \"quantity\": 60, \"reserved_quantity\": 10 }\n]" },
                 "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/inventory/bulk"
+              }
+            }
+          ]
+        },
+        {
+          "name": "KV Store",
+          "item": [
+            {
+              "name": "List Keys",
+              "request": {
+                "method": "GET",
+                "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+                "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs",
+                "description": "List all keys and values in the user_prefs namespace."
+              }
+            },
+            {
+              "name": "Get Key",
+              "request": {
+                "method": "GET",
+                "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+                "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs/theme",
+                "description": "Get value for key 'theme'. Create with Put Key first."
+              }
+            },
+            {
+              "name": "Put Key",
+              "request": {
+                "method": "PUT",
+                "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+                "body": { "mode": "raw", "raw": "\"dark\"" },
+                "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs/theme",
+                "description": "Set value for key 'theme'. Body is JSON (string, number, object, or array)."
+              }
+            },
+            {
+              "name": "Delete Key",
+              "request": {
+                "method": "DELETE",
+                "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+                "url": "{{base_url}}/api/v1/package/{{package_ecommerce}}/kv/user_prefs/theme",
+                "description": "Delete key 'theme'. Returns 204 No Content."
               }
             }
           ]

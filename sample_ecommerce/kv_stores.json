@@ -1,0 +1,4 @@
+[
+  { "id": "user_prefs", "namespace": "user_prefs" },
+  { "id": "feature_flags", "namespace": "feature_flags" }
+]

@@ -29,9 +29,9 @@ Use **Body → form-data** (not raw). Add a row with key **file** (or **package*
 ## Folders
 
 - **Common**: Health, Ready, Version, Info (no `/api/v1` prefix).
-- **Config**: Install Package (POST `/api/v1/config/package`, multipart zip with manifest.json + config JSONs), then GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities (under `/api/v1/config/...`). **X-Tenant-ID is required** for all config and package requests. The sample config omits created_at/updated_at/archived_at; they are added automatically.
+- **Config**: Install Package (POST `/api/v1/config/package`, multipart zip with manifest.json + config JSONs), then GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores (under `/api/v1/config/...`). **X-Tenant-ID is required** for all config and package requests. The sample config omits created_at/updated_at/archived_at; they are added automatically.
 - **Users**: List (with optional filters and limit/offset), Create, Read, Update, Delete, Bulk Create, Bulk Update (under `/api/v1/users`). **X-Tenant-ID is required** for all entity requests.
 - **Orders**: Same operations for orders (under `/api/v1/orders`). List supports filters (e.g. `?status=pending&user_id=...`).
-- **Sample (package: sample)**, **Sample E-commerce (package: sample_ecommerce)**: Package-scoped entity APIs; use **package_sample** and **package_ecommerce** variables in URLs.
+- **Sample (package: sample)**, **Sample E-commerce (package: sample_ecommerce)**: Package-scoped entity APIs; use **package_sample** and **package_ecommerce** variables in URLs. Under Sample E-commerce, **KV Store** provides List Keys, Get Key, Put Key, and Delete Key for `/api/v1/package/{{package_ecommerce}}/kv/:namespace` and `.../kv/:namespace/:key` (e.g. namespace `user_prefs`, key `theme`).
 
 Start the server with `cargo run --example server` before running requests. The server seeds two tenants automatically (default-mode-1, default-mode-3). Use `X-Tenant-ID: default-mode-3` for RLS, or `default-mode-1` for database strategy.

@@ -140,6 +140,10 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
         &tokio::fs::read_to_string(dir.join("api_entities.json")).await.unwrap_or_else(|_| "[]".into()),
     )?;
 
+    let kv_stores: Vec<architect_sdk::config::KvStoreConfig> = serde_json::from_str(
+        &tokio::fs::read_to_string(dir.join("kv_stores.json")).await.unwrap_or_else(|_| "[]".into()),
+    )?;
+
     Ok((
         FullConfig {
             schemas,
@@ -149,6 +153,7 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
             indexes,
             relationships,
             api_entities,
+            kv_stores,
         },
         package_id,
     ))

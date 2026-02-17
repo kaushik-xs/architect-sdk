@@ -25,6 +25,7 @@ const CONFIG_TABLES: &[&str] = &[
     "_sys_indexes",
     "_sys_relationships",
     "_sys_api_entities",
+    "_sys_kv_stores",
 ];
 
 /// Package id used when config is posted directly (no package install). Ensures (id, package_id) is unique per package.
@@ -137,6 +138,22 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     sqlx::query(&tenants_ddl).execute(pool).await?;
     let drop_schema_name = format!("ALTER TABLE {} DROP COLUMN IF EXISTS schema_name", q_tenants);
     let _ = sqlx::query(&drop_schema_name).execute(pool).await;
+
+    let q_kv_data = qualified_sys_table("_sys_kv_data");
+    let kv_data_ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {} (
+            package_id TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (package_id, namespace, key)
+        )
+        "#,
+        q_kv_data
+    );
+    sqlx::query(&kv_data_ddl).execute(pool).await?;
 
     Ok(())
 }
@@ -365,6 +382,7 @@ pub fn sys_table_for_kind(kind: &str) -> Option<&'static str> {
         "indexes" => Some("_sys_indexes"),
         "relationships" => Some("_sys_relationships"),
         "api_entities" => Some("_sys_api_entities"),
+        "kv_stores" => Some("_sys_kv_stores"),
         _ => None,
     }
 }

@@ -25,6 +25,7 @@ const CONFIG_KINDS: &[&str] = &[
     "indexes",
     "relationships",
     "api_entities",
+    "kv_stores",
 ];
 
 /// Dependencies for each config kind: these must be applied before this kind.
@@ -38,6 +39,7 @@ fn dependencies(kind: &str) -> &'static [&'static str] {
         "indexes" => &["schemas", "tables"],
         "relationships" => &["schemas", "tables", "columns"],
         "api_entities" => &["tables"],
+        "kv_stores" => &[],
         _ => &[],
     }
 }

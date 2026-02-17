@@ -165,6 +165,14 @@ pub struct ApiEntityConfig {
     pub validation: std::collections::HashMap<String, ValidationRule>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvStoreConfig {
+    pub id: String,
+    pub namespace: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 /// All config types in one struct for in-memory loading.
 #[derive(Clone, Debug, Default)]
 pub struct FullConfig {
@@ -175,4 +183,5 @@ pub struct FullConfig {
     pub indexes: Vec<IndexConfig>,
     pub relationships: Vec<RelationshipConfig>,
     pub api_entities: Vec<ApiEntityConfig>,
+    pub kv_stores: Vec<KvStoreConfig>,
 }

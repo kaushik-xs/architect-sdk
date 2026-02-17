@@ -221,6 +221,7 @@ pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfi
     let indexes = load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes"), package_id).await?;
     let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_sys_table("_sys_relationships"), package_id).await?;
     let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_sys_table("_sys_api_entities"), package_id).await?;
+    let kv_stores = load_config_table::<KvStoreConfig>(pool, &qualified_sys_table("_sys_kv_stores"), package_id).await?;
 
     let config = FullConfig {
         schemas,
@@ -230,6 +231,7 @@ pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfi
         indexes,
         relationships,
         api_entities,
+        kv_stores,
     };
     Ok(config)
 }
