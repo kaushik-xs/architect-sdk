@@ -1,0 +1,241 @@
+{
+  "info": {
+    "name": "Architect SDK – Config & Health",
+    "description": "Health/common and config ingestion endpoints only. No entity CRUD.\n\nX-Tenant-ID is required for all config, package, and health/version requests. Set the tenant_id collection variable (must match a tenant in architect._sys_tenants with strategy database, schema, or rls). Use Install Package to upload a zip (manifest.json + config JSONs); use GET/POST per config kind to read or write schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "tenant_id",
+      "value": "default-mode-3",
+      "description": "Required. Must match a tenant id in architect._sys_tenants. Seeded: default-mode-1 (database), default-mode-2 (schema), default-mode-3 (rls)."
+    }
+  ],
+  "item": [
+    {
+      "name": "Common",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/health",
+            "description": "Liveness check. Returns 200 + { \"status\": \"ok\" }."
+          }
+        },
+        {
+          "name": "Ready",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/ready",
+            "description": "Readiness check (includes DB). Returns 200 if ready, 503 if degraded."
+          }
+        },
+        {
+          "name": "Version",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/version",
+            "description": "Service name and version."
+          }
+        },
+        {
+          "name": "Info",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/info",
+            "description": "Same as version."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Config",
+      "item": [
+        {
+          "name": "Install Package",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Zip file containing manifest.json at root (must include 'schema', the PostgreSQL schema name used by all configs) plus enums.json, tables.json, columns.json, indexes.json, relationships.json, api_entities.json, and optionally kv_stores.json. No schemas.json needed."
+                }
+              ]
+            },
+            "url": "{{base_url}}/api/v1/config/package",
+            "description": "Upload a package zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_packages.\n\nUse Body → form-data, key 'file', type File, select your zip. Do NOT add a Content-Type header (Postman sets multipart/form-data with boundary automatically)."
+          }
+        },
+        {
+          "name": "GET Schemas",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/schemas"
+          }
+        },
+        {
+          "name": "POST Schemas",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"default\",\n    \"name\": \"public\",\n    \"comment\": \"Single schema (from manifest.schema when using module)\"\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/schemas"
+          }
+        },
+        {
+          "name": "GET Enums",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/enums"
+          }
+        },
+        {
+          "name": "POST Enums",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"enum_order_status\",\n    \"name\": \"order_status\",\n    \"values\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"],\n    \"comment\": \"Order lifecycle status (schema from manifest)\"\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/enums"
+          }
+        },
+        {
+          "name": "GET Tables",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/tables"
+          }
+        },
+        {
+          "name": "POST Tables",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"tbl_users\",\n    \"name\": \"users\",\n    \"comment\": \"User accounts\",\n    \"primary_key\": \"id\",\n    \"unique\": [[\"email\"]],\n    \"check\": []\n  },\n  {\n    \"id\": \"tbl_orders\",\n    \"name\": \"orders\",\n    \"comment\": \"Customer orders\",\n    \"primary_key\": \"id\",\n    \"unique\": [],\n    \"check\": [{\"name\": \"created_at_not_future\", \"expression\": \"created_at <= NOW()\"}]\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/tables"
+          }
+        },
+        {
+          "name": "GET Columns",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/columns"
+          }
+        },
+        {
+          "name": "POST Columns",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "description": "Every table gets created_at, updated_at, and archived_at (timestamptz) added automatically; omit them from config unless you need custom definitions.",
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"id\": \"col_users_id\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"id\",\n    \"type\": \"uuid\",\n    \"nullable\": false,\n    \"default\": {\"expression\": \"gen_random_uuid()\"},\n    \"comment\": null\n  },\n  {\n    \"id\": \"col_users_email\",\n    \"table_id\": \"tbl_users\",\n    \"name\": \"email\",\n    \"type\": \"varchar(255)\",\n    \"nullable\": false,\n    \"default\": null,\n    \"comment\": null\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/columns"
+          }
+        },
+        {
+          "name": "GET Indexes",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/indexes"
+          }
+        },
+        {
+          "name": "POST Indexes",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {"mode": "raw", "raw": "[]"},
+            "url": "{{base_url}}/api/v1/config/indexes"
+          }
+        },
+        {
+          "name": "GET Relationships",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/relationships"
+          }
+        },
+        {
+          "name": "POST Relationships",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {"mode": "raw", "raw": "[]"},
+            "url": "{{base_url}}/api/v1/config/relationships"
+          }
+        },
+        {
+          "name": "GET API Entities",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/api_entities"
+          }
+        },
+        {
+          "name": "POST API Entities",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  {\n    \"entity_id\": \"tbl_users\",\n    \"path_segment\": \"users\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"email\": { \"required\": true, \"format\": \"email\", \"max_length\": 255 },\n      \"id\": { \"format\": \"uuid\" }\n    }\n  },\n  {\n    \"entity_id\": \"tbl_orders\",\n    \"path_segment\": \"orders\",\n    \"operations\": [\"create\", \"read\", \"update\", \"delete\", \"bulk_create\", \"bulk_update\"],\n    \"validation\": {\n      \"status\": { \"allowed\": [\"pending\", \"confirmed\", \"shipped\", \"cancelled\"] },\n      \"user_id\": { \"required\": true, \"format\": \"uuid\" }\n    }\n  }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/api_entities"
+          }
+        },
+        {
+          "name": "GET KV Stores",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/kv_stores"
+          }
+        },
+        {
+          "name": "POST KV Stores",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Tenant-ID", "value": "{{tenant_id}}", "description": "Required for config, package, and entity APIs"}],
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"id\": \"user_prefs\", \"namespace\": \"user_prefs\" },\n  { \"id\": \"feature_flags\", \"namespace\": \"feature_flags\" }\n]"
+            },
+            "url": "{{base_url}}/api/v1/config/kv_stores"
+          }
+        }
+      ]
+    }
+  ]
+}
