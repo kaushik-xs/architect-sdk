@@ -1,6 +1,6 @@
 //! Raw config types matching the JSON schema (postgres-config-schema + api_entities).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaConfig {
@@ -56,11 +56,53 @@ pub enum ColumnTypeConfig {
     Parameterized { name: String, params: Option<Vec<u32>> },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Serialize)]
 pub enum ColumnDefaultConfig {
     Literal(String),
     Expression { expression: String },
+}
+
+impl<'de> Deserialize<'de> for ColumnDefaultConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::String(s) => Ok(ColumnDefaultConfig::Literal(s)),
+            serde_json::Value::Object(mut obj) => {
+                if let Some(expr) = obj.remove("expression") {
+                    if let serde_json::Value::String(s) = expr {
+                        return Ok(ColumnDefaultConfig::Expression { expression: s });
+                    }
+                }
+                if let Some(lit) = obj.remove("value").or_else(|| obj.remove("literal")) {
+                    if let serde_json::Value::String(s) = lit {
+                        return Ok(ColumnDefaultConfig::Literal(s));
+                    }
+                }
+                Err(serde::de::Error::custom(format!(
+                    "column default must be a string, {{ \"expression\": \"...\" }}, or {{ \"value\": \"...\" }}; got object with keys: {:?}",
+                    obj.keys().collect::<Vec<_>>()
+                )))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "column default must be a string or {{ \"expression\": \"...\" }}; got {}",
+                type_name_of_json(&other)
+            ))),
+        }
+    }
+}
+
+fn type_name_of_json(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
