@@ -86,8 +86,10 @@ impl<'de> Deserialize<'de> for ColumnDefaultConfig {
                     obj.keys().collect::<Vec<_>>()
                 )))
             }
+            serde_json::Value::Bool(b) => Ok(ColumnDefaultConfig::Literal(b.to_string())),
+            serde_json::Value::Number(n) => Ok(ColumnDefaultConfig::Literal(n.to_string())),
             other => Err(serde::de::Error::custom(format!(
-                "column default must be a string or {{ \"expression\": \"...\" }}; got {}",
+                "column default must be a string, boolean, number, or {{ \"expression\": \"...\" }}; got {}",
                 type_name_of_json(&other)
             ))),
         }
