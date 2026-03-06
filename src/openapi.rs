@@ -154,8 +154,27 @@ fn x_tenant_id_header() -> Parameter {
         .build()
 }
 
-fn list_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
-    let mut params = vec![x_tenant_id_header(),
+/// Path parameter for package-scoped routes: packageId (from architect._sys_packages). No literal package ids in the spec.
+fn package_id_param() -> Parameter {
+    ParameterBuilder::new()
+        .name("packageId")
+        .parameter_in(ParameterIn::Path)
+        .required(Required::True)
+        .description(Some("Package id from architect._sys_packages."))
+        .schema(Some(RefOr::T(Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .into(),
+        ))))
+        .build()
+}
+
+fn list_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
+    params.extend(vec![
         ParameterBuilder::new()
             .name("limit")
             .parameter_in(ParameterIn::Query)
@@ -189,7 +208,7 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
                     .into(),
             ))))
             .build(),
-    ];
+    ]);
     for col in &entity.columns {
         if entity.sensitive_columns.contains(&col.name) {
             continue;
@@ -221,7 +240,11 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         .build()
 }
 
-fn create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn create_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let body = RequestBodyBuilder::new()
         .description(Some(format!(
             "JSON object with {} fields from _sys_columns (camelCase). PK may be omitted if DB default exists.",
@@ -237,7 +260,7 @@ fn create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         .summary(Some(format!("Create {}", entity.path_segment)))
         .description(Some(format!("Create a single {}", entity.path_segment)))
         .operation_id(Some(format!("create_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header()]))
+        .parameters(Some(params))
         .request_body(Some(body))
         .responses(
             ResponsesBuilder::new()
@@ -248,7 +271,11 @@ fn create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         .build()
 }
 
-fn read_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn read_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let id_param = ParameterBuilder::new()
         .name("id")
         .parameter_in(ParameterIn::Path)
@@ -271,16 +298,22 @@ fn read_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
                 .into(),
         ))))
         .build();
+    params.push(id_param);
+    params.push(include_param);
     OperationBuilder::new()
         .summary(Some(format!("Get {} by id", entity.path_segment)))
         .description(Some(format!("Get a single {} by id.", entity.path_segment)))
         .operation_id(Some(format!("read_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header(), id_param, include_param]))
+        .parameters(Some(params))
         .responses(default_responses().build())
         .build()
 }
 
-fn update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let id_param = ParameterBuilder::new()
         .name("id")
         .parameter_in(ParameterIn::Path)
@@ -292,6 +325,7 @@ fn update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
                 .into(),
         ))))
         .build();
+    params.push(id_param);
     let body = RequestBodyBuilder::new()
         .description(Some(
             "JSON object with fields from _sys_columns to update (camelCase, partial).",
@@ -306,13 +340,17 @@ fn update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         .summary(Some(format!("Update {} by id", entity.path_segment)))
         .description(Some(format!("Update a single {} by id.", entity.path_segment)))
         .operation_id(Some(format!("update_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header(), id_param]))
+        .parameters(Some(params))
         .request_body(Some(body))
         .responses(default_responses().build())
         .build()
 }
 
-fn delete_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn delete_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let id_param = ParameterBuilder::new()
         .name("id")
         .parameter_in(ParameterIn::Path)
@@ -324,11 +362,12 @@ fn delete_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
                 .into(),
         ))))
         .build();
+    params.push(id_param);
     OperationBuilder::new()
         .summary(Some(format!("Delete {} by id", entity.path_segment)))
         .description(Some(format!("Delete a single {} by id.", entity.path_segment)))
         .operation_id(Some(format!("delete_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header(), id_param]))
+        .parameters(Some(params))
         .responses(
             ResponsesBuilder::new()
                 .response("204", Response::new("No Content"))
@@ -339,7 +378,11 @@ fn delete_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         .build()
 }
 
-fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let item_schema = entity_body_schema(entity, true);
     let body = RequestBodyBuilder::new()
         .description(Some(
@@ -360,7 +403,7 @@ fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation 
         .summary(Some(format!("Bulk create {}", entity.path_segment)))
         .description(Some(format!("Create multiple {}.", entity.path_segment)))
         .operation_id(Some(format!("bulk_create_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header()]))
+        .parameters(Some(params))
         .request_body(Some(body))
         .responses(
             ResponsesBuilder::new()
@@ -371,7 +414,11 @@ fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation 
         .build()
 }
 
-fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
     let item_schema = entity_body_schema(entity, false);
     let body = RequestBodyBuilder::new()
         .description(Some(
@@ -392,27 +439,27 @@ fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation 
         .summary(Some(format!("Bulk update {}", entity.path_segment)))
         .description(Some(format!("Update multiple {}.", entity.path_segment)))
         .operation_id(Some(format!("bulk_update_{}{}", entity.path_segment, op_suffix)))
-        .parameters(Some(vec![x_tenant_id_header()]))
+        .parameters(Some(params))
         .request_body(Some(body))
         .responses(default_responses().build())
         .build()
 }
 
-/// Add entity paths for one model to the builder. When `package_id` is None, paths are
-/// `{base}/{path_segment}` (default model). When `Some(id)`, paths are `{base}/package/{id}/{path_segment}`.
+/// Add entity paths for one model. When `use_package_param` is false, paths are
+/// `{base}/{path_segment}` (default model). When true, paths are `{base}/package/{packageId}/{path_segment}`
+/// with no literal package id in the spec (caller substitutes packageId at runtime).
 fn add_entity_paths(
     mut builder: PathsBuilder,
     base: &str,
     model: &ResolvedModel,
-    package_id: Option<&str>,
+    use_package_param: bool,
 ) -> PathsBuilder {
-    let path_prefix = match package_id {
-        None => base.to_string(),
-        Some(pid) => format!("{}/package/{}", base, pid),
+    let path_prefix = if use_package_param {
+        format!("{}/package/{{packageId}}", base)
+    } else {
+        base.to_string()
     };
-    let op_suffix = package_id
-        .map(|pid| format!("_package_{}", pid.replace('-', "_")))
-        .unwrap_or_default();
+    let op_suffix = if use_package_param { "_package" } else { "" };
 
     for entity in &model.entities {
         let seg = &entity.path_segment;
@@ -425,11 +472,16 @@ fn add_entity_paths(
         if has_list || has_create {
             let mut list_item = PathItemBuilder::new();
             if has_list {
-                list_item = list_item.operation(HttpMethod::Get, list_operation(entity, &op_suffix));
+                list_item = list_item.operation(
+                    HttpMethod::Get,
+                    list_operation(entity, op_suffix, use_package_param),
+                );
             }
             if has_create {
-                list_item =
-                    list_item.operation(HttpMethod::Post, create_operation(entity, &op_suffix));
+                list_item = list_item.operation(
+                    HttpMethod::Post,
+                    create_operation(entity, op_suffix, use_package_param),
+                );
             }
             builder = builder.path(list_path, list_item.build());
         }
@@ -440,16 +492,22 @@ fn add_entity_paths(
         if has_read || has_update || has_delete {
             let mut by_id_item = PathItemBuilder::new();
             if has_read {
-                by_id_item =
-                    by_id_item.operation(HttpMethod::Get, read_operation(entity, &op_suffix));
+                by_id_item = by_id_item.operation(
+                    HttpMethod::Get,
+                    read_operation(entity, op_suffix, use_package_param),
+                );
             }
             if has_update {
-                by_id_item =
-                    by_id_item.operation(HttpMethod::Patch, update_operation(entity, &op_suffix));
+                by_id_item = by_id_item.operation(
+                    HttpMethod::Patch,
+                    update_operation(entity, op_suffix, use_package_param),
+                );
             }
             if has_delete {
-                by_id_item =
-                    by_id_item.operation(HttpMethod::Delete, delete_operation(entity, &op_suffix));
+                by_id_item = by_id_item.operation(
+                    HttpMethod::Delete,
+                    delete_operation(entity, op_suffix, use_package_param),
+                );
             }
             builder = builder.path(by_id_path, by_id_item.build());
         }
@@ -459,12 +517,16 @@ fn add_entity_paths(
         if has_bulk_create || has_bulk_update {
             let mut bulk_item = PathItemBuilder::new();
             if has_bulk_create {
-                bulk_item = bulk_item
-                    .operation(HttpMethod::Post, bulk_create_operation(entity, &op_suffix));
+                bulk_item = bulk_item.operation(
+                    HttpMethod::Post,
+                    bulk_create_operation(entity, op_suffix, use_package_param),
+                );
             }
             if has_bulk_update {
-                bulk_item = bulk_item
-                    .operation(HttpMethod::Patch, bulk_update_operation(entity, &op_suffix));
+                bulk_item = bulk_item.operation(
+                    HttpMethod::Patch,
+                    bulk_update_operation(entity, op_suffix, use_package_param),
+                );
             }
             builder = builder.path(bulk_path, bulk_item.build());
         }
@@ -472,48 +534,60 @@ fn add_entity_paths(
     builder
 }
 
-fn kv_list_keys_operation(package_id: &str, namespace: &str) -> Operation {
+fn kv_namespace_param() -> Parameter {
+    ParameterBuilder::new()
+        .name("namespace")
+        .parameter_in(ParameterIn::Path)
+        .required(Required::True)
+        .description(Some("KV store namespace (from _sys_kv_stores)."))
+        .schema(Some(RefOr::T(Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .into(),
+        ))))
+        .build()
+}
+
+fn kv_list_keys_operation() -> Operation {
     OperationBuilder::new()
-        .summary(Some(format!("List KV keys in namespace {}", namespace)))
-        .description(Some(format!(
-            "List all keys and values in package {} namespace {}.",
-            package_id, namespace
-        )))
-        .operation_id(Some(format!(
-            "kv_list_keys_package_{}_ns_{}",
-            package_id.replace('-', "_"),
-            namespace.replace('-', "_")
-        )))
-        .parameters(Some(vec![x_tenant_id_header()]))
+        .summary(Some("List KV keys in namespace"))
+        .description(Some(
+            "List all keys and values in the given package and namespace.",
+        ))
+        .operation_id(Some("kv_list_keys"))
+        .parameters(Some(vec![
+            x_tenant_id_header(),
+            package_id_param(),
+            kv_namespace_param(),
+        ]))
         .responses(default_responses().build())
         .build()
 }
 
-fn kv_key_operations(package_id: &str, namespace: &str) -> (Operation, Operation, Operation) {
+fn kv_key_param() -> Parameter {
+    ParameterBuilder::new()
+        .name("key")
+        .parameter_in(ParameterIn::Path)
+        .required(Required::True)
+        .description(Some("KV key"))
+        .schema(Some(RefOr::T(Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .into(),
+        ))))
+        .build()
+}
+
+fn kv_key_operations() -> (Operation, Operation, Operation) {
     let get_op = OperationBuilder::new()
         .summary(Some("Get KV value by key"))
-        .description(Some(format!(
-            "Get value for key in package {} namespace {}.",
-            package_id, namespace
-        )))
-        .operation_id(Some(format!(
-            "kv_get_package_{}_ns_{}",
-            package_id.replace('-', "_"),
-            namespace.replace('-', "_")
-        )))
+        .description(Some("Get value for key in package and namespace."))
+        .operation_id(Some("kv_get"))
         .parameters(Some(vec![
             x_tenant_id_header(),
-            ParameterBuilder::new()
-                .name("key")
-                .parameter_in(ParameterIn::Path)
-                .required(Required::True)
-                .description(Some("KV key"))
-                .schema(Some(RefOr::T(Schema::Object(
-                    utoipa::openapi::schema::ObjectBuilder::new()
-                        .schema_type(SchemaType::new(Type::String))
-                        .into(),
-                ))))
-                .build(),
+            package_id_param(),
+            kv_namespace_param(),
+            kv_key_param(),
         ]))
         .responses(default_responses().build())
         .build();
@@ -521,23 +595,12 @@ fn kv_key_operations(package_id: &str, namespace: &str) -> (Operation, Operation
     let put_op = OperationBuilder::new()
         .summary(Some("Set KV value (upsert)"))
         .description(Some("Set or overwrite value for key. Body is arbitrary JSON."))
-        .operation_id(Some(format!(
-            "kv_put_package_{}_ns_{}",
-            package_id.replace('-', "_"),
-            namespace.replace('-', "_")
-        )))
+        .operation_id(Some("kv_put"))
         .parameters(Some(vec![
             x_tenant_id_header(),
-            ParameterBuilder::new()
-                .name("key")
-                .parameter_in(ParameterIn::Path)
-                .required(Required::True)
-                .schema(Some(RefOr::T(Schema::Object(
-                    utoipa::openapi::schema::ObjectBuilder::new()
-                        .schema_type(SchemaType::new(Type::String))
-                        .into(),
-                ))))
-                .build(),
+            package_id_param(),
+            kv_namespace_param(),
+            kv_key_param(),
         ]))
         .request_body(Some(
             RequestBodyBuilder::new()
@@ -557,23 +620,12 @@ fn kv_key_operations(package_id: &str, namespace: &str) -> (Operation, Operation
     let delete_op = OperationBuilder::new()
         .summary(Some("Delete KV key"))
         .description(Some("Delete key. Returns 204 No Content."))
-        .operation_id(Some(format!(
-            "kv_delete_package_{}_ns_{}",
-            package_id.replace('-', "_"),
-            namespace.replace('-', "_")
-        )))
+        .operation_id(Some("kv_delete"))
         .parameters(Some(vec![
             x_tenant_id_header(),
-            ParameterBuilder::new()
-                .name("key")
-                .parameter_in(ParameterIn::Path)
-                .required(Required::True)
-                .schema(Some(RefOr::T(Schema::Object(
-                    utoipa::openapi::schema::ObjectBuilder::new()
-                        .schema_type(SchemaType::new(Type::String))
-                        .into(),
-                ))))
-                .build(),
+            package_id_param(),
+            kv_namespace_param(),
+            kv_key_param(),
         ]))
         .responses(
             ResponsesBuilder::new()
@@ -586,35 +638,53 @@ fn kv_key_operations(package_id: &str, namespace: &str) -> (Operation, Operation
     (get_op, put_op, delete_op)
 }
 
-/// Add KV store paths for each package's namespaces: list keys and get/put/delete by key.
+/// Add KV store paths with {packageId} and {namespace} (no literal package ids in spec).
 fn add_kv_paths(
     mut builder: PathsBuilder,
     base: &str,
     package_kv_stores: &HashMap<String, Vec<KvStoreConfig>>,
 ) -> PathsBuilder {
-    for (package_id, stores) in package_kv_stores {
-        for store in stores {
-            let namespace = &store.namespace;
-            let list_path = format!("{}/package/{}/kv/{}", base, package_id, namespace);
-            let key_path = format!("{}/package/{}/kv/{}/{{key}}", base, package_id, namespace);
-
-            let list_item = PathItemBuilder::new()
-                .operation(HttpMethod::Get, kv_list_keys_operation(package_id, namespace));
-            builder = builder.path(list_path, list_item.build());
-
-            let (get_op, put_op, delete_op) = kv_key_operations(package_id, namespace);
-            let key_item = PathItemBuilder::new()
-                .operation(HttpMethod::Get, get_op)
-                .operation(HttpMethod::Put, put_op)
-                .operation(HttpMethod::Delete, delete_op);
-            builder = builder.path(key_path, key_item.build());
-        }
+    let has_kv = package_kv_stores.values().any(|s| !s.is_empty());
+    if !has_kv {
+        return builder;
     }
+    let list_path = format!("{}/package/{{packageId}}/kv/{{namespace}}", base);
+    let key_path = format!("{}/package/{{packageId}}/kv/{{namespace}}/{{key}}", base);
+
+    let list_item = PathItemBuilder::new()
+        .operation(HttpMethod::Get, kv_list_keys_operation());
+    builder = builder.path(list_path, list_item.build());
+
+    let (get_op, put_op, delete_op) = kv_key_operations();
+    let key_item = PathItemBuilder::new()
+        .operation(HttpMethod::Get, get_op)
+        .operation(HttpMethod::Put, put_op)
+        .operation(HttpMethod::Delete, delete_op);
+    builder = builder.path(key_path, key_item.build());
     builder
 }
 
-/// Build full OpenAPI spec for entity APIs: default model paths plus package-scoped paths for each package,
-/// plus KV store paths per package namespace.
+/// Merge entities from all package models by path_segment (first occurrence wins). Used so
+/// package-scoped paths are emitted once with {packageId} instead of per-package literal ids.
+fn merge_package_models(package_models: &HashMap<String, ResolvedModel>) -> ResolvedModel {
+    let mut entity_by_path = HashMap::new();
+    let mut entities = Vec::new();
+    for model in package_models.values() {
+        for entity in &model.entities {
+            if !entity_by_path.contains_key(&entity.path_segment) {
+                entity_by_path.insert(entity.path_segment.clone(), entity.clone());
+                entities.push(entity.clone());
+            }
+        }
+    }
+    ResolvedModel {
+        entities,
+        entity_by_path,
+    }
+}
+
+/// Build full OpenAPI spec for entity APIs: default model paths plus package-scoped paths
+/// (with {packageId} parameter, no literal package ids) plus KV paths with {packageId}/{namespace}.
 pub fn build_spec(
     default_model: &ResolvedModel,
     base_path: &str,
@@ -623,9 +693,10 @@ pub fn build_spec(
 ) -> OpenApi {
     let server = build_server();
     let mut builder = PathsBuilder::new();
-    builder = add_entity_paths(builder, base_path, default_model, None);
-    for (package_id, model) in package_models {
-        builder = add_entity_paths(builder, base_path, model, Some(package_id.as_str()));
+    builder = add_entity_paths(builder, base_path, default_model, false);
+    let merged_package = merge_package_models(package_models);
+    if !merged_package.entities.is_empty() {
+        builder = add_entity_paths(builder, base_path, &merged_package, true);
     }
     builder = add_kv_paths(builder, base_path, package_kv_stores);
     let paths = builder.build();
