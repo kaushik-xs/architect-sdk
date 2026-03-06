@@ -1,5 +1,6 @@
-//! Common routes: health, readiness, version.
+//! Common routes: health, readiness, version, OpenAPI spec.
 
+use crate::openapi::spec_handler;
 use crate::state::AppState;
 use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
@@ -51,12 +52,13 @@ pub fn common_routes() -> Router {
         .route("/info", get(version))
 }
 
-/// Common routes including readiness with DB check. Requires AppState.
+/// Common routes including readiness with DB check and GET /spec (OpenAPI). Requires AppState.
 pub fn common_routes_with_ready(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
         .route("/info", get(version))
+        .route("/spec", get(spec_handler))
         .with_state(state)
 }

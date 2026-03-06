@@ -12,6 +12,7 @@ pub mod store;
 pub mod service;
 pub mod tenant;
 pub mod handlers;
+pub mod openapi;
 pub mod routes;
 
 pub use config::{resolve, load_from_pool, FullConfig, ResolvedModel, ResolvedEntity};
