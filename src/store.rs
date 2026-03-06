@@ -283,6 +283,16 @@ pub async fn replace_config_rows(
 const PACKAGES_TABLE: &str = "_sys_packages";
 const PACKAGES_HISTORY_TABLE: &str = "_sys_packages_history";
 
+/// List all package ids from _sys_packages (what is installed in the DB). Used to generate OpenAPI spec from _sys_* config.
+pub async fn list_package_ids(pool: &PgPool) -> Result<Vec<String>, AppError> {
+    let q = qualified_sys_table(PACKAGES_TABLE);
+    let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT id FROM {} ORDER BY id", q))
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Db)?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// Upsert one package row by id: copy current to history if exists, then insert or replace with new payload.
 /// Semantic version is read from payload.version (e.g. manifest "version": "1.0.0"). Version is only incremented when semantic_version changes.
 pub async fn upsert_package(
