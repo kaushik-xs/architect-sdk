@@ -1,6 +1,7 @@
-//! Build OpenAPI spec from resolved model (api_entities + columns). Exposed at GET /spec.
-//! Entity paths are generated dynamically from what exists in _sys_* tables: default model from state
-//! and package-scoped paths by listing _sys_packages and loading each package's config from _sys_*.
+//! Build OpenAPI spec from architect._sys_* tables. Exposed at GET /spec.
+//! APIs and paths come from _sys_api_entities per package; parameters and request/response body
+//! schemas are built from _sys_columns (column names, types, nullable, default). Entity and KV
+//! paths are generated dynamically by listing _sys_packages and loading each package's config.
 
 use crate::case::to_camel_case;
 use crate::config::{
@@ -49,13 +50,82 @@ fn json_object_schema() -> Schema {
     )
 }
 
-fn json_array_of_objects_schema() -> Schema {
-    Schema::Array(
-        utoipa::openapi::schema::ArrayBuilder::new()
-            .items(RefOr::T(json_object_schema()))
-            .build()
+/// Map PostgreSQL type (from _sys_columns) to OpenAPI schema type for parameters and body properties.
+fn column_schema_from_pg_type(pg_type: Option<&str>) -> Schema {
+    let t = pg_type.unwrap_or("").to_lowercase();
+    if t.contains("int") || t.contains("serial") {
+        return Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::Integer))
+                .into(),
+        );
+    }
+    if t.contains("bool") {
+        return Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::Boolean))
+                .into(),
+        );
+    }
+    if t.contains("uuid") {
+        return Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
+                    utoipa::openapi::schema::KnownFormat::Uuid,
+                )))
+                .into(),
+        );
+    }
+    if t.contains("numeric") || t.contains("decimal") || t.contains("real") || t.contains("double") || t.contains("float") {
+        return Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::Number))
+                .into(),
+        );
+    }
+    if t.contains("timestamp") || t.contains("date") {
+        return Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
+                    utoipa::openapi::schema::KnownFormat::DateTime,
+                )))
+                .into(),
+        );
+    }
+    Schema::Object(
+        utoipa::openapi::schema::ObjectBuilder::new()
+            .schema_type(SchemaType::new(Type::String))
             .into(),
     )
+}
+
+/// Build OpenAPI object schema from entity columns (_sys_columns). Properties use camelCase.
+/// For create: required = !nullable && !has_default. For update: all optional (partial).
+fn entity_body_schema(entity: &ResolvedEntity, for_create: bool) -> Schema {
+    let mut builder = utoipa::openapi::schema::ObjectBuilder::new()
+        .schema_type(SchemaType::new(Type::Object))
+        .description(Some(format!(
+            "Fields from architect._sys_columns for table {} (API uses camelCase).",
+            entity.table_id
+        )));
+    let mut required = Vec::new();
+    for col in &entity.columns {
+        if entity.sensitive_columns.contains(&col.name) {
+            continue;
+        }
+        let camel = to_camel_case(&col.name);
+        let prop_schema = column_schema_from_pg_type(col.pg_type.as_deref());
+        builder = builder.property(camel.clone(), RefOr::T(prop_schema));
+        if for_create && !col.nullable && !col.has_default {
+            required.push(camel);
+        }
+    }
+    for r in &required {
+        builder = builder.required(r.clone());
+    }
+    Schema::Object(builder.into())
 }
 
 fn default_responses() -> ResponsesBuilder {
@@ -125,37 +195,16 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
             continue;
         }
         let camel = to_camel_case(&col.name);
-        let schema = match col.pg_type.as_deref().unwrap_or("").to_lowercase() {
-            t if t.contains("int") || t.contains("serial") => Schema::Object(
-                utoipa::openapi::schema::ObjectBuilder::new()
-                    .schema_type(SchemaType::new(Type::Integer))
-                    .into(),
-            ),
-            t if t.contains("bool") => Schema::Object(
-                utoipa::openapi::schema::ObjectBuilder::new()
-                    .schema_type(SchemaType::new(Type::Boolean))
-                    .into(),
-            ),
-            t if t.contains("uuid") => Schema::Object(
-                utoipa::openapi::schema::ObjectBuilder::new()
-                    .schema_type(SchemaType::new(Type::String))
-                    .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
-                        utoipa::openapi::schema::KnownFormat::Uuid,
-                    )))
-                    .into(),
-            ),
-            _ => Schema::Object(
-                utoipa::openapi::schema::ObjectBuilder::new()
-                    .schema_type(SchemaType::new(Type::String))
-                    .into(),
-            ),
-        };
+        let schema = column_schema_from_pg_type(col.pg_type.as_deref());
         params.push(
             ParameterBuilder::new()
                 .name(camel)
                 .parameter_in(ParameterIn::Query)
                 .required(Required::False)
-                .description(Some(format!("Filter by {}", col.name)))
+                .description(Some(format!(
+                    "Filter by {} (from _sys_columns)",
+                    col.name
+                )))
                 .schema(Some(RefOr::T(schema)))
                 .build(),
         );
@@ -175,10 +224,13 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
 fn create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
     let body = RequestBodyBuilder::new()
         .description(Some(format!(
-            "JSON object with {} fields (camelCase). PK may be omitted if DB default exists.",
+            "JSON object with {} fields from _sys_columns (camelCase). PK may be omitted if DB default exists.",
             entity.path_segment
         )))
-        .content("application/json", Content::new(Some(RefOr::T(json_object_schema()))))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(entity_body_schema(entity, true)))),
+        )
         .required(Some(Required::True))
         .build();
     OperationBuilder::new()
@@ -241,8 +293,13 @@ fn update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
         ))))
         .build();
     let body = RequestBodyBuilder::new()
-        .description(Some("JSON object with fields to update (camelCase, partial)."))
-        .content("application/json", Content::new(Some(RefOr::T(json_object_schema()))))
+        .description(Some(
+            "JSON object with fields from _sys_columns to update (camelCase, partial).",
+        ))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(entity_body_schema(entity, false)))),
+        )
         .required(Some(Required::True))
         .build();
     OperationBuilder::new()
@@ -283,11 +340,19 @@ fn delete_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
 }
 
 fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+    let item_schema = entity_body_schema(entity, true);
     let body = RequestBodyBuilder::new()
-        .description(Some("JSON array of objects; each object has same shape as create body."))
+        .description(Some(
+            "JSON array of objects; each has shape from _sys_columns (same as create body).",
+        ))
         .content(
             "application/json",
-            Content::new(Some(RefOr::T(json_array_of_objects_schema()))),
+            Content::new(Some(RefOr::T(Schema::Array(
+                utoipa::openapi::schema::ArrayBuilder::new()
+                    .items(RefOr::T(item_schema))
+                    .build()
+                    .into(),
+            )))),
         )
         .required(Some(Required::True))
         .build();
@@ -307,13 +372,19 @@ fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation 
 }
 
 fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str) -> Operation {
+    let item_schema = entity_body_schema(entity, false);
     let body = RequestBodyBuilder::new()
         .description(Some(
-            "JSON array of objects; each must include id and fields to update.",
+            "JSON array of objects; each must include id and fields from _sys_columns to update (camelCase, partial).",
         ))
         .content(
             "application/json",
-            Content::new(Some(RefOr::T(json_array_of_objects_schema()))),
+            Content::new(Some(RefOr::T(Schema::Array(
+                utoipa::openapi::schema::ArrayBuilder::new()
+                    .items(RefOr::T(item_schema))
+                    .build()
+                    .into(),
+            )))),
         )
         .required(Some(Required::True))
         .build();
