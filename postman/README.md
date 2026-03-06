@@ -1,6 +1,6 @@
 # Postman collection
 
-Import **Architect-SDK-API.postman_collection.json** into Postman (File → Import → select the file).
+Import **Architect-SDK-API.postman_collection.json** into Postman (File → Import → select the file). It includes Common (health, ready, version, info, spec), Config (package + all config GET/POST), and entity CRUD for Users, Orders, and the sample/sample_ecommerce packages.
 
 ## Collection variables
 
@@ -28,7 +28,7 @@ Use **Body → form-data** (not raw). Add a row with key **file** (or **package*
 
 ## Folders
 
-- **Common**: Health, Ready, Version, Info (no `/api/v1` prefix).
+- **Common**: Health, Ready, Version, Info, **Spec** (GET `/spec` returns OpenAPI JSON for entity APIs; no `/api/v1` prefix for these).
 - **Config**: Install Package (POST `/api/v1/config/package`, multipart zip with manifest.json + config JSONs), then GET/POST for schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores (under `/api/v1/config/...`). **X-Tenant-ID is required** for all config and package requests. The sample config omits created_at/updated_at/archived_at; they are added automatically.
 - **Users**: List (with optional filters and limit/offset), Create, Read, Update, Delete, Bulk Create, Bulk Update (under `/api/v1/users`). **X-Tenant-ID is required** for all entity requests.
 - **Orders**: Same operations for orders (under `/api/v1/orders`). List supports filters (e.g. `?status=pending&user_id=...`).

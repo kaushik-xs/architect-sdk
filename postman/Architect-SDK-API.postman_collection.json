@@ -112,6 +112,15 @@
             "url": "{{base_url}}/info",
             "description": "Same as version."
           }
+        },
+        {
+          "name": "Spec",
+          "request": {
+            "method": "GET",
+            "header": [{"key":"X-Tenant-ID","value":"{{tenant_id}}","description":"Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/spec",
+            "description": "OpenAPI (Swagger) JSON for entity APIs from the current resolved model. Use for documentation, codegen, or API exploration."
+          }
         }
       ]
     },
