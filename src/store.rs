@@ -365,6 +365,68 @@ pub async fn upsert_package(
     Ok(new_version)
 }
 
+/// Delete all config rows and KV data for a package, then remove the package record.
+/// Copies the current package row to _sys_packages_history before delete. Call after reverting migrations on the tenant DB.
+pub async fn delete_package_and_config(pool: &PgPool, package_id: &str) -> Result<(), AppError> {
+    let q_packages = qualified_sys_table(PACKAGES_TABLE);
+    let q_packages_history = qualified_sys_table(PACKAGES_HISTORY_TABLE);
+    let q_kv_data = qualified_sys_table("_sys_kv_data");
+
+    let mut tx = pool.begin().await?;
+
+    // Copy current package row to history (if exists)
+    let current: Option<(serde_json::Value, i64, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT payload, version, semantic_version FROM {} WHERE id = $1",
+        q_packages
+    ))
+    .bind(package_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::Db)?;
+
+    if let Some((payload, version, semantic_version)) = current {
+        sqlx::query(&format!(
+            "INSERT INTO {} (id, payload, version, created_at, semantic_version) VALUES ($1, $2, $3, NOW(), $4)",
+            q_packages_history
+        ))
+        .bind(package_id)
+        .bind(payload)
+        .bind(version)
+        .bind(semantic_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Delete from each config table and its history (by package_id)
+    for table in CONFIG_TABLES {
+        let q_table = qualified_sys_table(table);
+        sqlx::query(&format!("DELETE FROM {} WHERE package_id = $1", q_table))
+            .bind(package_id)
+            .execute(&mut *tx)
+            .await?;
+        let history_table = qualified_sys_table(&format!("{}_history", table));
+        sqlx::query(&format!("DELETE FROM {} WHERE package_id = $1", history_table))
+            .bind(package_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Delete KV data for this package
+    sqlx::query(&format!("DELETE FROM {} WHERE package_id = $1", q_kv_data))
+        .bind(package_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Delete package row
+    sqlx::query(&format!("DELETE FROM {} WHERE id = $1", q_packages))
+        .bind(package_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Ensure the database in `database_url` exists; create it if not. Connects to the
 /// default `postgres` database to run CREATE DATABASE. Call before creating the main pool.
 pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> {

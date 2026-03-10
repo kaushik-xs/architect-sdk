@@ -1,4 +1,4 @@
-//! Package install handler: accept zip upload, extract manifest + configs, apply configs in dependency order (most atomic first), store manifest, and reload model. X-Tenant-ID is required.
+//! Package install/uninstall handlers. Install: zip upload, extract manifest + configs, apply configs, store manifest, reload model. Uninstall: revert migrations, delete _sys_* rows and package record. X-Tenant-ID is required.
 //! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in the tenant's target DB (for database/RLS with database_url).
 
 use crate::config::{load_from_pool, resolve};
@@ -6,11 +6,12 @@ use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::replace_config;
 use crate::handlers::entity::resolve_tenant_context;
-use crate::migration::apply_migrations;
+use crate::migration::{apply_migrations, revert_migrations};
 use crate::state::AppState;
-use crate::store::upsert_package;
-use axum::extract::{Multipart, State};
+use crate::store::{delete_package_and_config, list_package_ids, upsert_package};
+use axum::extract::{Multipart, Path, State};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -231,6 +232,58 @@ pub async fn install_package(
                 package: manifest_value,
                 applied,
             },
+            meta: None,
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct UninstallPath {
+    pub package_id: String,
+}
+
+/// DELETE /api/v1/config/package/:package_id — uninstall package: revert migrations in tenant DB, delete all _sys_* config and KV data, remove package record. X-Tenant-ID required.
+pub async fn uninstall_package(
+    TenantId(tenant_id_opt): TenantId,
+    State(state): State<AppState>,
+    Path(UninstallPath { package_id }): Path<UninstallPath>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id = tenant_id_opt
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
+
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let config_pool = ctx.config_pool();
+    let migration_pool = ctx.migration_pool();
+    let schema_override = ctx.schema_override();
+    let package_cache_key = ctx.package_cache_key().to_string();
+
+    let installed = list_package_ids(config_pool).await?;
+    if !installed.contains(&package_id) {
+        return Err(AppError::NotFound(format!("package not found: {}", package_id)));
+    }
+
+    let config = load_from_pool(config_pool, &package_id).await.map_err(AppError::Config)?;
+    revert_migrations(migration_pool, &config, schema_override).await?;
+    delete_package_and_config(config_pool, &package_id).await?;
+
+    {
+        state
+            .package_models
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?
+            .remove(&package_cache_key);
+    }
+
+    #[derive(serde::Serialize)]
+    struct UninstallResponse {
+        package_id: String,
+    }
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: UninstallResponse { package_id },
             meta: None,
         }),
     ))

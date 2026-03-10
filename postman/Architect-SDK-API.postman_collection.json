@@ -23,6 +23,11 @@
       "value": ""
     },
     {
+      "key": "package_id",
+      "value": "sample",
+      "description": "Package id for uninstall (e.g. sample, sample_ecommerce)"
+    },
+    {
       "key": "package_sample",
       "value": "sample",
       "description": "Package id for sample (users, orders)"
@@ -145,6 +150,15 @@
             },
             "url": "{{base_url}}/api/v1/config/package",
             "description": "Upload a package zip. Zip must have manifest.json (id, name, version, schema) at root and config JSON files. The manifest's 'schema' is the PostgreSQL schema name used for all configs; no separate schemas table or schema_id in each config. Applies all configs in order and stores manifest in _sys_packages.\n\nUse Body → form-data, key 'file', type File, select your zip. Do NOT add a Content-Type header (Postman sets multipart/form-data with boundary automatically)."
+          }
+        },
+        {
+          "name": "Uninstall Package",
+          "request": {
+            "method": "DELETE",
+            "header": [{"key":"X-Tenant-ID","value":"{{tenant_id}}","description":"Required for config, package, and entity APIs"}],
+            "url": "{{base_url}}/api/v1/config/package/{{package_id}}",
+            "description": "Uninstall a package by id. Reverts migrations in the tenant DB (drops tables, enum types, schema), deletes all _sys_* config and KV data for the package, removes the package record, and evicts the package from in-memory cache. Set package_id in the URL (e.g. sample or sample_ecommerce) or use a collection variable."
           }
         },
         {

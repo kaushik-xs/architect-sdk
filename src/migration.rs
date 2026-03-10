@@ -338,6 +338,67 @@ pub async fn apply_migrations(
     Ok(())
 }
 
+/// Revert migrations for a package: drop tables, enum types, and schema (if not public) in reverse order of apply.
+/// Uses the same schema_override as apply_migrations (tables/enums live in that schema).
+pub async fn revert_migrations(
+    pool: &PgPool,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+) -> Result<(), AppError> {
+    let default_sid = config
+        .schemas
+        .first()
+        .map(|s| s.id.as_str())
+        .ok_or_else(|| AppError::Config(crate::error::ConfigError::Validation("at least one schema required".into())))?;
+
+    let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    // 1. Drop tables (CASCADE drops FKs and dependent objects)
+    for t in &config.tables {
+        let sid = t.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::MissingReference {
+                kind: "schema",
+                id: sid.to_string(),
+            })
+        })?;
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
+        let table_name = quote(&t.name);
+        let full_name = format!("{}.{}", schema_name, table_name);
+        let drop_sql = format!("DROP TABLE IF EXISTS {} CASCADE", full_name);
+        let _ = sqlx::query(&drop_sql).execute(pool).await;
+    }
+
+    // 2. Drop enum types
+    for e in &config.enums {
+        let sid = e.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::MissingReference {
+                kind: "schema",
+                id: sid.to_string(),
+            })
+        })?;
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
+        let type_name = quote(&e.name);
+        let drop_sql = format!("DROP TYPE IF EXISTS {}.{} CASCADE", schema_name, type_name);
+        let _ = sqlx::query(&drop_sql).execute(pool).await;
+    }
+
+    // 3. Drop schema only if not public (shared schema)
+    if schema_override.is_none() {
+        for s in &config.schemas {
+            if s.name.eq_ignore_ascii_case("public") {
+                continue;
+            }
+            let schema_name = quote(&s.name);
+            let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
+            let _ = sqlx::query(&drop_sql).execute(pool).await;
+        }
+    }
+
+    Ok(())
+}
+
 fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {
     match ty {
         ColumnTypeConfig::Simple(s) => {
