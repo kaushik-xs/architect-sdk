@@ -664,6 +664,117 @@ fn add_kv_paths(
     builder
 }
 
+/// Add config API paths: install/uninstall package and GET/POST per config kind.
+fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
+    let install_path = format!("{}/config/package", base);
+    let install_op = OperationBuilder::new()
+        .summary(Some("Install package"))
+        .description(Some(
+            "Upload a package zip. Zip must contain manifest.json (id, name, version, schema) at root and config JSON files. Use multipart/form-data with field 'file' or 'package' (ZIP file).",
+        ))
+        .operation_id(Some("config_install_package"))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .request_body(Some(
+            RequestBodyBuilder::new()
+                .description(Some("Multipart form with 'file' or 'package' field containing the ZIP."))
+                .content(
+                    "multipart/form-data",
+                    Content::new(Some(RefOr::T(Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::new(Type::Object))
+                            .property(
+                                "file",
+                                Schema::Object(
+                                    ObjectBuilder::new()
+                                        .schema_type(SchemaType::new(Type::String))
+                                        .format(Some(utoipa::openapi::schema::SchemaFormat::KnownFormat(
+                                            utoipa::openapi::schema::KnownFormat::Binary,
+                                        )))
+                                        .description(Some("ZIP file (manifest.json + config JSONs)"))
+                                        .into(),
+                                ),
+                            )
+                            .into(),
+                    )))),
+                )
+                .required(Some(Required::True))
+                .build(),
+        ))
+        .responses(
+            ResponsesBuilder::new()
+                .response("200", Response::new("OK"))
+                .response("400", Response::new("Bad Request"))
+                .build(),
+        )
+        .build();
+    let install_item = PathItemBuilder::new().operation(HttpMethod::Post, install_op);
+    builder = builder.path(install_path, install_item.build());
+
+    let uninstall_path = format!("{}/config/package/{{packageId}}", base);
+    let uninstall_op = OperationBuilder::new()
+        .summary(Some("Uninstall package"))
+        .description(Some(
+            "Revert migrations for the package, delete all _sys_* config and KV data, remove package record.",
+        ))
+        .operation_id(Some("config_uninstall_package"))
+        .parameters(Some(vec![x_tenant_id_header(), package_id_param()]))
+        .responses(
+            ResponsesBuilder::new()
+                .response("200", Response::new("OK"))
+                .response("404", Response::new("Not Found"))
+                .build(),
+        )
+        .build();
+    let uninstall_item = PathItemBuilder::new().operation(HttpMethod::Delete, uninstall_op);
+    builder = builder.path(uninstall_path, uninstall_item.build());
+
+    let config_kinds = [
+        ("schemas", "Schema definitions"),
+        ("enums", "Enum types"),
+        ("tables", "Table definitions"),
+        ("columns", "Column definitions"),
+        ("indexes", "Index definitions"),
+        ("relationships", "Relationship definitions"),
+        ("api_entities", "API entity definitions"),
+        ("kv_stores", "KV store definitions"),
+    ];
+    for (kind, description) in config_kinds {
+        let path = format!("{}/config/{}", base, kind);
+        let get_op = OperationBuilder::new()
+            .summary(Some(format!("Get {}", kind)))
+            .description(Some(format!("Get {} (from _sys_{}). {}", description, kind, "X-Tenant-ID required.")))
+            .operation_id(Some(format!("config_get_{}", kind)))
+            .parameters(Some(vec![x_tenant_id_header()]))
+            .responses(default_responses().build())
+            .build();
+        let post_body = RequestBodyBuilder::new()
+            .description(Some(format!("JSON array of {} records.", description)))
+            .content(
+                "application/json",
+                Content::new(Some(RefOr::T(Schema::Array(
+                    utoipa::openapi::schema::ArrayBuilder::new()
+                        .items(RefOr::T(json_object_schema()))
+                        .into(),
+                )))),
+            )
+            .required(Some(Required::True))
+            .build();
+        let post_op = OperationBuilder::new()
+            .summary(Some(format!("Replace {}", kind)))
+            .description(Some(format!("Replace {} for the default package. Runs migrations when rows change.", kind)))
+            .operation_id(Some(format!("config_post_{}", kind)))
+            .parameters(Some(vec![x_tenant_id_header()]))
+            .request_body(Some(post_body))
+            .responses(default_responses().build())
+            .build();
+        let item = PathItemBuilder::new()
+            .operation(HttpMethod::Get, get_op)
+            .operation(HttpMethod::Post, post_op);
+        builder = builder.path(path, item.build());
+    }
+    builder
+}
+
 /// Merge entities from all package models by path_segment (first occurrence wins). Used so
 /// package-scoped paths are emitted once with {packageId} instead of per-package literal ids.
 fn merge_package_models(package_models: &HashMap<String, ResolvedModel>) -> ResolvedModel {
@@ -693,6 +804,7 @@ pub fn build_spec(
 ) -> OpenApi {
     let server = build_server();
     let mut builder = PathsBuilder::new();
+    builder = add_config_paths(builder, base_path);
     builder = add_entity_paths(builder, base_path, default_model, false);
     let merged_package = merge_package_models(package_models);
     if !merged_package.entities.is_empty() {
@@ -701,7 +813,13 @@ pub fn build_spec(
     builder = add_kv_paths(builder, base_path, package_kv_stores);
     let paths = builder.build();
     OpenApiBuilder::new()
-        .info(Info::new("Architect Entity API", env!("CARGO_PKG_VERSION")))
+        .info(
+            Info::builder()
+                .title("Architect API")
+                .version(env!("CARGO_PKG_VERSION"))
+                .description(Some("Config APIs (package install/uninstall, schemas, enums, tables, etc.) and entity CRUD + package-scoped entity and KV APIs."))
+                .build(),
+        )
         .servers(Some(vec![server]))
         .paths(paths)
         .build()
