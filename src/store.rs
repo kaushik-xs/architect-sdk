@@ -121,6 +121,17 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     sqlx::query(&packages_history_ddl).execute(pool).await?;
     let alter_pkg_hist_semver = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT", q_packages_history);
     let _ = sqlx::query(&alter_pkg_hist_semver).execute(pool).await;
+    // Migrate to surrogate PK so multiple uninstalls of the same package (same id/version) don't violate uniqueness
+    let add_history_id = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS history_id BIGSERIAL", q_packages_history);
+    let _ = sqlx::query(&add_history_id).execute(pool).await;
+    let drop_old_pk = format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_packages_history_pkey", q_packages_history);
+    let _ = sqlx::query(&drop_old_pk).execute(pool).await;
+    let add_new_pk_cond = format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '_sys_packages_history_history_id_pkey') THEN \
+         ALTER TABLE {} ADD CONSTRAINT _sys_packages_history_history_id_pkey PRIMARY KEY (history_id); END IF; END $$",
+        q_packages_history
+    );
+    let _ = sqlx::query(&add_new_pk_cond).execute(pool).await;
 
     let q_tenants = qualified_sys_table("_sys_tenants");
     let tenants_ddl = format!(
