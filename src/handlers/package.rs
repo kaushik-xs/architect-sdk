@@ -4,7 +4,7 @@
 use crate::config::{load_from_pool, resolve};
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
-use crate::handlers::config::replace_config;
+use crate::handlers::config::{reload_model, replace_config};
 use crate::handlers::entity::resolve_tenant_context;
 use crate::migration::{apply_migrations, revert_migrations};
 use crate::state::AppState;
@@ -274,6 +274,11 @@ pub async fn uninstall_package(
             .write()
             .map_err(|_| AppError::BadRequest("state lock".into()))?
             .remove(&package_cache_key);
+    }
+
+    // Reload default model when uninstall was on the central DB so in-memory state stays in sync (no process restart needed).
+    if std::ptr::eq(&state.pool as *const _, config_pool as *const _) {
+        let _ = reload_model(&state).await;
     }
 
     #[derive(serde::Serialize)]
