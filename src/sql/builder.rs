@@ -68,6 +68,46 @@ fn resolve_schema<'a>(entity: &'a ResolvedEntity, schema_override: Option<&'a st
     schema_override.unwrap_or(&entity.schema_name)
 }
 
+/// Postgres array columns: API accepts JSON `["a","b"]`; bind as array literal + `$n::varchar(255)[]` etc.
+fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Value {
+    if !pg_type.is_some_and(|t| t.ends_with("[]")) {
+        return val;
+    }
+    match val {
+        Value::Null => Value::Null,
+        Value::Array(items) => {
+            let mut out = String::from('{');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match v {
+                    Value::Null => out.push_str("NULL"),
+                    other => {
+                        let elem = match other {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                        };
+                        out.push('"');
+                        for ch in elem.chars() {
+                            if ch == '"' || ch == '\\' {
+                                out.push('\\');
+                            }
+                            out.push(ch);
+                        }
+                        out.push('"');
+                    }
+                }
+            }
+            out.push('}');
+            Value::String(out)
+        }
+        other => other,
+    }
+}
+
 /// Placeholder for PK in WHERE (e.g. $1 or $1::uuid) so bound text is cast when column is UUID.
 fn pk_placeholder(entity: &ResolvedEntity, param_num: u32) -> String {
     match &entity.pk_type {
@@ -292,6 +332,7 @@ pub fn insert(
             continue;
         }
         let val = val.unwrap_or(Value::Null);
+        let val = coerce_json_value_for_pg_array(val, c.pg_type.as_deref());
         let param_num = q.push_param(val);
         let ph = c
             .pg_type
@@ -343,7 +384,8 @@ pub fn update(
             continue;
         }
         let Some(c) = col_by_name.get(k.as_str()) else { continue };
-        let param_num = q.push_param(v.clone());
+        let v = coerce_json_value_for_pg_array(v.clone(), c.pg_type.as_deref());
+        let param_num = q.push_param(v);
         let rhs = c
             .pg_type
             .as_deref()

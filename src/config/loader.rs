@@ -189,6 +189,9 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
     } else if name.contains('.') {
         // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
         Some(name.to_string())
+    } else if name.ends_with("[]") {
+        // text[], varchar(n)[], int[], etc. — bind JSON ["a","b"] as PG array literal + ::type[]
+        Some(name.to_string())
     } else {
         None
     }
