@@ -48,13 +48,16 @@ impl<'q> Encode<'q, Postgres> for PgBindValue {
         &self,
         buf: &mut <Postgres as Database>::ArgumentBuffer<'q>,
     ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
-        // type_info() is TEXT, so we must only write valid UTF-8. Encoding I64/F64 as binary
-        // would send bytes that PostgreSQL interprets as UTF-8, causing "invalid byte sequence"
-        // (e.g. 0xff in f64 representation). Encode numbers as decimal strings; SQL casts
-        // like $1::numeric then convert them correctly.
+        // type_info() is TEXT for all variants, so parameters must be valid UTF-8 text.
+        // Encoding I64/F64 as binary would break; use decimal strings + $n::numeric casts.
+        // Booleans: "true"/"false" + $n::boolean. JSON objects/arrays: serde_json::to_string
+        // + $n::jsonb (or ::json) so jsonb columns accept TEXT-shaped params.
         Ok(match self {
             PgBindValue::Null => <Option::<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
-            PgBindValue::Bool(b) => <bool as Encode<Postgres>>::encode_by_ref(b, buf)?,
+            PgBindValue::Bool(b) => {
+                let s: &str = if *b { "true" } else { "false" };
+                <&str as Encode<Postgres>>::encode_by_ref(&s, buf)?
+            }
             PgBindValue::I64(n) => {
                 let s = n.to_string();
                 let s_ref = s.as_str();
@@ -73,7 +76,12 @@ impl<'q> Encode<'q, Postgres> for PgBindValue {
                 let u_str = u.to_string();
                 <&str as Encode<Postgres>>::encode_by_ref(&u_str.as_str(), buf)?
             }
-            PgBindValue::Json(v) => <serde_json::Value as Encode<Postgres>>::encode_by_ref(v, buf)?,
+            PgBindValue::Json(v) => {
+                let s = serde_json::to_string(v).map_err(|e| {
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+            }
         })
     }
 }

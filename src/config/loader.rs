@@ -176,6 +176,12 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("timestamp".into())
     } else if lower == "date" {
         Some("date".into())
+    } else if lower == "boolean" || lower == "bool" {
+        Some("boolean".into())
+    } else if lower == "jsonb" {
+        Some("jsonb".into())
+    } else if lower == "json" {
+        Some("json".into())
     } else if lower.contains("uuid") {
         Some("uuid".into())
     } else if lower == "numeric" || lower.starts_with("numeric(") || lower == "decimal" || lower.starts_with("decimal(") {
