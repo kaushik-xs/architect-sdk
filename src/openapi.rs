@@ -53,6 +53,18 @@ fn json_object_schema() -> Schema {
 /// Map PostgreSQL type (from _sys_columns) to OpenAPI schema type for parameters and body properties.
 fn column_schema_from_pg_type(pg_type: Option<&str>) -> Schema {
     let t = pg_type.unwrap_or("").to_lowercase();
+    // Handle PostgreSQL array types (e.g. uuid[], text[], _int4, _uuid) by mapping
+    // them to OpenAPI arrays whose item schema is derived from the element type.
+    if t.ends_with("[]") || t.starts_with('_') {
+        let element_type = t.trim_end_matches("[]").trim_start_matches('_');
+        let item_schema = column_schema_from_pg_type(Some(element_type));
+        return Schema::Array(
+            utoipa::openapi::schema::ArrayBuilder::new()
+                .items(RefOr::T(item_schema))
+                .build()
+                .into(),
+        );
+    }
     if t.contains("int") || t.contains("serial") {
         return Schema::Object(
             utoipa::openapi::schema::ObjectBuilder::new()
@@ -445,17 +457,21 @@ fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str, include_packa
         .build()
 }
 
-/// Add entity paths for one model. When `use_package_param` is false, paths are
-/// `{base}/{path_segment}` (default model). When true, paths are `{base}/package/{packageId}/{path_segment}`
-/// with no literal package id in the spec (caller substitutes packageId at runtime).
+/// Add entity paths for one model.
+/// - For default model: paths are `{base}/{path_segment}` (no package segment).
+/// - For package models: paths are `{base}/package/{package_id}/{path_segment}` with the concrete package id.
 fn add_entity_paths(
     mut builder: PathsBuilder,
     base: &str,
     model: &ResolvedModel,
     use_package_param: bool,
+    package_id_literal: Option<&str>,
 ) -> PathsBuilder {
     let path_prefix = if use_package_param {
-        format!("{}/package/{{packageId}}", base)
+        match package_id_literal {
+            Some(pkg) => format!("{}/package/{}", base, pkg),
+            None => format!("{}/package/{{packageId}}", base),
+        }
     } else {
         base.to_string()
     };
@@ -638,29 +654,30 @@ fn kv_key_operations() -> (Operation, Operation, Operation) {
     (get_op, put_op, delete_op)
 }
 
-/// Add KV store paths with {packageId} and {namespace} (no literal package ids in spec).
+/// Add KV store paths with concrete package ids and {namespace}/{key}.
 fn add_kv_paths(
     mut builder: PathsBuilder,
     base: &str,
     package_kv_stores: &HashMap<String, Vec<KvStoreConfig>>,
 ) -> PathsBuilder {
-    let has_kv = package_kv_stores.values().any(|s| !s.is_empty());
-    if !has_kv {
-        return builder;
+    for (package_id, stores) in package_kv_stores {
+        if stores.is_empty() {
+            continue;
+        }
+        let list_path = format!("{}/package/{}/kv/{{namespace}}", base, package_id);
+        let key_path = format!("{}/package/{}/kv/{{namespace}}/{{key}}", base, package_id);
+
+        let list_item = PathItemBuilder::new()
+            .operation(HttpMethod::Get, kv_list_keys_operation());
+        builder = builder.path(list_path, list_item.build());
+
+        let (get_op, put_op, delete_op) = kv_key_operations();
+        let key_item = PathItemBuilder::new()
+            .operation(HttpMethod::Get, get_op)
+            .operation(HttpMethod::Put, put_op)
+            .operation(HttpMethod::Delete, delete_op);
+        builder = builder.path(key_path, key_item.build());
     }
-    let list_path = format!("{}/package/{{packageId}}/kv/{{namespace}}", base);
-    let key_path = format!("{}/package/{{packageId}}/kv/{{namespace}}/{{key}}", base);
-
-    let list_item = PathItemBuilder::new()
-        .operation(HttpMethod::Get, kv_list_keys_operation());
-    builder = builder.path(list_path, list_item.build());
-
-    let (get_op, put_op, delete_op) = kv_key_operations();
-    let key_item = PathItemBuilder::new()
-        .operation(HttpMethod::Get, get_op)
-        .operation(HttpMethod::Put, put_op)
-        .operation(HttpMethod::Delete, delete_op);
-    builder = builder.path(key_path, key_item.build());
     builder
 }
 
@@ -775,27 +792,8 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
     builder
 }
 
-/// Merge entities from all package models by path_segment (first occurrence wins). Used so
-/// package-scoped paths are emitted once with {packageId} instead of per-package literal ids.
-fn merge_package_models(package_models: &HashMap<String, ResolvedModel>) -> ResolvedModel {
-    let mut entity_by_path = HashMap::new();
-    let mut entities = Vec::new();
-    for model in package_models.values() {
-        for entity in &model.entities {
-            if !entity_by_path.contains_key(&entity.path_segment) {
-                entity_by_path.insert(entity.path_segment.clone(), entity.clone());
-                entities.push(entity.clone());
-            }
-        }
-    }
-    ResolvedModel {
-        entities,
-        entity_by_path,
-    }
-}
-
 /// Build full OpenAPI spec for entity APIs: default model paths plus package-scoped paths
-/// (with {packageId} parameter, no literal package ids) plus KV paths with {packageId}/{namespace}.
+/// with concrete package ids, plus KV paths with {namespace}/{key} per package.
 pub fn build_spec(
     default_model: &ResolvedModel,
     base_path: &str,
@@ -805,10 +803,11 @@ pub fn build_spec(
     let server = build_server();
     let mut builder = PathsBuilder::new();
     builder = add_config_paths(builder, base_path);
-    builder = add_entity_paths(builder, base_path, default_model, false);
-    let merged_package = merge_package_models(package_models);
-    if !merged_package.entities.is_empty() {
-        builder = add_entity_paths(builder, base_path, &merged_package, true);
+    builder = add_entity_paths(builder, base_path, default_model, false, None);
+    for (package_id, model) in package_models {
+        if !model.entities.is_empty() {
+            builder = add_entity_paths(builder, base_path, model, true, Some(package_id.as_str()));
+        }
     }
     builder = add_kv_paths(builder, base_path, package_kv_stores);
     let paths = builder.build();

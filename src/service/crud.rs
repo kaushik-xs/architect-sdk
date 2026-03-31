@@ -347,6 +347,11 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
             return Value::Array(vec.into_iter().map(Value::String).collect());
         }
     }
+    if let Ok(v) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(name) {
+        if let Some(vec) = v {
+            return Value::Array(vec.into_iter().map(|u| Value::String(u.to_string())).collect());
+        }
+    }
     if let Ok(v) = row.try_get::<Option<Vec<i64>>, _>(name) {
         if let Some(vec) = v {
             return Value::Array(vec.into_iter().map(|n| Value::Number(n.into())).collect());

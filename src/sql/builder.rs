@@ -104,7 +104,9 @@ fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Value {
             out.push('}');
             Value::String(out)
         }
-        other => other,
+        // For convenience, treat scalar JSON values as single-element arrays so that
+        // clients can send `"id"` instead of `["id"]` for uuid[] and other array columns.
+        other => coerce_json_value_for_pg_array(Value::Array(vec![other]), pg_type),
     }
 }
 
