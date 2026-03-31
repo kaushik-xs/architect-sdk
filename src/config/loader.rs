@@ -176,6 +176,10 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("timestamp".into())
     } else if lower == "date" {
         Some("date".into())
+    } else if lower == "timetz" || lower == "time with time zone" {
+        Some("timetz".into())
+    } else if lower == "time" || lower.starts_with("time ") {
+        Some("time".into())
     } else if lower == "boolean" || lower == "bool" {
         Some("boolean".into())
     } else if lower == "jsonb" {
