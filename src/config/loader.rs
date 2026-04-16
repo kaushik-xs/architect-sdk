@@ -170,6 +170,15 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
     };
     let lower = name.to_lowercase();
+    // Check array and schema-qualified types first so they are preserved verbatim
+    // (e.g. `uuid[]` must not be shortened to `uuid`, `sample.order_status[]` keeps both).
+    if name.ends_with("[]") {
+        return Some(name.to_string());
+    }
+    if name.contains('.') {
+        // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
+        return Some(name.to_string());
+    }
     if lower == "timestamptz" || lower == "timestamp with time zone" {
         Some("timestamptz".into())
     } else if lower == "timestamp" || lower.starts_with("timestamp ") {
@@ -203,12 +212,6 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
     } else if lower == "float" || lower.starts_with("float(") {
         // Postgres FLOAT(n): n<=24 is real, n>25 is double precision; default to double precision.
         Some("double precision".into())
-    } else if name.contains('.') {
-        // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
-        Some(name.to_string())
-    } else if name.ends_with("[]") {
-        // text[], varchar(n)[], int[], etc. — bind JSON ["a","b"] as PG array literal + ::type[]
-        Some(name.to_string())
     } else {
         None
     }
