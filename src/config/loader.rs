@@ -190,6 +190,19 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("uuid".into())
     } else if lower == "numeric" || lower.starts_with("numeric(") || lower == "decimal" || lower.starts_with("decimal(") {
         Some("numeric".into())
+    } else if lower == "smallint" || lower == "int2" || lower == "smallserial" || lower == "serial2" {
+        Some("smallint".into())
+    } else if lower == "integer" || lower == "int" || lower == "int4" || lower == "serial" || lower == "serial4" {
+        Some("integer".into())
+    } else if lower == "bigint" || lower == "int8" || lower == "bigserial" || lower == "serial8" {
+        Some("bigint".into())
+    } else if lower == "real" || lower == "float4" {
+        Some("real".into())
+    } else if lower == "double precision" || lower == "float8" {
+        Some("double precision".into())
+    } else if lower == "float" || lower.starts_with("float(") {
+        // Postgres FLOAT(n): n<=24 is real, n>25 is double precision; default to double precision.
+        Some("double precision".into())
     } else if name.contains('.') {
         // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
         Some(name.to_string())

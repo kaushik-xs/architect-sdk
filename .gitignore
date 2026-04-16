@@ -38,3 +38,5 @@ coverage/
 *.log
 *.tmp
 .cursor
+
+CLAUDE.md
