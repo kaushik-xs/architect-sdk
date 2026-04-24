@@ -43,7 +43,8 @@ impl QueryBuf {
     }
 }
 
-/// SELECT list: each column as-is, except custom enum (schema.typename) as col::text and numeric as col::text so sqlx returns String.
+/// SELECT list: each column as-is, except custom enum (schema.typename), numeric, time, and timetz
+/// as col::text so sqlx returns String.
 fn select_column_list(entity: &ResolvedEntity) -> String {
     entity
         .columns
@@ -51,9 +52,7 @@ fn select_column_list(entity: &ResolvedEntity) -> String {
         .map(|c| {
             let q = quoted(&c.name);
             let pg_type = c.pg_type.as_deref().unwrap_or("");
-            if pg_type.contains('.') {
-                format!("{}::text", q)
-            } else if pg_type == "numeric" {
+            if pg_type.contains('.') || pg_type == "numeric" || pg_type == "time" || pg_type == "timetz" {
                 format!("{}::text", q)
             } else {
                 q
@@ -152,7 +151,7 @@ pub fn select_list_with_includes(
         .map(|c| {
             let q = quoted(&c.name);
             let pg_type = c.pg_type.as_deref().unwrap_or("");
-            let expr = if pg_type.contains('.') || pg_type == "numeric" {
+            let expr = if pg_type.contains('.') || pg_type == "numeric" || pg_type == "time" || pg_type == "timetz" {
                 format!("{}.{}::text", MAIN_ALIAS, q)
             } else {
                 format!("{}.{}", MAIN_ALIAS, q)
