@@ -1,6 +1,7 @@
 //! Shared application state for all routes. Model is reloadable after package install.
 
 use crate::config::ResolvedModel;
+use crate::storage::StorageProvider;
 use crate::tenant::TenantRegistry;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -18,4 +19,7 @@ pub struct AppState {
     pub tenant_pools: Arc<RwLock<HashMap<String, PgPool>>>,
     /// Tenant registry (strategy + config per tenant), loaded from central DB at startup.
     pub tenant_registry: Arc<TenantRegistry>,
+    /// Optional blob storage provider for asset columns (S3 or RustFS).
+    /// Initialised from STORAGE_PROVIDER env var; None when not configured.
+    pub storage: Option<Arc<dyn StorageProvider>>,
 }

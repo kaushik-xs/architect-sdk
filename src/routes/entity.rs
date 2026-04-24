@@ -2,6 +2,7 @@
 //! Uses parameterized paths so Path extractors receive the segment and id; handlers resolve the entity by path.
 //! Unprefixed routes use the default/active model; /package/:package_id/... use that package's model (same entity names, different packages).
 
+use crate::handlers::asset::sign_asset;
 use crate::handlers::entity::{
     bulk_create, bulk_create_package, bulk_update, bulk_update_package, create, create_package,
     delete as delete_handler, delete_package, list, list_package, read, read_package, update,
@@ -13,6 +14,8 @@ use axum::{routing::get, routing::post, Router};
 
 pub fn entity_routes(state: AppState) -> Router {
     Router::new()
+        // /assets/sign must be declared before /:path_segment to avoid being captured.
+        .route("/assets/sign", get(sign_asset))
         .route("/:path_segment", get(list).post(create))
         .route("/:path_segment/bulk", post(bulk_create).patch(bulk_update))
         .route(

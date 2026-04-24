@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         package_models: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         tenant_pools: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         tenant_registry: Arc::new(_registry),
+        storage: None,
     };
 
     let app = common_routes_with_ready(state);

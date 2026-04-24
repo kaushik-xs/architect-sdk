@@ -68,6 +68,11 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             .iter()
             .map(|c| {
                 let is_pk = pk_names.contains(&c.name);
+                let type_str = match &c.type_ {
+                    ColumnTypeConfig::Simple(s) => s.to_lowercase(),
+                    ColumnTypeConfig::Parameterized { name, .. } => name.to_lowercase(),
+                };
+                let is_asset = type_str == "asset";
                 let pg_type = column_pg_type_name(&c.type_);
                 ColumnInfo {
                     name: c.name.clone(),
@@ -75,6 +80,8 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     nullable: c.nullable,
                     has_default: c.default.is_some(),
                     pg_type,
+                    is_asset,
+                    asset_config: c.asset.clone(),
                 }
             })
             .collect();
@@ -92,6 +99,8 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     nullable,
                     has_default,
                     pg_type: Some("timestamptz".into()),
+                    is_asset: false,
+                    asset_config: None,
                 });
             }
         }
@@ -212,6 +221,9 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
     } else if lower == "float" || lower.starts_with("float(") {
         // Postgres FLOAT(n): n<=24 is real, n>25 is double precision; default to double precision.
         Some("double precision".into())
+    } else if lower == "asset" {
+        // Asset columns store relative storage paths as plain text.
+        Some("text".into())
     } else {
         None
     }

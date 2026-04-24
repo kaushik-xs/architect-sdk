@@ -8,10 +8,11 @@ use crate::extractors::tenant::TenantId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
 use crate::sql::IncludeSelect;
 use crate::state::AppState;
+use crate::storage::{compress, resolve_prefix, validate_asset_field};
 use crate::store::DEFAULT_PACKAGE_ID;
 use crate::tenant::TenantStrategy;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{FromRequest, Path, Query, Request, State},
     Json,
 };
 use serde_json::Value;
@@ -95,6 +96,156 @@ fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value 
         }
     }
     Value::String(s.to_string())
+}
+
+/// Collected file from a multipart upload field.
+struct UploadedFile {
+    field_name: String,
+    filename: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+/// Parse a multipart request into a text body map and a list of file fields.
+async fn parse_multipart(
+    mut multipart: axum::extract::Multipart,
+) -> Result<(HashMap<String, Value>, Vec<UploadedFile>), AppError> {
+    let mut body: HashMap<String, Value> = HashMap::new();
+    let mut files: Vec<UploadedFile> = Vec::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        let filename = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?
+            .to_vec();
+
+        if let Some(fname) = filename {
+            files.push(UploadedFile {
+                field_name,
+                filename: fname,
+                content_type,
+                data,
+            });
+        } else {
+            let text = String::from_utf8(data)
+                .map_err(|e| AppError::BadRequest(format!("field '{}' is not valid UTF-8: {}", field_name, e)))?;
+            body.insert(field_name, Value::String(text));
+        }
+    }
+    Ok((body, files))
+}
+
+/// Upload all file fields that correspond to asset columns, inserting paths into body.
+async fn process_asset_uploads(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    tenant_id: &str,
+    body: &mut HashMap<String, Value>,
+    files: Vec<UploadedFile>,
+) -> Result<(), AppError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let storage = state
+        .storage
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+
+    for file in files {
+        let col_name = to_snake_case(&file.field_name);
+        let col_info = entity.columns.iter().find(|c| c.name == col_name);
+
+        let col = col_info.ok_or_else(|| {
+            AppError::BadRequest(format!("unknown field: {}", file.field_name))
+        })?;
+        if !col.is_asset {
+            return Err(AppError::BadRequest(format!(
+                "field '{}' is not an asset column",
+                file.field_name
+            )));
+        }
+
+        // Asset validation against api_entity rules
+        if let Some(rule) = entity.validation.get(&col_name) {
+            validate_asset_field(
+                &col_name,
+                &file.filename,
+                &file.content_type,
+                file.data.len(),
+                rule,
+            )?;
+        }
+
+        // Compress
+        let asset_cfg = col.asset_config.as_ref();
+        let compression = asset_cfg
+            .and_then(|c| c.compression.as_deref())
+            .unwrap_or("none");
+        let data = compress(file.data, compression)?;
+
+        // Resolve prefix and build storage path
+        let prefix_template = asset_cfg
+            .and_then(|c| c.prefix.as_deref())
+            .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+        let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
+        let ext = std::path::Path::new(&file.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+        let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
+
+        storage.upload(&object_name, data, &file.content_type).await?;
+        body.insert(col_name, Value::String(object_name));
+    }
+    Ok(())
+}
+
+/// Replace asset column values in a row with presigned URLs for the columns listed in `sign_cols`.
+/// `sign_cols` is None → sign all asset columns. Some(set) → sign only those columns.
+async fn sign_row_assets(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    row: &mut Value,
+    sign_cols: &Option<HashSet<String>>,
+    expires: u64,
+) -> Result<(), AppError> {
+    let storage = match &state.storage {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    if let Value::Object(map) = row {
+        for col in &entity.columns {
+            if !col.is_asset {
+                continue;
+            }
+            let should_sign = sign_cols
+                .as_ref()
+                .map(|s| s.contains(&col.name))
+                .unwrap_or(true);
+            if !should_sign {
+                continue;
+            }
+            let camel = crate::case::to_camel_case(&col.name);
+            let key = if map.contains_key(&col.name) { col.name.as_str() } else { camel.as_str() };
+            if let Some(Value::String(path)) = map.get(key).cloned() {
+                if path.is_empty() {
+                    continue;
+                }
+                let result = storage.presign_url(&path, expires).await?;
+                map.insert(key.to_string(), Value::String(result.url));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve include names to (name, spec, related_entity). Call with model read lock held.
@@ -423,12 +574,16 @@ pub async fn list(
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
     let mut filters: Vec<(String, Value)> = Vec::new();
+    let mut sign_param: Option<String> = None;
+    let mut sign_expires: u64 = 900;
 
     for (k, v) in params {
         match k.as_str() {
             "limit" => limit = v.parse().ok(),
             "offset" => offset = v.parse().ok(),
             "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "sign" => sign_param = Some(v),
+            "sign_expires" => sign_expires = v.parse().unwrap_or(900),
             _ => {
                 let col_key = to_snake_case(&k);
                 if column_names.contains(col_key.as_str()) {
@@ -438,6 +593,15 @@ pub async fn list(
             }
         }
     }
+
+    // Resolve which asset columns to sign (None = all, Some(set) = named subset).
+    let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
+        if s == "true" {
+            None // sign all asset columns
+        } else {
+            Some(s.split(',').map(|c| to_snake_case(c.trim())).collect())
+        }
+    });
 
     let mut rows = if include_names.is_empty() {
         CrudService::list(&mut executor, &entity, &filters, limit, offset, schema_override).await?
@@ -473,6 +637,14 @@ pub async fn list(
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
     }
+
+    // Presign asset columns when ?sign= is present.
+    if sign_param.is_some() {
+        for row in &mut rows {
+            sign_row_assets(&state, &entity, row, &sign_cols, sign_expires).await?;
+        }
+    }
+
     let count = rows.len() as u64;
     Ok((
         axum::http::StatusCode::OK,
@@ -487,8 +659,9 @@ pub async fn create(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
     Path(path_segment): Path<String>,
-    Json(body): Json<Value>,
+    request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
@@ -505,8 +678,30 @@ pub async fn create(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
-    let body = body_to_map(body)?;
-    let body = hashmap_keys_to_snake_case(&body);
+
+    // Dispatch by Content-Type: multipart for file uploads, JSON for everything else.
+    let is_multipart = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("multipart/form-data"))
+        .unwrap_or(false);
+
+    let mut body;
+    if is_multipart {
+        let multipart = axum::extract::Multipart::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let (text_fields, files) = parse_multipart(multipart).await?;
+        body = hashmap_keys_to_snake_case(&text_fields);
+        process_asset_uploads(&state, &entity, &tenant_id_str, &mut body, files).await?;
+    } else {
+        let Json(json_body) = Json::<Value>::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+    }
+
     RequestValidator::validate(&body, &entity.validation)?;
     let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
@@ -554,6 +749,17 @@ pub async fn read(
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
+
+    // Presign asset columns when ?sign= is present.
+    let sign_param = params.get("sign").cloned();
+    if sign_param.is_some() {
+        let sign_expires: u64 = params.get("sign_expires").and_then(|s| s.parse().ok()).unwrap_or(900);
+        let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
+            if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+        });
+        sign_row_assets(&state, &entity, &mut row, &sign_cols, sign_expires).await?;
+    }
+
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -561,8 +767,9 @@ pub async fn update(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
     Path((path_segment, id_str)): Path<(String, String)>,
-    Json(body): Json<Value>,
+    request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
@@ -580,8 +787,29 @@ pub async fn update(
         return Err(AppError::BadRequest("update not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let body = body_to_map(body)?;
-    let body = hashmap_keys_to_snake_case(&body);
+
+    let is_multipart = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("multipart/form-data"))
+        .unwrap_or(false);
+
+    let mut body;
+    if is_multipart {
+        let multipart = axum::extract::Multipart::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let (text_fields, files) = parse_multipart(multipart).await?;
+        body = hashmap_keys_to_snake_case(&text_fields);
+        process_asset_uploads(&state, &entity, &tenant_id_str, &mut body, files).await?;
+    } else {
+        let Json(json_body) = Json::<Value>::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+    }
+
     RequestValidator::validate_partial(&body, &entity.validation)?;
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;

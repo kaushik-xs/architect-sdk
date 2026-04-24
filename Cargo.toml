@@ -31,3 +31,7 @@ regex = "1"
 dotenvy = "0.15"
 zip = "2.2"
 utoipa = { version = "5", features = ["chrono", "uuid"] }
+aws-sdk-s3 = "1"
+aws-config = "1"
+flate2 = "1"
+zstd = "0.13"

@@ -402,8 +402,9 @@ pub async fn revert_migrations(
 fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {
     match ty {
         ColumnTypeConfig::Simple(s) => {
-            if s.contains('.') {
-                s.clone()
+            if s.eq_ignore_ascii_case("asset") {
+                // Asset columns are stored as plain text (relative storage path).
+                "TEXT".to_string()
             } else {
                 s.clone()
             }

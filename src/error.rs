@@ -36,6 +36,8 @@ pub enum AppError {
     Conflict(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("storage: {0}")]
+    Storage(String),
 }
 
 #[derive(Serialize)]
@@ -66,6 +68,7 @@ impl IntoResponse for AppError {
             }
             AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            AppError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
         };
         let body = ErrorBody {
             error: ErrorDetail {

@@ -120,6 +120,8 @@ pub struct ColumnConfig {
     pub default: Option<ColumnDefaultConfig>,
     #[serde(default)]
     pub comment: Option<String>,
+    #[serde(default)]
+    pub asset: Option<AssetColumnConfig>,
 }
 
 fn default_true() -> bool {
@@ -195,6 +197,27 @@ pub struct ValidationRule {
     pub minimum: Option<f64>,
     #[serde(default)]
     pub maximum: Option<f64>,
+    // Asset-specific validation (only applied when the column type is "asset")
+    #[serde(default)]
+    pub allowed_mime_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_size_mb: Option<f64>,
+    #[serde(default)]
+    pub min_size_kb: Option<f64>,
+    #[serde(default)]
+    pub max_filename_length: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssetColumnConfig {
+    /// Path prefix template. Supports {yyyy}, {mm}, {dd}, {hh}, {tenant_id}, {entity}.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Byte-level compression before upload: "none" | "gzip" | "zstd". Default: "none".
+    #[serde(default)]
+    pub compression: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

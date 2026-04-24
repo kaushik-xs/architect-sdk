@@ -60,12 +60,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = resolve(&config)?;
     let mut package_models = HashMap::new();
     package_models.insert(package_id.clone(), model.clone());
+    let storage = architect_sdk::init_storage_provider().await;
     let state = AppState {
         pool: pool.clone(),
         model: Arc::new(RwLock::new(model)),
         package_models: Arc::new(RwLock::new(package_models)),
         tenant_pools: Arc::new(RwLock::new(HashMap::new())),
         tenant_registry: Arc::new(tenant_registry),
+        storage,
     };
 
     let api = Router::new()

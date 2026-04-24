@@ -1,5 +1,6 @@
 //! Resolved entity model: config validated and flattened for runtime use.
 
+use crate::config::types::AssetColumnConfig;
 use crate::config::ValidationRule;
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +43,10 @@ pub struct ColumnInfo {
     pub has_default: bool,
     /// PostgreSQL type name for SQL casts (e.g. "timestamptz") when binding string values.
     pub pg_type: Option<String>,
+    /// True when the column was declared with type "asset".
+    pub is_asset: bool,
+    /// Storage config for asset columns (prefix template, compression).
+    pub asset_config: Option<AssetColumnConfig>,
 }
 
 #[derive(Clone, Debug)]
