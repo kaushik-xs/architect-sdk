@@ -1,6 +1,8 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
 use crate::config::{IncludeDirection, PkType, ResolvedEntity};
+use crate::error::AppError;
+use crate::sql::rsql::{FilterNode, RsqlOp, SortSpec};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -117,6 +119,286 @@ fn pk_placeholder(entity: &ResolvedEntity, param_num: u32) -> String {
     }
 }
 
+// ─── RSQL → SQL ───────────────────────────────────────────────────────────────
+
+/// Classify a PostgreSQL type string into a broad category for operator validation.
+fn pg_type_category(pg_type: &str) -> &'static str {
+    let base = pg_type
+        .trim_end_matches("[]")
+        .split('(')
+        .next()
+        .unwrap_or(pg_type)
+        .trim()
+        .to_lowercase();
+    match base.as_str() {
+        "text" | "varchar" | "char" | "bpchar" | "citext" | "name" | "character varying"
+        | "character" => "text",
+        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial"
+        | "bigserial" | "smallserial" => "int",
+        "float4" | "float8" | "numeric" | "decimal" | "real" | "money"
+        | "double precision" => "float",
+        "bool" | "boolean" => "bool",
+        "uuid" => "uuid",
+        "date" => "date",
+        "timestamp" | "timestamptz" | "timestamp with time zone"
+        | "timestamp without time zone" => "timestamp",
+        "time" | "timetz" | "time with time zone" | "time without time zone" => "time",
+        _ => "other",
+    }
+}
+
+fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
+    match category {
+        "text" => matches!(
+            op,
+            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::In | RsqlOp::Out | RsqlOp::Like
+                | RsqlOp::Ilike | RsqlOp::Contains | RsqlOp::Starts | RsqlOp::Ends
+                | RsqlOp::Null(_)
+        ),
+        "int" | "float" => matches!(
+            op,
+            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le
+                | RsqlOp::Between | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
+        ),
+        "bool" => matches!(op, RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Null(_)),
+        "uuid" => matches!(
+            op,
+            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
+        ),
+        "date" | "timestamp" | "time" => matches!(
+            op,
+            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le
+                | RsqlOp::Between | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
+        ),
+        _ => true, // unknown / custom types: allow everything
+    }
+}
+
+fn make_placeholder(n: u32, cast: Option<&str>) -> String {
+    match cast {
+        Some(t) => format!("${}::{}", n, t),
+        None => format!("${}", n),
+    }
+}
+
+/// Convert a `FilterNode` tree into a SQL WHERE fragment (no leading `WHERE`).
+/// All values are pushed as parameters into `q`; identifiers come only from
+/// config (never from user input) so SQL injection is structurally impossible.
+///
+/// `col_qualifier` is an optional table alias prefix, e.g. `"main."` for
+/// aliased queries.
+pub fn rsql_to_sql(
+    node: &FilterNode,
+    entity: &ResolvedEntity,
+    q: &mut QueryBuf,
+    col_qualifier: Option<&str>,
+) -> Result<String, AppError> {
+    match node {
+        FilterNode::And(children) => {
+            let parts: Result<Vec<_>, _> = children
+                .iter()
+                .map(|c| rsql_to_sql(c, entity, q, col_qualifier))
+                .collect();
+            Ok(format!("({})", parts?.join(" AND ")))
+        }
+        FilterNode::Or(children) => {
+            let parts: Result<Vec<_>, _> = children
+                .iter()
+                .map(|c| rsql_to_sql(c, entity, q, col_qualifier))
+                .collect();
+            Ok(format!("({})", parts?.join(" OR ")))
+        }
+        FilterNode::Leaf { field, op, values } => {
+            // Validate field exists in entity
+            let col_info = entity
+                .columns
+                .iter()
+                .find(|c| c.name == *field)
+                .ok_or_else(|| {
+                    AppError::Validation(format!("unknown filter field '{}'", field))
+                })?;
+
+            // Type-based operator validation
+            let pg_type = col_info.pg_type.as_deref().unwrap_or("text");
+            let category = pg_type_category(pg_type);
+            if !op_valid_for_category(op, category) {
+                return Err(AppError::Validation(format!(
+                    "operator {} is not valid for {} field '{}' (type: {})",
+                    op.display(),
+                    category,
+                    field,
+                    pg_type
+                )));
+            }
+
+            // Build qualified column reference (identifier from config only)
+            let qcol = match col_qualifier {
+                Some(pfx) => format!("{}{}", pfx, quoted(field)),
+                None => quoted(field),
+            };
+
+            // String-pattern operators don't get a type cast
+            let cast = if matches!(
+                op,
+                RsqlOp::Like | RsqlOp::Ilike | RsqlOp::Contains | RsqlOp::Starts | RsqlOp::Ends
+            ) {
+                None
+            } else {
+                col_info.pg_type.as_deref()
+            };
+
+            match op {
+                RsqlOp::Null(is_null) => {
+                    Ok(if *is_null {
+                        format!("{} IS NULL", qcol)
+                    } else {
+                        format!("{} IS NOT NULL", qcol)
+                    })
+                }
+
+                RsqlOp::Eq
+                | RsqlOp::Neq
+                | RsqlOp::Gt
+                | RsqlOp::Ge
+                | RsqlOp::Lt
+                | RsqlOp::Le => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(v));
+                    let ph = make_placeholder(n, cast);
+                    let cmp = match op {
+                        RsqlOp::Eq  => "=",
+                        RsqlOp::Neq => "!=",
+                        RsqlOp::Gt  => ">",
+                        RsqlOp::Ge  => ">=",
+                        RsqlOp::Lt  => "<",
+                        RsqlOp::Le  => "<=",
+                        _ => unreachable!(),
+                    };
+                    Ok(format!("{} {} {}", qcol, cmp, ph))
+                }
+
+                RsqlOp::Like => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(v));
+                    Ok(format!("{} LIKE ${}", qcol, n))
+                }
+
+                RsqlOp::Ilike => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(v));
+                    Ok(format!("{} ILIKE ${}", qcol, n))
+                }
+
+                RsqlOp::Contains => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(format!("%{}%", v)));
+                    Ok(format!("{} ILIKE ${}", qcol, n))
+                }
+
+                RsqlOp::Starts => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(format!("{}%", v)));
+                    Ok(format!("{} ILIKE ${}", qcol, n))
+                }
+
+                RsqlOp::Ends => {
+                    let v = values.first().cloned().unwrap_or_default();
+                    let n = q.push_param(Value::String(format!("%{}", v)));
+                    Ok(format!("{} ILIKE ${}", qcol, n))
+                }
+
+                RsqlOp::In => {
+                    if values.is_empty() {
+                        return Err(AppError::Validation(format!(
+                            "=in= requires at least one value for field '{}'",
+                            field
+                        )));
+                    }
+                    let phs: Vec<String> = values
+                        .iter()
+                        .map(|v| {
+                            let n = q.push_param(Value::String(v.clone()));
+                            make_placeholder(n, cast)
+                        })
+                        .collect();
+                    Ok(format!("{} IN ({})", qcol, phs.join(", ")))
+                }
+
+                RsqlOp::Out => {
+                    if values.is_empty() {
+                        return Err(AppError::Validation(format!(
+                            "=out= requires at least one value for field '{}'",
+                            field
+                        )));
+                    }
+                    let phs: Vec<String> = values
+                        .iter()
+                        .map(|v| {
+                            let n = q.push_param(Value::String(v.clone()));
+                            make_placeholder(n, cast)
+                        })
+                        .collect();
+                    Ok(format!("{} NOT IN ({})", qcol, phs.join(", ")))
+                }
+
+                RsqlOp::Between => {
+                    if values.len() != 2 {
+                        return Err(AppError::Validation(format!(
+                            "=between= requires exactly 2 values for field '{}', got {}",
+                            field,
+                            values.len()
+                        )));
+                    }
+                    let n1 = q.push_param(Value::String(values[0].clone()));
+                    let n2 = q.push_param(Value::String(values[1].clone()));
+                    Ok(format!(
+                        "{} BETWEEN {} AND {}",
+                        qcol,
+                        make_placeholder(n1, cast),
+                        make_placeholder(n2, cast)
+                    ))
+                }
+
+                #[allow(unreachable_patterns)]
+                RsqlOp::Null(_) => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Build ORDER BY clause from sort specs, falling back to pk ASC when empty.
+/// Unknown column names are silently skipped.
+fn build_order_by(
+    sort: &[SortSpec],
+    entity: &ResolvedEntity,
+    col_qualifier: Option<&str>,
+) -> String {
+    let pk = &entity.pk_columns[0];
+    let col_names: std::collections::HashSet<&str> =
+        entity.columns.iter().map(|c| c.name.as_str()).collect();
+
+    let parts: Vec<String> = sort
+        .iter()
+        .filter(|s| col_names.contains(s.field.as_str()))
+        .map(|s| {
+            let qcol = match col_qualifier {
+                Some(pfx) => format!("{}{}", pfx, quoted(&s.field)),
+                None => quoted(&s.field),
+            };
+            if s.desc { format!("{} DESC", qcol) } else { format!("{} ASC", qcol) }
+        })
+        .collect();
+
+    if parts.is_empty() {
+        match col_qualifier {
+            Some(pfx) => format!(" ORDER BY {}{}", pfx, quoted(pk)),
+            None => format!(" ORDER BY {}", quoted(pk)),
+        }
+    } else {
+        format!(" ORDER BY {}", parts.join(", "))
+    }
+}
+
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
 pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
     let mut q = QueryBuf::new();
@@ -132,18 +414,18 @@ pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> Q
 /// SELECT list with includes in a single query: main table aliased as "main", each include as a scalar subquery (json_agg for to_many, row_to_json for to_one).
 pub fn select_list_with_includes(
     entity: &ResolvedEntity,
-    filters: &[(String, Value)],
+    filter: Option<&FilterNode>,
+    sort: &[SortSpec],
     limit: Option<u32>,
     offset: Option<u32>,
     includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
-) -> QueryBuf {
+) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
-    let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
-    let pk = &entity.pk_columns[0];
     const MAIN_ALIAS: &str = "main";
+    let main_qualifier = format!("{}.", MAIN_ALIAS);
 
     let main_cols: Vec<String> = entity
         .columns
@@ -179,26 +461,14 @@ pub fn select_list_with_includes(
         select_parts.push(format!("{} AS {}", subquery, quoted(inc.name)));
     }
 
-    let mut where_parts = Vec::new();
-    for (col, val) in filters {
-        if col_names.contains(col.as_str()) {
-            let param_num = q.push_param(val.clone());
-            let ph = entity
-                .columns
-                .iter()
-                .find(|c| c.name == *col)
-                .and_then(|c| c.pg_type.as_deref())
-                .map(|t| format!("${}::{}", param_num, t))
-                .unwrap_or_else(|| format!("${}", param_num));
-            where_parts.push(format!("{}.{} = {}", MAIN_ALIAS, quoted(col), ph));
+    let where_clause = match filter {
+        Some(node) => {
+            let frag = rsql_to_sql(node, entity, &mut q, Some(&main_qualifier))?;
+            format!(" WHERE {}", frag)
         }
-    }
-    let where_clause = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", where_parts.join(" AND "))
+        None => String::new(),
     };
-    let order_clause = format!(" ORDER BY {}.{}", MAIN_ALIAS, quoted(pk));
+    let order_clause = build_order_by(sort, entity, Some(&main_qualifier));
     let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
 
@@ -212,45 +482,30 @@ pub fn select_list_with_includes(
         limit_clause,
         offset_clause
     );
-    q
+    Ok(q)
 }
 
-/// SELECT list with optional filters (exact match per column), ORDER BY pk, optional LIMIT/OFFSET.
-/// filters: only (col, value) where col is in entity.columns; params bound in filter order.
+/// SELECT list with optional RSQL filter and sort specs.
 pub fn select_list(
     entity: &ResolvedEntity,
-    filters: &[(String, Value)],
+    filter: Option<&FilterNode>,
+    sort: &[SortSpec],
     limit: Option<u32>,
     offset: Option<u32>,
     schema_override: Option<&str>,
-) -> QueryBuf {
+) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
-    let col_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
-    let pk = &entity.pk_columns[0];
 
-    let mut where_parts = Vec::new();
-    for (col, val) in filters {
-        if col_names.contains(col.as_str()) {
-            let param_num = q.push_param(val.clone());
-            let ph = entity
-                .columns
-                .iter()
-                .find(|c| c.name == *col)
-                .and_then(|c| c.pg_type.as_deref())
-                .map(|t| format!("${}::{}", param_num, t))
-                .unwrap_or_else(|| format!("${}", param_num));
-            where_parts.push(format!("{} = {}", quoted(col), ph));
+    let where_clause = match filter {
+        Some(node) => {
+            let frag = rsql_to_sql(node, entity, &mut q, None)?;
+            format!(" WHERE {}", frag)
         }
-    }
-
-    let where_clause = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", where_parts.join(" AND "))
+        None => String::new(),
     };
-    let order_clause = format!(" ORDER BY {}", quoted(pk));
+    let order_clause = build_order_by(sort, entity, None);
     let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
     let cols = select_column_list(entity);
@@ -263,7 +518,7 @@ pub fn select_list(
         limit_clause,
         offset_clause
     );
-    q
+    Ok(q)
 }
 
 /// SELECT * FROM entity WHERE column IN ($1, $2, ...) ORDER BY pk. Used for batch-fetching related rows (to_many or to_one by key).

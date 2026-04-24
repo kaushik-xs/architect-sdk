@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, IncludeSelect, update, PgBindValue, QueryBuf};
+use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -16,11 +16,12 @@ pub enum TenantExecutor<'a> {
 pub struct CrudService;
 
 impl CrudService {
-    /// List rows with optional filters (exact match), limit (default 100, max 1000), offset (default 0).
+    /// List rows with optional RSQL filter and sort, limit (default 100, max 1000), offset (default 0).
     pub async fn list<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
-        filters: &[(String, Value)],
+        filter: Option<&FilterNode>,
+        sort: &[SortSpec],
         limit: Option<u32>,
         offset: Option<u32>,
         schema_override: Option<&str>,
@@ -28,7 +29,7 @@ impl CrudService {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list(entity, filters, Some(limit), Some(offset), schema_override);
+        let q = select_list(entity, filter, sort, Some(limit), Some(offset), schema_override)?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 
@@ -36,7 +37,8 @@ impl CrudService {
     pub async fn list_with_includes<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
-        filters: &[(String, Value)],
+        filter: Option<&FilterNode>,
+        sort: &[SortSpec],
         limit: Option<u32>,
         offset: Option<u32>,
         includes: &[IncludeSelect<'_>],
@@ -45,7 +47,7 @@ impl CrudService {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list_with_includes(entity, filters, Some(limit), Some(offset), includes, schema_override);
+        let q = select_list_with_includes(entity, filter, sort, Some(limit), Some(offset), includes, schema_override)?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 

@@ -6,7 +6,7 @@ use crate::config::{load_from_pool, resolve, IncludeDirection, PkType, ResolvedM
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
-use crate::sql::IncludeSelect;
+use crate::sql::{parse_rsql, parse_sort, FilterNode, IncludeSelect};
 use crate::state::AppState;
 use crate::storage::{compress, resolve_prefix, validate_asset_field};
 use crate::store::DEFAULT_PACKAGE_ID;
@@ -51,6 +51,7 @@ fn body_to_map(value: Value) -> Result<HashMap<String, Value>, AppError> {
     }
 }
 
+#[allow(dead_code)]
 fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value {
     let col_info = entity.columns.iter().find(|c| c.name == col);
     let is_uuid = col_info
@@ -205,6 +206,76 @@ async fn process_asset_uploads(
 
         storage.upload(&object_name, data, &file.content_type).await?;
         body.insert(col_name, Value::String(object_name));
+    }
+    Ok(())
+}
+
+/// For JSON create/update: detect asset columns whose value is a JSON object or array,
+/// serialize to bytes, upload to storage, and replace the value with the stored path.
+/// Plain strings are passed through unchanged (treat as pre-existing path).
+async fn process_json_asset_fields(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    tenant_id: &str,
+    body: &mut HashMap<String, Value>,
+) -> Result<(), AppError> {
+    let asset_cols: Vec<_> = entity
+        .columns
+        .iter()
+        .filter(|c| c.is_asset)
+        .collect();
+
+    if asset_cols.is_empty() {
+        return Ok(());
+    }
+
+    // Only touch the body if at least one asset column has a JSON value.
+    let has_json_asset = asset_cols.iter().any(|c| {
+        matches!(body.get(&c.name), Some(Value::Object(_)) | Some(Value::Array(_)))
+    });
+    if !has_json_asset {
+        return Ok(());
+    }
+
+    let storage = state
+        .storage
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+
+    for col in asset_cols {
+        let val = match body.get(&col.name) {
+            Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
+            _ => continue,
+        };
+
+        let data = serde_json::to_vec(&val)
+            .map_err(|e| AppError::BadRequest(format!("failed to serialize {}: {}", col.name, e)))?;
+
+        // Validate size if rules exist (mime type / extension checks are skipped for JSON blobs).
+        if let Some(rule) = entity.validation.get(&col.name) {
+            if let Some(max_mb) = rule.max_size_mb {
+                let limit = (max_mb * 1024.0 * 1024.0) as usize;
+                if data.len() > limit {
+                    return Err(AppError::Validation(format!(
+                        "{}: JSON payload {} bytes exceeds maximum of {:.1} MB",
+                        col.name, data.len(), max_mb
+                    )));
+                }
+            }
+        }
+
+        let asset_cfg = col.asset_config.as_ref();
+        let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+        let data = compress(data, compression)?;
+
+        let prefix_template = asset_cfg
+            .and_then(|c| c.prefix.as_deref())
+            .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+        let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
+        let object_name = format!("{}/{}.json", prefix, uuid::Uuid::new_v4());
+
+        storage.upload(&object_name, data, "application/json").await?;
+        body.insert(col.name.clone(), Value::String(object_name));
     }
     Ok(())
 }
@@ -568,12 +639,11 @@ pub async fn list(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    let column_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
-
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
-    let mut filters: Vec<(String, Value)> = Vec::new();
+    let mut filter_str: Option<String> = None;
+    let mut sort_str: Option<String> = None;
     let mut sign_param: Option<String> = None;
     let mut sign_expires: u64 = 900;
 
@@ -582,17 +652,16 @@ pub async fn list(
             "limit" => limit = v.parse().ok(),
             "offset" => offset = v.parse().ok(),
             "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "q" => filter_str = Some(v),
+            "sort" => sort_str = Some(v),
             "sign" => sign_param = Some(v),
             "sign_expires" => sign_expires = v.parse().unwrap_or(900),
-            _ => {
-                let col_key = to_snake_case(&k);
-                if column_names.contains(col_key.as_str()) {
-                    let val = query_value_for_column(&entity, &col_key, &v);
-                    filters.push((col_key, val));
-                }
-            }
+            _ => {}
         }
     }
+
+    let filter: Option<FilterNode> = filter_str.as_deref().map(parse_rsql).transpose()?;
+    let sort = sort_str.as_deref().map(parse_sort).unwrap_or_default();
 
     // Resolve which asset columns to sign (None = all, Some(set) = named subset).
     let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
@@ -604,7 +673,7 @@ pub async fn list(
     });
 
     let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, &filters, limit, offset, schema_override).await?
+        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, schema_override).await?
     } else {
         let resolved = {
             let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
@@ -623,7 +692,8 @@ pub async fn list(
         let mut rows = CrudService::list_with_includes(
             &mut executor,
             &entity,
-            &filters,
+            filter.as_ref(),
+            &sort,
             limit,
             offset,
             includes.as_slice(),
@@ -700,6 +770,7 @@ pub async fn create(
             .await
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
         body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+        process_json_asset_fields(&state, &entity, &tenant_id_str, &mut body).await?;
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
@@ -808,6 +879,7 @@ pub async fn update(
             .await
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
         body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+        process_json_asset_fields(&state, &entity, &tenant_id_str, &mut body).await?;
     }
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
@@ -969,30 +1041,29 @@ pub async fn list_package(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    let column_names: std::collections::HashSet<&str> = entity.columns.iter().map(|c| c.name.as_str()).collect();
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
-    let mut filters: Vec<(String, Value)> = Vec::new();
+    let mut filter_str: Option<String> = None;
+    let mut sort_str: Option<String> = None;
     for (k, v) in params {
         match k.as_str() {
             "limit" => limit = v.parse().ok(),
             "offset" => offset = v.parse().ok(),
             "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            _ => {
-                let col_key = to_snake_case(&k);
-                if column_names.contains(col_key.as_str()) {
-                    filters.push((col_key.clone(), query_value_for_column(&entity, &col_key, &v)));
-                }
-            }
+            "q" => filter_str = Some(v),
+            "sort" => sort_str = Some(v),
+            _ => {}
         }
     }
+    let filter: Option<FilterNode> = filter_str.as_deref().map(parse_rsql).transpose()?;
+    let sort = sort_str.as_deref().map(parse_sort).unwrap_or_default();
     let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, &filters, limit, offset, schema_override).await?
+        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, schema_override).await?
     } else {
         let resolved = resolve_includes(&model, &entity, &include_names)?;
         let includes: Vec<IncludeSelect> = resolved.iter().map(|(name, spec, related)| IncludeSelect { name: name.as_str(), direction: spec.direction.clone(), related, our_key: spec.our_key_column.as_str(), their_key: spec.their_key_column.as_str() }).collect();
-        let mut rows = CrudService::list_with_includes(&mut executor, &entity, &filters, limit, offset, includes.as_slice(), schema_override).await?;
+        let mut rows = CrudService::list_with_includes(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, includes.as_slice(), schema_override).await?;
         post_process_include_columns(&mut rows, &resolved);
         rows
     };
