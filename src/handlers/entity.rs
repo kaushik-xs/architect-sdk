@@ -1046,6 +1046,8 @@ pub async fn list_package(
     let mut include_names: Vec<String> = Vec::new();
     let mut filter_str: Option<String> = None;
     let mut sort_str: Option<String> = None;
+    let mut sign_param: Option<String> = None;
+    let mut sign_expires: u64 = 900;
     for (k, v) in params {
         match k.as_str() {
             "limit" => limit = v.parse().ok(),
@@ -1053,9 +1055,14 @@ pub async fn list_package(
             "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             "q" => filter_str = Some(v),
             "sort" => sort_str = Some(v),
+            "sign" => sign_param = Some(v),
+            "sign_expires" => sign_expires = v.parse().unwrap_or(900),
             _ => {}
         }
     }
+    let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
+        if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+    });
     let filter: Option<FilterNode> = filter_str.as_deref().map(parse_rsql).transpose()?;
     let sort = sort_str.as_deref().map(parse_sort).unwrap_or_default();
     let mut rows = if include_names.is_empty() {
@@ -1070,6 +1077,11 @@ pub async fn list_package(
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
+    }
+    if sign_param.is_some() {
+        for row in &mut rows {
+            sign_row_assets(&state, &entity, row, &sign_cols, sign_expires).await?;
+        }
     }
     let count = rows.len() as u64;
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
@@ -1164,6 +1176,16 @@ pub async fn read_package(
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
+
+    let sign_param = params.get("sign").cloned();
+    if sign_param.is_some() {
+        let sign_expires: u64 = params.get("sign_expires").and_then(|s| s.parse().ok()).unwrap_or(900);
+        let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
+            if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+        });
+        sign_row_assets(&state, &entity, &mut row, &sign_cols, sign_expires).await?;
+    }
+
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
