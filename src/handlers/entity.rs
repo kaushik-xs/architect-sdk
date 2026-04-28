@@ -1079,8 +1079,9 @@ pub async fn create_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
     Path((package_id, path_segment)): Path<(String, String)>,
-    Json(body): Json<Value>,
+    request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
     let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
@@ -1098,8 +1099,30 @@ pub async fn create_package(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
-    let body = body_to_map(body)?;
-    let body = hashmap_keys_to_snake_case(&body);
+
+    let is_multipart = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("multipart/form-data"))
+        .unwrap_or(false);
+
+    let mut body;
+    if is_multipart {
+        let multipart = axum::extract::Multipart::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let (text_fields, files) = parse_multipart(multipart).await?;
+        body = hashmap_keys_to_snake_case(&text_fields);
+        process_asset_uploads(&state, &entity, &tenant_id_str, &mut body, files).await?;
+    } else {
+        let Json(json_body) = Json::<Value>::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+        process_json_asset_fields(&state, &entity, &tenant_id_str, &mut body).await?;
+    }
+
     RequestValidator::validate(&body, &entity.validation)?;
     let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
@@ -1148,8 +1171,9 @@ pub async fn update_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
-    Json(body): Json<Value>,
+    request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
     let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
@@ -1168,8 +1192,30 @@ pub async fn update_package(
         return Err(AppError::BadRequest("update not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let body = body_to_map(body)?;
-    let body = hashmap_keys_to_snake_case(&body);
+
+    let is_multipart = request
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("multipart/form-data"))
+        .unwrap_or(false);
+
+    let mut body;
+    if is_multipart {
+        let multipart = axum::extract::Multipart::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let (text_fields, files) = parse_multipart(multipart).await?;
+        body = hashmap_keys_to_snake_case(&text_fields);
+        process_asset_uploads(&state, &entity, &tenant_id_str, &mut body, files).await?;
+    } else {
+        let Json(json_body) = Json::<Value>::from_request(request, &state)
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        body = hashmap_keys_to_snake_case(&body_to_map(json_body)?);
+        process_json_asset_fields(&state, &entity, &tenant_id_str, &mut body).await?;
+    }
+
     RequestValidator::validate_partial(&body, &entity.validation)?;
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str))?;
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
