@@ -402,7 +402,10 @@ pub async fn revert_migrations(
 fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {
     match ty {
         ColumnTypeConfig::Simple(s) => {
-            if s.eq_ignore_ascii_case("asset") {
+            if s.eq_ignore_ascii_case("asset[]") {
+                // Asset array columns store JSONB arrays of relative storage paths.
+                "JSONB".to_string()
+            } else if s.eq_ignore_ascii_case("asset") {
                 // Asset columns are stored as plain text (relative storage path).
                 "TEXT".to_string()
             } else {

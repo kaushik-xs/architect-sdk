@@ -43,8 +43,10 @@ pub struct ColumnInfo {
     pub has_default: bool,
     /// PostgreSQL type name for SQL casts (e.g. "timestamptz") when binding string values.
     pub pg_type: Option<String>,
-    /// True when the column was declared with type "asset".
+    /// True when the column was declared with type "asset" or "asset[]".
     pub is_asset: bool,
+    /// True when the column was declared with type "asset[]" (stores a JSONB array of paths).
+    pub asset_is_array: bool,
     /// Storage config for asset columns (prefix template, compression).
     pub asset_config: Option<AssetColumnConfig>,
 }

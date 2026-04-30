@@ -145,6 +145,7 @@ async fn parse_multipart(
 }
 
 /// Upload all file fields that correspond to asset columns, inserting paths into body.
+/// For `asset[]` columns, multiple files with the same field name are collected into a JSON array.
 async fn process_asset_uploads(
     state: &AppState,
     entity: &ResolvedEntity,
@@ -160,128 +161,204 @@ async fn process_asset_uploads(
         .as_ref()
         .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
 
+    // Group files by field name to support asset[] (multiple files per column).
+    let mut groups: std::collections::BTreeMap<String, Vec<UploadedFile>> = std::collections::BTreeMap::new();
     for file in files {
-        let col_name = to_snake_case(&file.field_name);
-        let col_info = entity.columns.iter().find(|c| c.name == col_name);
+        groups.entry(file.field_name.clone()).or_default().push(file);
+    }
 
-        let col = col_info.ok_or_else(|| {
-            AppError::BadRequest(format!("unknown field: {}", file.field_name))
-        })?;
+    for (field_name, group) in groups {
+        let col_name = to_snake_case(&field_name);
+        let col = entity
+            .columns
+            .iter()
+            .find(|c| c.name == col_name)
+            .ok_or_else(|| AppError::BadRequest(format!("unknown field: {}", field_name)))?;
+
         if !col.is_asset {
             return Err(AppError::BadRequest(format!(
                 "field '{}' is not an asset column",
-                file.field_name
+                field_name
             )));
         }
 
-        // Asset validation against api_entity rules
-        if let Some(rule) = entity.validation.get(&col_name) {
-            validate_asset_field(
-                &col_name,
-                &file.filename,
-                &file.content_type,
-                file.data.len(),
-                rule,
-            )?;
+        if col.asset_is_array {
+            // Upload each file and collect paths into a JSON array.
+            let mut paths: Vec<Value> = Vec::new();
+            for file in group {
+                if let Some(rule) = entity.validation.get(&col_name) {
+                    validate_asset_field(&col_name, &file.filename, &file.content_type, file.data.len(), rule)?;
+                }
+                let asset_cfg = col.asset_config.as_ref();
+                let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+                let data = compress(file.data, compression)?;
+                let prefix_template = asset_cfg.and_then(|c| c.prefix.as_deref()).unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+                let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
+                let ext = std::path::Path::new(&file.filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{}", e))
+                    .unwrap_or_default();
+                let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
+                storage.upload(&object_name, data, &file.content_type).await?;
+                paths.push(Value::String(object_name));
+            }
+            body.insert(col_name, Value::Array(paths));
+        } else {
+            // Single-file asset: take the first (and expected only) file.
+            let file = group.into_iter().next().unwrap();
+            if let Some(rule) = entity.validation.get(&col_name) {
+                validate_asset_field(&col_name, &file.filename, &file.content_type, file.data.len(), rule)?;
+            }
+            let asset_cfg = col.asset_config.as_ref();
+            let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+            let data = compress(file.data, compression)?;
+            let prefix_template = asset_cfg.and_then(|c| c.prefix.as_deref()).unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+            let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
+            let ext = std::path::Path::new(&file.filename)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{}", e))
+                .unwrap_or_default();
+            let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
+            storage.upload(&object_name, data, &file.content_type).await?;
+            body.insert(col_name, Value::String(object_name));
         }
-
-        // Compress
-        let asset_cfg = col.asset_config.as_ref();
-        let compression = asset_cfg
-            .and_then(|c| c.compression.as_deref())
-            .unwrap_or("none");
-        let data = compress(file.data, compression)?;
-
-        // Resolve prefix and build storage path
-        let prefix_template = asset_cfg
-            .and_then(|c| c.prefix.as_deref())
-            .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
-        let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
-        let ext = std::path::Path::new(&file.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
-        let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
-
-        storage.upload(&object_name, data, &file.content_type).await?;
-        body.insert(col_name, Value::String(object_name));
     }
     Ok(())
 }
 
-/// For JSON create/update: detect asset columns whose value is a JSON object or array,
-/// serialize to bytes, upload to storage, and replace the value with the stored path.
-/// Plain strings are passed through unchanged (treat as pre-existing path).
+/// Upload a single JSON value (Object or Array) to storage and return its path.
+async fn upload_json_value(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    tenant_id: &str,
+    col_name: &str,
+    asset_cfg: Option<&crate::config::AssetColumnConfig>,
+    val: &Value,
+) -> Result<String, AppError> {
+    let storage = state
+        .storage
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+
+    let data = serde_json::to_vec(val)
+        .map_err(|e| AppError::BadRequest(format!("failed to serialize {}: {}", col_name, e)))?;
+
+    // Validate size if rules exist.
+    if let Some(rule) = entity.validation.get(col_name) {
+        if let Some(max_mb) = rule.max_size_mb {
+            let limit = (max_mb * 1024.0 * 1024.0) as usize;
+            if data.len() > limit {
+                return Err(AppError::Validation(format!(
+                    "{}: JSON payload {} bytes exceeds maximum of {:.1} MB",
+                    col_name, data.len(), max_mb
+                )));
+            }
+        }
+    }
+
+    let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+    let data = compress(data, compression)?;
+
+    let prefix_template = asset_cfg
+        .and_then(|c| c.prefix.as_deref())
+        .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+    let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
+    let object_name = format!("{}/{}.json", prefix, uuid::Uuid::new_v4());
+
+    storage.upload(&object_name, data, "application/json").await?;
+    Ok(object_name)
+}
+
+/// For JSON create/update: detect asset columns whose value needs upload treatment.
+///
+/// `asset` columns:  Object/Array value → serialize to JSON, upload, replace with path string.
+///                   Plain strings pass through unchanged (pre-existing path).
+///
+/// `asset[]` columns: Value::Array of elements is processed element-by-element:
+///                    - String elements pass through unchanged (pre-existing paths).
+///                    - Object/Array elements are serialized to JSON, uploaded, replaced with paths.
+///                    A top-level Value::Array whose elements are already plain strings is a no-op.
 async fn process_json_asset_fields(
     state: &AppState,
     entity: &ResolvedEntity,
     tenant_id: &str,
     body: &mut HashMap<String, Value>,
 ) -> Result<(), AppError> {
-    let asset_cols: Vec<_> = entity
-        .columns
-        .iter()
-        .filter(|c| c.is_asset)
-        .collect();
-
+    let asset_cols: Vec<_> = entity.columns.iter().filter(|c| c.is_asset).collect();
     if asset_cols.is_empty() {
         return Ok(());
     }
 
-    // Only touch the body if at least one asset column has a JSON value.
-    let has_json_asset = asset_cols.iter().any(|c| {
-        matches!(body.get(&c.name), Some(Value::Object(_)) | Some(Value::Array(_)))
+    // Quick check: any asset column has a value that needs upload.
+    let needs_upload = asset_cols.iter().any(|c| {
+        match body.get(&c.name) {
+            Some(Value::Object(_)) => true,
+            Some(Value::Array(arr)) => {
+                if c.asset_is_array {
+                    // needs upload if any element is not a plain string
+                    arr.iter().any(|el| !matches!(el, Value::String(_)))
+                } else {
+                    // single asset: an Array value means serialize-the-whole-thing
+                    true
+                }
+            }
+            _ => false,
+        }
     });
-    if !has_json_asset {
+    if !needs_upload {
         return Ok(());
     }
 
-    let storage = state
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
-
     for col in asset_cols {
-        let val = match body.get(&col.name) {
-            Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
-            _ => continue,
-        };
+        let asset_cfg = col.asset_config.as_ref();
 
-        let data = serde_json::to_vec(&val)
-            .map_err(|e| AppError::BadRequest(format!("failed to serialize {}: {}", col.name, e)))?;
+        if col.asset_is_array {
+            // Expect a JSON array of path strings or JSON objects/arrays to upload.
+            let arr = match body.get(&col.name) {
+                Some(Value::Array(a)) => a.clone(),
+                Some(Value::Null) | None => continue,
+                Some(other) => {
+                    // Wrap a single value into an array for convenience.
+                    vec![other.clone()]
+                }
+            };
 
-        // Validate size if rules exist (mime type / extension checks are skipped for JSON blobs).
-        if let Some(rule) = entity.validation.get(&col.name) {
-            if let Some(max_mb) = rule.max_size_mb {
-                let limit = (max_mb * 1024.0 * 1024.0) as usize;
-                if data.len() > limit {
-                    return Err(AppError::Validation(format!(
-                        "{}: JSON payload {} bytes exceeds maximum of {:.1} MB",
-                        col.name, data.len(), max_mb
-                    )));
+            let mut paths: Vec<Value> = Vec::with_capacity(arr.len());
+            for element in arr {
+                match element {
+                    Value::String(s) => {
+                        // Pre-existing path — pass through.
+                        paths.push(Value::String(s));
+                    }
+                    other @ Value::Object(_) | other @ Value::Array(_) => {
+                        let path = upload_json_value(state, entity, tenant_id, &col.name, asset_cfg, &other).await?;
+                        paths.push(Value::String(path));
+                    }
+                    _ => {
+                        // Null, number, bool — pass through as-is.
+                        paths.push(element);
+                    }
                 }
             }
+            body.insert(col.name.clone(), Value::Array(paths));
+        } else {
+            // Single-asset column.
+            let val = match body.get(&col.name) {
+                Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
+                _ => continue,
+            };
+            let path = upload_json_value(state, entity, tenant_id, &col.name, asset_cfg, &val).await?;
+            body.insert(col.name.clone(), Value::String(path));
         }
-
-        let asset_cfg = col.asset_config.as_ref();
-        let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
-        let data = compress(data, compression)?;
-
-        let prefix_template = asset_cfg
-            .and_then(|c| c.prefix.as_deref())
-            .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
-        let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
-        let object_name = format!("{}/{}.json", prefix, uuid::Uuid::new_v4());
-
-        storage.upload(&object_name, data, "application/json").await?;
-        body.insert(col.name.clone(), Value::String(object_name));
     }
     Ok(())
 }
 
 /// Replace asset column values in a row with presigned URLs for the columns listed in `sign_cols`.
 /// `sign_cols` is None → sign all asset columns. Some(set) → sign only those columns.
+/// For `asset[]` columns the stored value is a JSON array; each path string is presigned individually.
 async fn sign_row_assets(
     state: &AppState,
     entity: &ResolvedEntity,
@@ -307,12 +384,34 @@ async fn sign_row_assets(
             }
             let camel = crate::case::to_camel_case(&col.name);
             let key = if map.contains_key(&col.name) { col.name.as_str() } else { camel.as_str() };
-            if let Some(Value::String(path)) = map.get(key).cloned() {
-                if path.is_empty() {
-                    continue;
+
+            if col.asset_is_array {
+                // asset[] — presign each path string in the array.
+                if let Some(Value::Array(arr)) = map.get(key).cloned() {
+                    let mut signed: Vec<Value> = Vec::with_capacity(arr.len());
+                    for el in arr {
+                        if let Value::String(path) = &el {
+                            if path.is_empty() {
+                                signed.push(el);
+                            } else {
+                                let result = storage.presign_url(path, expires).await?;
+                                signed.push(Value::String(result.url));
+                            }
+                        } else {
+                            signed.push(el);
+                        }
+                    }
+                    map.insert(key.to_string(), Value::Array(signed));
                 }
-                let result = storage.presign_url(&path, expires).await?;
-                map.insert(key.to_string(), Value::String(result.url));
+            } else {
+                // Single asset — presign the path string.
+                if let Some(Value::String(path)) = map.get(key).cloned() {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let result = storage.presign_url(&path, expires).await?;
+                    map.insert(key.to_string(), Value::String(result.url));
+                }
             }
         }
     }
