@@ -203,7 +203,7 @@ impl Parser {
     fn parse_selector(&mut self) -> Result<String, String> {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
                 self.pos += 1;
             } else {
                 break;
@@ -212,7 +212,14 @@ impl Parser {
         if self.pos == start {
             return Err(format!("expected field name at position {}", self.pos));
         }
-        Ok(self.chars[start..self.pos].iter().collect())
+        let field: String = self.chars[start..self.pos].iter().collect();
+        if field.chars().filter(|&c| c == '.').count() > 1 {
+            return Err(format!(
+                "nested dotted field '{}' is not supported; only one level allowed (e.g. include_name.field)",
+                field
+            ));
+        }
+        Ok(field)
     }
 
     /// Returns (RsqlOp, op_name_string).
@@ -398,5 +405,20 @@ mod tests {
     #[test]
     fn test_null_bad_value_errors() {
         assert!(parse_rsql("deleted_at=null=yes").is_err());
+    }
+
+    #[test]
+    fn test_dotted_field() {
+        let node = parse_rsql("transport_unit.bay=contains=bay23").unwrap();
+        if let FilterNode::Leaf { field, op: RsqlOp::Contains, .. } = node {
+            assert_eq!(field, "transport_unit.bay");
+        } else {
+            panic!("expected Contains leaf with dotted field");
+        }
+    }
+
+    #[test]
+    fn test_nested_dot_errors() {
+        assert!(parse_rsql("a.b.c==value").is_err());
     }
 }

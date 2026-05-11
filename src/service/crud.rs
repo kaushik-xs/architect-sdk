@@ -17,6 +17,7 @@ pub struct CrudService;
 
 impl CrudService {
     /// List rows with optional RSQL filter and sort, limit (default 100, max 1000), offset (default 0).
+    /// `filter_includes` supplies related-entity metadata for dotted-field EXISTS filters; pass `&[]` when unused.
     pub async fn list<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -24,16 +25,18 @@ impl CrudService {
         sort: &[SortSpec],
         limit: Option<u32>,
         offset: Option<u32>,
+        filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list(entity, filter, sort, Some(limit), Some(offset), schema_override)?;
+        let q = select_list(entity, filter, sort, Some(limit), Some(offset), filter_includes, schema_override)?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 
     /// List rows with includes in a single query (scalar subqueries with json_agg/row_to_json). Returns rows with include keys already set (JSON).
+    /// `includes` drives scalar subqueries for response data; `filter_includes` is the superset used for EXISTS generation.
     pub async fn list_with_includes<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -42,12 +45,13 @@ impl CrudService {
         limit: Option<u32>,
         offset: Option<u32>,
         includes: &[IncludeSelect<'_>],
+        filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list_with_includes(entity, filter, sort, Some(limit), Some(offset), includes, schema_override)?;
+        let q = select_list_with_includes(entity, filter, sort, Some(limit), Some(offset), includes, filter_includes, schema_override)?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 

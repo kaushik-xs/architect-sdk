@@ -713,6 +713,33 @@ async fn attach_includes<'a>(
     Ok(())
 }
 
+/// Collect unique include-name prefixes from dotted filter fields (e.g. "transport_unit" from "transport_unit.bay==x").
+fn collect_dotted_prefixes(filter: Option<&FilterNode>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(node) = filter {
+        collect_dotted_prefixes_rec(node, &mut out);
+    }
+    out
+}
+
+fn collect_dotted_prefixes_rec(node: &FilterNode, out: &mut Vec<String>) {
+    match node {
+        FilterNode::And(children) | FilterNode::Or(children) => {
+            for c in children {
+                collect_dotted_prefixes_rec(c, out);
+            }
+        }
+        FilterNode::Leaf { field, .. } => {
+            if let Some(dot_pos) = field.find('.') {
+                let prefix = field[..dot_pos].to_string();
+                if !out.contains(&prefix) {
+                    out.push(prefix);
+                }
+            }
+        }
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
@@ -771,14 +798,49 @@ pub async fn list(
         }
     });
 
-    let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, schema_override).await?
-    } else {
-        let resolved = {
+    // All includes needed: explicit include= names + any prefixes from dotted filter fields.
+    // Resolved once so the model lock is acquired only once.
+    let filter_prefix_names = collect_dotted_prefixes(filter.as_ref());
+    let all_include_names: Vec<String> = {
+        let mut names = include_names.clone();
+        for n in &filter_prefix_names {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        names
+    };
+    let resolved_all: Vec<(String, crate::config::IncludeSpec, ResolvedEntity)> =
+        if !all_include_names.is_empty() {
             let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
-            resolve_includes(&model, &entity, &include_names)?
+            resolve_includes(&model, &entity, &all_include_names)?
+        } else {
+            Vec::new()
         };
-        let includes: Vec<IncludeSelect> = resolved
+
+    // filter_includes = all resolved (for EXISTS generation on dotted filters)
+    let filter_include_selects: Vec<IncludeSelect> = resolved_all
+        .iter()
+        .map(|(name, spec, related)| IncludeSelect {
+            name: name.as_str(),
+            direction: spec.direction.clone(),
+            related,
+            our_key: spec.our_key_column.as_str(),
+            their_key: spec.their_key_column.as_str(),
+        })
+        .collect();
+
+    // data includes = only those explicitly requested via include= param (scalar subqueries)
+    let resolved_data: Vec<_> = resolved_all
+        .iter()
+        .filter(|(name, _, _)| include_names.contains(name))
+        .cloned()
+        .collect();
+
+    let mut rows = if include_names.is_empty() {
+        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, &filter_include_selects, schema_override).await?
+    } else {
+        let data_include_selects: Vec<IncludeSelect> = resolved_data
             .iter()
             .map(|(name, spec, related)| IncludeSelect {
                 name: name.as_str(),
@@ -795,11 +857,12 @@ pub async fn list(
             &sort,
             limit,
             offset,
-            includes.as_slice(),
+            data_include_selects.as_slice(),
+            &filter_include_selects,
             schema_override,
         )
         .await?;
-        post_process_include_columns(&mut rows, &resolved);
+        post_process_include_columns(&mut rows, &resolved_data);
         rows
     };
     for row in &mut rows {
@@ -1164,13 +1227,64 @@ pub async fn list_package(
     });
     let filter: Option<FilterNode> = filter_str.as_deref().map(parse_rsql).transpose()?;
     let sort = sort_str.as_deref().map(parse_sort).unwrap_or_default();
+
+    let filter_prefix_names = collect_dotted_prefixes(filter.as_ref());
+    let all_include_names: Vec<String> = {
+        let mut names = include_names.clone();
+        for n in &filter_prefix_names {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        names
+    };
+    let resolved_all: Vec<(String, crate::config::IncludeSpec, ResolvedEntity)> =
+        if !all_include_names.is_empty() {
+            resolve_includes(&model, &entity, &all_include_names)?
+        } else {
+            Vec::new()
+        };
+    let filter_include_selects: Vec<IncludeSelect> = resolved_all
+        .iter()
+        .map(|(name, spec, related)| IncludeSelect {
+            name: name.as_str(),
+            direction: spec.direction.clone(),
+            related,
+            our_key: spec.our_key_column.as_str(),
+            their_key: spec.their_key_column.as_str(),
+        })
+        .collect();
+    let resolved_data: Vec<_> = resolved_all
+        .iter()
+        .filter(|(name, _, _)| include_names.contains(name))
+        .cloned()
+        .collect();
+
     let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, schema_override).await?
+        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, &filter_include_selects, schema_override).await?
     } else {
-        let resolved = resolve_includes(&model, &entity, &include_names)?;
-        let includes: Vec<IncludeSelect> = resolved.iter().map(|(name, spec, related)| IncludeSelect { name: name.as_str(), direction: spec.direction.clone(), related, our_key: spec.our_key_column.as_str(), their_key: spec.their_key_column.as_str() }).collect();
-        let mut rows = CrudService::list_with_includes(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, includes.as_slice(), schema_override).await?;
-        post_process_include_columns(&mut rows, &resolved);
+        let data_include_selects: Vec<IncludeSelect> = resolved_data
+            .iter()
+            .map(|(name, spec, related)| IncludeSelect {
+                name: name.as_str(),
+                direction: spec.direction.clone(),
+                related,
+                our_key: spec.our_key_column.as_str(),
+                their_key: spec.their_key_column.as_str(),
+            })
+            .collect();
+        let mut rows = CrudService::list_with_includes(
+            &mut executor,
+            &entity,
+            filter.as_ref(),
+            &sort,
+            limit,
+            offset,
+            data_include_selects.as_slice(),
+            &filter_include_selects,
+            schema_override,
+        ).await?;
+        post_process_include_columns(&mut rows, &resolved_data);
         rows
     };
     for row in &mut rows {

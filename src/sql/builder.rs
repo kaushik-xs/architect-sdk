@@ -181,187 +181,228 @@ fn make_placeholder(n: u32, cast: Option<&str>) -> String {
     }
 }
 
+/// Build the SQL fragment for a single RSQL leaf condition.
+/// `qcol` is an already-quoted (and optionally qualified) column expression.
+/// `pg_type` drives operator validation and placeholder casting.
+/// `field_label` is used only in error messages (e.g. "bay" or "transport_unit.bay").
+fn build_leaf_sql(
+    qcol: &str,
+    pg_type: Option<&str>,
+    op: &RsqlOp,
+    values: &[String],
+    q: &mut QueryBuf,
+    field_label: &str,
+) -> Result<String, AppError> {
+    let category = pg_type_category(pg_type.unwrap_or("text"));
+    if !op_valid_for_category(op, category) {
+        return Err(AppError::Validation(format!(
+            "operator {} is not valid for {} field '{}' (type: {})",
+            op.display(),
+            category,
+            field_label,
+            pg_type.unwrap_or("text")
+        )));
+    }
+    let cast = if matches!(
+        op,
+        RsqlOp::Like | RsqlOp::Ilike | RsqlOp::Contains | RsqlOp::Starts | RsqlOp::Ends
+    ) {
+        None
+    } else {
+        pg_type
+    };
+    match op {
+        RsqlOp::Null(is_null) => Ok(if *is_null {
+            format!("{} IS NULL", qcol)
+        } else {
+            format!("{} IS NOT NULL", qcol)
+        }),
+        RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(v));
+            let ph = make_placeholder(n, cast);
+            let cmp = match op {
+                RsqlOp::Eq  => "=",
+                RsqlOp::Neq => "!=",
+                RsqlOp::Gt  => ">",
+                RsqlOp::Ge  => ">=",
+                RsqlOp::Lt  => "<",
+                RsqlOp::Le  => "<=",
+                _ => unreachable!(),
+            };
+            Ok(format!("{} {} {}", qcol, cmp, ph))
+        }
+        RsqlOp::Like => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(v));
+            Ok(format!("{} LIKE ${}", qcol, n))
+        }
+        RsqlOp::Ilike => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(v));
+            Ok(format!("{} ILIKE ${}", qcol, n))
+        }
+        RsqlOp::Contains => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(format!("%{}%", v)));
+            Ok(format!("{} ILIKE ${}", qcol, n))
+        }
+        RsqlOp::Starts => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(format!("{}%", v)));
+            Ok(format!("{} ILIKE ${}", qcol, n))
+        }
+        RsqlOp::Ends => {
+            let v = values.first().cloned().unwrap_or_default();
+            let n = q.push_param(Value::String(format!("%{}", v)));
+            Ok(format!("{} ILIKE ${}", qcol, n))
+        }
+        RsqlOp::In => {
+            if values.is_empty() {
+                return Err(AppError::Validation(format!(
+                    "=in= requires at least one value for field '{}'",
+                    field_label
+                )));
+            }
+            let phs: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    let n = q.push_param(Value::String(v.clone()));
+                    make_placeholder(n, cast)
+                })
+                .collect();
+            Ok(format!("{} IN ({})", qcol, phs.join(", ")))
+        }
+        RsqlOp::Out => {
+            if values.is_empty() {
+                return Err(AppError::Validation(format!(
+                    "=out= requires at least one value for field '{}'",
+                    field_label
+                )));
+            }
+            let phs: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    let n = q.push_param(Value::String(v.clone()));
+                    make_placeholder(n, cast)
+                })
+                .collect();
+            Ok(format!("{} NOT IN ({})", qcol, phs.join(", ")))
+        }
+        RsqlOp::Between => {
+            if values.len() != 2 {
+                return Err(AppError::Validation(format!(
+                    "=between= requires exactly 2 values for field '{}', got {}",
+                    field_label,
+                    values.len()
+                )));
+            }
+            let n1 = q.push_param(Value::String(values[0].clone()));
+            let n2 = q.push_param(Value::String(values[1].clone()));
+            Ok(format!(
+                "{} BETWEEN {} AND {}",
+                qcol,
+                make_placeholder(n1, cast),
+                make_placeholder(n2, cast)
+            ))
+        }
+        #[allow(unreachable_patterns)]
+        RsqlOp::Null(_) => unreachable!(),
+    }
+}
+
 /// Convert a `FilterNode` tree into a SQL WHERE fragment (no leading `WHERE`).
 /// All values are pushed as parameters into `q`; identifiers come only from
 /// config (never from user input) so SQL injection is structurally impossible.
 ///
-/// `col_qualifier` is an optional table alias prefix, e.g. `"main."` for
-/// aliased queries.
+/// `col_qualifier` is an optional table alias prefix, e.g. `"main."` for aliased queries.
+///
+/// `filter_includes` supplies the related-entity metadata needed to generate
+/// EXISTS subqueries for dotted-field filters like `transport_unit.bay=contains=bay23`.
 pub fn rsql_to_sql(
     node: &FilterNode,
     entity: &ResolvedEntity,
     q: &mut QueryBuf,
     col_qualifier: Option<&str>,
+    filter_includes: &[IncludeSelect<'_>],
+    schema_override: Option<&str>,
 ) -> Result<String, AppError> {
     match node {
         FilterNode::And(children) => {
             let parts: Result<Vec<_>, _> = children
                 .iter()
-                .map(|c| rsql_to_sql(c, entity, q, col_qualifier))
+                .map(|c| rsql_to_sql(c, entity, q, col_qualifier, filter_includes, schema_override))
                 .collect();
             Ok(format!("({})", parts?.join(" AND ")))
         }
         FilterNode::Or(children) => {
             let parts: Result<Vec<_>, _> = children
                 .iter()
-                .map(|c| rsql_to_sql(c, entity, q, col_qualifier))
+                .map(|c| rsql_to_sql(c, entity, q, col_qualifier, filter_includes, schema_override))
                 .collect();
             Ok(format!("({})", parts?.join(" OR ")))
         }
         FilterNode::Leaf { field, op, values } => {
-            // Validate field exists in entity
+            // Dotted field (e.g. "transport_unit.bay"): generate EXISTS subquery
+            if let Some(dot_pos) = field.find('.') {
+                let include_name = &field[..dot_pos];
+                let sub_field = &field[dot_pos + 1..];
+
+                let inc = filter_includes
+                    .iter()
+                    .find(|i| i.name == include_name)
+                    .ok_or_else(|| AppError::Validation(format!(
+                        "filter on '{}': '{}' is not a known include — add it to the include= parameter or ensure the relationship is configured",
+                        field, include_name
+                    )))?;
+
+                let col_info = inc
+                    .related
+                    .columns
+                    .iter()
+                    .find(|c| c.name == sub_field)
+                    .ok_or_else(|| AppError::Validation(format!(
+                        "unknown filter field '{}' on related entity '{}'",
+                        sub_field, include_name
+                    )))?;
+
+                let rel_schema = schema_override.unwrap_or(inc.related.schema_name.as_str());
+                let rel_table = qualified_table(rel_schema, &inc.related.table_name);
+
+                // FK join condition: related.their_key = main.our_key
+                let join_cond = match col_qualifier {
+                    Some(pfx) => format!("{} = {}{}", quoted(inc.their_key), pfx, quoted(inc.our_key)),
+                    None => format!("{} = {}", quoted(inc.their_key), quoted(inc.our_key)),
+                };
+
+                let field_cond = build_leaf_sql(
+                    &quoted(sub_field),
+                    col_info.pg_type.as_deref(),
+                    op,
+                    values,
+                    q,
+                    field,
+                )?;
+
+                return Ok(format!(
+                    "EXISTS (SELECT 1 FROM {} WHERE {} AND {})",
+                    rel_table, join_cond, field_cond
+                ));
+            }
+
+            // Plain field: look up in main entity
             let col_info = entity
                 .columns
                 .iter()
                 .find(|c| c.name == *field)
-                .ok_or_else(|| {
-                    AppError::Validation(format!("unknown filter field '{}'", field))
-                })?;
+                .ok_or_else(|| AppError::Validation(format!("unknown filter field '{}'", field)))?;
 
-            // Type-based operator validation
-            let pg_type = col_info.pg_type.as_deref().unwrap_or("text");
-            let category = pg_type_category(pg_type);
-            if !op_valid_for_category(op, category) {
-                return Err(AppError::Validation(format!(
-                    "operator {} is not valid for {} field '{}' (type: {})",
-                    op.display(),
-                    category,
-                    field,
-                    pg_type
-                )));
-            }
-
-            // Build qualified column reference (identifier from config only)
             let qcol = match col_qualifier {
                 Some(pfx) => format!("{}{}", pfx, quoted(field)),
                 None => quoted(field),
             };
 
-            // String-pattern operators don't get a type cast
-            let cast = if matches!(
-                op,
-                RsqlOp::Like | RsqlOp::Ilike | RsqlOp::Contains | RsqlOp::Starts | RsqlOp::Ends
-            ) {
-                None
-            } else {
-                col_info.pg_type.as_deref()
-            };
-
-            match op {
-                RsqlOp::Null(is_null) => {
-                    Ok(if *is_null {
-                        format!("{} IS NULL", qcol)
-                    } else {
-                        format!("{} IS NOT NULL", qcol)
-                    })
-                }
-
-                RsqlOp::Eq
-                | RsqlOp::Neq
-                | RsqlOp::Gt
-                | RsqlOp::Ge
-                | RsqlOp::Lt
-                | RsqlOp::Le => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(v));
-                    let ph = make_placeholder(n, cast);
-                    let cmp = match op {
-                        RsqlOp::Eq  => "=",
-                        RsqlOp::Neq => "!=",
-                        RsqlOp::Gt  => ">",
-                        RsqlOp::Ge  => ">=",
-                        RsqlOp::Lt  => "<",
-                        RsqlOp::Le  => "<=",
-                        _ => unreachable!(),
-                    };
-                    Ok(format!("{} {} {}", qcol, cmp, ph))
-                }
-
-                RsqlOp::Like => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(v));
-                    Ok(format!("{} LIKE ${}", qcol, n))
-                }
-
-                RsqlOp::Ilike => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(v));
-                    Ok(format!("{} ILIKE ${}", qcol, n))
-                }
-
-                RsqlOp::Contains => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(format!("%{}%", v)));
-                    Ok(format!("{} ILIKE ${}", qcol, n))
-                }
-
-                RsqlOp::Starts => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(format!("{}%", v)));
-                    Ok(format!("{} ILIKE ${}", qcol, n))
-                }
-
-                RsqlOp::Ends => {
-                    let v = values.first().cloned().unwrap_or_default();
-                    let n = q.push_param(Value::String(format!("%{}", v)));
-                    Ok(format!("{} ILIKE ${}", qcol, n))
-                }
-
-                RsqlOp::In => {
-                    if values.is_empty() {
-                        return Err(AppError::Validation(format!(
-                            "=in= requires at least one value for field '{}'",
-                            field
-                        )));
-                    }
-                    let phs: Vec<String> = values
-                        .iter()
-                        .map(|v| {
-                            let n = q.push_param(Value::String(v.clone()));
-                            make_placeholder(n, cast)
-                        })
-                        .collect();
-                    Ok(format!("{} IN ({})", qcol, phs.join(", ")))
-                }
-
-                RsqlOp::Out => {
-                    if values.is_empty() {
-                        return Err(AppError::Validation(format!(
-                            "=out= requires at least one value for field '{}'",
-                            field
-                        )));
-                    }
-                    let phs: Vec<String> = values
-                        .iter()
-                        .map(|v| {
-                            let n = q.push_param(Value::String(v.clone()));
-                            make_placeholder(n, cast)
-                        })
-                        .collect();
-                    Ok(format!("{} NOT IN ({})", qcol, phs.join(", ")))
-                }
-
-                RsqlOp::Between => {
-                    if values.len() != 2 {
-                        return Err(AppError::Validation(format!(
-                            "=between= requires exactly 2 values for field '{}', got {}",
-                            field,
-                            values.len()
-                        )));
-                    }
-                    let n1 = q.push_param(Value::String(values[0].clone()));
-                    let n2 = q.push_param(Value::String(values[1].clone()));
-                    Ok(format!(
-                        "{} BETWEEN {} AND {}",
-                        qcol,
-                        make_placeholder(n1, cast),
-                        make_placeholder(n2, cast)
-                    ))
-                }
-
-                #[allow(unreachable_patterns)]
-                RsqlOp::Null(_) => unreachable!(),
-            }
+            build_leaf_sql(&qcol, col_info.pg_type.as_deref(), op, values, q, field)
         }
     }
 }
@@ -412,6 +453,8 @@ pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> Q
 }
 
 /// SELECT list with includes in a single query: main table aliased as "main", each include as a scalar subquery (json_agg for to_many, row_to_json for to_one).
+/// `includes` drives the scalar subqueries (response data); `filter_includes` is the superset used
+/// for EXISTS generation when the filter references dotted fields like `transport_unit.bay`.
 pub fn select_list_with_includes(
     entity: &ResolvedEntity,
     filter: Option<&FilterNode>,
@@ -419,6 +462,7 @@ pub fn select_list_with_includes(
     limit: Option<u32>,
     offset: Option<u32>,
     includes: &[IncludeSelect<'_>],
+    filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
@@ -463,7 +507,7 @@ pub fn select_list_with_includes(
 
     let where_clause = match filter {
         Some(node) => {
-            let frag = rsql_to_sql(node, entity, &mut q, Some(&main_qualifier))?;
+            let frag = rsql_to_sql(node, entity, &mut q, Some(&main_qualifier), filter_includes, schema_override)?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
@@ -486,12 +530,16 @@ pub fn select_list_with_includes(
 }
 
 /// SELECT list with optional RSQL filter and sort specs.
+/// `filter_includes` is needed when the filter contains dotted-field conditions
+/// (e.g. `transport_unit.bay=contains=bay23`) that generate EXISTS subqueries.
+/// Pass an empty slice when there are no such filters.
 pub fn select_list(
     entity: &ResolvedEntity,
     filter: Option<&FilterNode>,
     sort: &[SortSpec],
     limit: Option<u32>,
     offset: Option<u32>,
+    filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
@@ -500,7 +548,7 @@ pub fn select_list(
 
     let where_clause = match filter {
         Some(node) => {
-            let frag = rsql_to_sql(node, entity, &mut q, None)?;
+            let frag = rsql_to_sql(node, entity, &mut q, None, filter_includes, schema_override)?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
