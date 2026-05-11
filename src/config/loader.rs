@@ -182,6 +182,16 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
     };
     let lower = name.to_lowercase();
+    // Asset pseudo-types must be intercepted BEFORE the generic `ends_with("[]")` guard
+    // below, otherwise "asset[]" would be returned verbatim and PostgreSQL would reject the
+    // cast with "type asset[] does not exist".
+    if lower == "asset[]" {
+        return Some("jsonb".into());
+    }
+    if lower == "asset" {
+        return Some("text".into());
+    }
+
     // Check array and schema-qualified types first so they are preserved verbatim
     // (e.g. `uuid[]` must not be shortened to `uuid`, `sample.order_status[]` keeps both).
     if name.ends_with("[]") {
@@ -224,12 +234,6 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
     } else if lower == "float" || lower.starts_with("float(") {
         // Postgres FLOAT(n): n<=24 is real, n>25 is double precision; default to double precision.
         Some("double precision".into())
-    } else if lower == "asset[]" {
-        // Asset array columns store arrays of relative storage paths as JSONB.
-        Some("jsonb".into())
-    } else if lower == "asset" {
-        // Asset columns store relative storage paths as plain text.
-        Some("text".into())
     } else {
         None
     }
