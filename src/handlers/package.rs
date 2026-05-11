@@ -73,8 +73,6 @@ fn config_apply_order() -> Vec<&'static str> {
 /// Schema id used when manifest provides the schema name (no separate schemas.json).
 const DEFAULT_SCHEMA_ID: &str = "default";
 
-const DEFAULT_EMPTY_JSON: &str = "[]";
-
 fn inject_schema_id(body: &mut [Value], schema_id: &str) {
     for rec in body.iter_mut() {
         if let Some(obj) = rec.as_object_mut() {
@@ -106,6 +104,37 @@ fn read_zip_entry_to_string<R: std::io::Read + std::io::Seek>(
     let mut s = String::new();
     std::io::Read::read_to_string(&mut f, &mut s).map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(s)
+}
+
+/// Read all records for a config kind from a zip archive.
+/// Tries `{kind}.json` first (flat file), then scans `{kind}/*.json` (subdirectory),
+/// merging all arrays in alphabetical order. Returns an empty vec if neither exists.
+fn read_kind_from_zip<R: std::io::Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    kind: &str,
+) -> Result<Vec<Value>, AppError> {
+    let flat = format!("{}.json", kind);
+    if let Ok(content) = read_zip_entry_to_string(archive, &flat) {
+        return serde_json::from_str(&content)
+            .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", flat, e)));
+    }
+
+    let prefix = format!("{}/", kind);
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+        .map(String::from)
+        .collect();
+    names.sort();
+
+    let mut merged: Vec<Value> = Vec::new();
+    for name in names {
+        let content = read_zip_entry_to_string(archive, &name)?;
+        let mut items: Vec<Value> = serde_json::from_str(&content)
+            .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", name, e)))?;
+        merged.append(&mut items);
+    }
+    Ok(merged)
 }
 
 /// POST /api/v1/config/package: multipart form with file field containing a zip (manifest.json + config JSONs). X-Tenant-ID required.
@@ -186,14 +215,7 @@ pub async fn install_package(
             serde_json::from_value(Value::Array(schemas_body.clone()))
                 .map_err(|e| AppError::BadRequest(format!("schemas body: {}", e)))?
         } else {
-            let file_name = format!("{}.json", kind);
-            let file_name_with_slash = format!("{}/{}", kind, file_name);
-            let content = read_zip_entry_to_string(&mut archive, &file_name)
-                .or_else(|_| read_zip_entry_to_string(&mut archive, &file_name_with_slash))
-                .unwrap_or_else(|_| DEFAULT_EMPTY_JSON.to_string());
-
-            let mut body: Vec<Value> = serde_json::from_str(&content)
-                .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", file_name, e)))?;
+            let mut body = read_kind_from_zip(&mut archive, kind)?;
             match *kind {
                 "enums" | "tables" | "indexes" => inject_schema_id(&mut body, DEFAULT_SCHEMA_ID),
                 "relationships" => inject_relationship_schema_ids(&mut body, DEFAULT_SCHEMA_ID),

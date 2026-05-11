@@ -18,7 +18,7 @@ use architect_sdk::{
 use axum::Router;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -84,6 +84,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Read all JSON records for a config kind from a package directory.
+/// Tries `{kind}.json` first (flat file), then scans `{kind}/*.json` (subdirectory),
+/// merging all arrays in alphabetical order. Returns an empty vec if neither exists.
+async fn read_kind_from_dir(dir: &Path, kind: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let flat = dir.join(format!("{}.json", kind));
+    if flat.exists() {
+        let content = tokio::fs::read_to_string(&flat).await?;
+        return Ok(serde_json::from_str(&content)?);
+    }
+
+    let subdir = dir.join(kind);
+    if subdir.is_dir() {
+        let mut read_dir = tokio::fs::read_dir(&subdir).await?;
+        let mut files: Vec<PathBuf> = Vec::new();
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        let mut merged: Vec<serde_json::Value> = Vec::new();
+        for path in files {
+            let content = tokio::fs::read_to_string(&path).await?;
+            let mut items: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+            merged.append(&mut items);
+        }
+        return Ok(merged);
+    }
+
+    Ok(vec![])
+}
+
 async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(dir);
     let manifest_path = dir.join("manifest.json");
@@ -101,7 +134,7 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
     let schemas = vec![serde_json::json!({ "id": "default", "name": schema_name })];
     let schemas: Vec<architect_sdk::config::SchemaConfig> = serde_json::from_value(serde_json::Value::Array(schemas))?;
 
-    let mut enums: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("enums.json")).await?)?;
+    let mut enums = read_kind_from_dir(&dir, "enums").await?;
     for o in enums.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
             obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
@@ -109,7 +142,7 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
     }
     let enums: Vec<architect_sdk::config::EnumConfig> = serde_json::from_value(serde_json::Value::Array(enums))?;
 
-    let mut tables: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("tables.json")).await?)?;
+    let mut tables = read_kind_from_dir(&dir, "tables").await?;
     for o in tables.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
             obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
@@ -117,9 +150,10 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
     }
     let tables: Vec<architect_sdk::config::TableConfig> = serde_json::from_value(serde_json::Value::Array(tables))?;
 
-    let columns: Vec<architect_sdk::config::ColumnConfig> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("columns.json")).await?)?;
+    let columns_raw = read_kind_from_dir(&dir, "columns").await?;
+    let columns: Vec<architect_sdk::config::ColumnConfig> = serde_json::from_value(serde_json::Value::Array(columns_raw))?;
 
-    let mut indexes: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("indexes.json")).await?)?;
+    let mut indexes = read_kind_from_dir(&dir, "indexes").await?;
     for o in indexes.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
             obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
@@ -127,7 +161,7 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
     }
     let indexes: Vec<architect_sdk::config::IndexConfig> = serde_json::from_value(serde_json::Value::Array(indexes))?;
 
-    let mut relationships: Vec<serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string(dir.join("relationships.json")).await?)?;
+    let mut relationships = read_kind_from_dir(&dir, "relationships").await?;
     for o in relationships.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
             obj.entry("from_schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
@@ -136,13 +170,11 @@ async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String)
     }
     let relationships: Vec<architect_sdk::config::RelationshipConfig> = serde_json::from_value(serde_json::Value::Array(relationships))?;
 
-    let api_entities: Vec<architect_sdk::config::ApiEntityConfig> = serde_json::from_str(
-        &tokio::fs::read_to_string(dir.join("api_entities.json")).await.unwrap_or_else(|_| "[]".into()),
-    )?;
+    let api_entities_raw = read_kind_from_dir(&dir, "api_entities").await?;
+    let api_entities: Vec<architect_sdk::config::ApiEntityConfig> = serde_json::from_value(serde_json::Value::Array(api_entities_raw))?;
 
-    let kv_stores: Vec<architect_sdk::config::KvStoreConfig> = serde_json::from_str(
-        &tokio::fs::read_to_string(dir.join("kv_stores.json")).await.unwrap_or_else(|_| "[]".into()),
-    )?;
+    let kv_stores_raw = read_kind_from_dir(&dir, "kv_stores").await?;
+    let kv_stores: Vec<architect_sdk::config::KvStoreConfig> = serde_json::from_value(serde_json::Value::Array(kv_stores_raw))?;
 
     Ok((
         FullConfig {
