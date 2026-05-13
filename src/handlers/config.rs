@@ -53,7 +53,7 @@ pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn get_config(pool: &PgPool, kind: &str, package_id: &str) -> Result<Vec<Value>, AppError> {
+pub(crate) async fn get_config(pool: &PgPool, kind: &str, package_id: &str) -> Result<Vec<Value>, AppError> {
     let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let q_table = qualified_sys_table(table);
     let sql = format!("SELECT payload FROM {} WHERE package_id = $1 ORDER BY id", q_table);

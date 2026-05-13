@@ -1,6 +1,7 @@
 //! _sys_* table DDL and config persistence. All _sys_* tables live in a schema named from `ARCHITECT_SCHEMA` env (default `architect`).
 
 use crate::error::AppError;
+use chrono::{DateTime, Utc};
 use sqlx::ConnectOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -293,6 +294,55 @@ pub async fn replace_config_rows(
 
 const PACKAGES_TABLE: &str = "_sys_packages";
 const PACKAGES_HISTORY_TABLE: &str = "_sys_packages_history";
+
+pub struct PackageRow {
+    pub id: String,
+    pub payload: serde_json::Value,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// List all rows from _sys_packages ordered by id.
+pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
+    let q = qualified_sys_table(PACKAGES_TABLE);
+    let rows: Vec<(String, serde_json::Value, i64, DateTime<Utc>)> =
+        sqlx::query_as(&format!("SELECT id, payload, version, updated_at FROM {} ORDER BY id", q))
+            .fetch_all(pool)
+            .await
+            .map_err(AppError::Db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, payload, version, updated_at)| PackageRow { id, payload, version, updated_at })
+        .collect())
+}
+
+/// Fetch a single package row by id, or None if not installed.
+pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, AppError> {
+    let q = qualified_sys_table(PACKAGES_TABLE);
+    let row: Option<(String, serde_json::Value, i64, DateTime<Utc>)> = sqlx::query_as(&format!(
+        "SELECT id, payload, version, updated_at FROM {} WHERE id = $1",
+        q
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::Db)?;
+    Ok(row.map(|(id, payload, version, updated_at)| PackageRow { id, payload, version, updated_at }))
+}
+
+/// Count rows in a config table for a given package.
+pub async fn count_package_kind(pool: &PgPool, kind: &str, package_id: &str) -> Result<i64, AppError> {
+    let table = sys_table_for_kind(kind)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
+    let q = qualified_sys_table(table);
+    let (count,): (i64,) =
+        sqlx::query_as(&format!("SELECT COUNT(*) FROM {} WHERE package_id = $1", q))
+            .bind(package_id)
+            .fetch_one(pool)
+            .await
+            .map_err(AppError::Db)?;
+    Ok(count)
+}
 
 /// List all package ids from _sys_packages (what is installed in the DB). Used to generate OpenAPI spec from _sys_* config.
 pub async fn list_package_ids(pool: &PgPool) -> Result<Vec<String>, AppError> {

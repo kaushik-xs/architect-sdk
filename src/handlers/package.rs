@@ -8,11 +8,11 @@ use crate::handlers::config::{reload_model, replace_config};
 use crate::handlers::entity::resolve_tenant_context;
 use crate::migration::{apply_migrations, revert_migrations};
 use crate::state::AppState;
-use crate::store::{delete_package_and_config, list_package_ids, upsert_package};
+use crate::store::{count_package_kind, delete_package_and_config, get_package, list_package_ids, list_packages, upsert_package};
 use axum::extract::{Multipart, Path, State};
 use axum::Json;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Cursor;
 use zip::ZipArchive;
@@ -311,6 +311,133 @@ pub async fn uninstall_package(
         axum::http::StatusCode::OK,
         Json(crate::response::SuccessOne {
             data: UninstallResponse { package_id },
+            meta: None,
+        }),
+    ))
+}
+
+/// Build the stats + full config payload for a package by fetching all 8 config kinds in parallel.
+async fn package_detail_data(pool: &sqlx::PgPool, package_id: &str) -> Result<Value, crate::error::AppError> {
+    use crate::handlers::config::get_config;
+
+    let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores) = tokio::try_join!(
+        get_config(pool, "schemas", package_id),
+        get_config(pool, "enums", package_id),
+        get_config(pool, "tables", package_id),
+        get_config(pool, "columns", package_id),
+        get_config(pool, "indexes", package_id),
+        get_config(pool, "relationships", package_id),
+        get_config(pool, "api_entities", package_id),
+        get_config(pool, "kv_stores", package_id),
+    )?;
+
+    Ok(json!({
+        "stats": {
+            "schemas": schemas.len(),
+            "enums": enums.len(),
+            "tables": tables.len(),
+            "columns": columns.len(),
+            "indexes": indexes.len(),
+            "relationships": relationships.len(),
+            "apiEntities": api_entities.len(),
+            "kvStores": kv_stores.len(),
+        },
+        "schemas": schemas,
+        "enums": enums,
+        "tables": tables,
+        "columns": columns,
+        "indexes": indexes,
+        "relationships": relationships,
+        "apiEntities": api_entities,
+        "kvStores": kv_stores,
+    }))
+}
+
+/// GET /api/v1/config/packages — list all installed packages with manifest info and per-kind counts.
+pub async fn list_packages_handler(
+    State(state): State<AppState>,
+) -> Result<impl axum::response::IntoResponse, crate::error::AppError> {
+    let packages = list_packages(&state.pool).await?;
+
+    let mut items: Vec<Value> = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores) = tokio::try_join!(
+            count_package_kind(&state.pool, "schemas", &pkg.id),
+            count_package_kind(&state.pool, "enums", &pkg.id),
+            count_package_kind(&state.pool, "tables", &pkg.id),
+            count_package_kind(&state.pool, "columns", &pkg.id),
+            count_package_kind(&state.pool, "indexes", &pkg.id),
+            count_package_kind(&state.pool, "relationships", &pkg.id),
+            count_package_kind(&state.pool, "api_entities", &pkg.id),
+            count_package_kind(&state.pool, "kv_stores", &pkg.id),
+        )?;
+
+        let name = pkg.payload.get("name").and_then(Value::as_str).map(String::from);
+        let version = pkg.payload.get("version").and_then(Value::as_str).map(String::from);
+        let schema = pkg.payload.get("schema").and_then(Value::as_str).map(String::from);
+
+        items.push(json!({
+            "id": pkg.id,
+            "name": name,
+            "version": version,
+            "schema": schema,
+            "installedVersion": pkg.version,
+            "updatedAt": pkg.updated_at,
+            "stats": {
+                "schemas": schemas,
+                "enums": enums,
+                "tables": tables,
+                "columns": columns,
+                "indexes": indexes,
+                "relationships": relationships,
+                "apiEntities": api_entities,
+                "kvStores": kv_stores,
+            },
+        }));
+    }
+
+    let count = items.len() as u64;
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: items,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct PackageIdPath {
+    pub package_id: String,
+}
+
+/// GET /api/v1/config/packages/:package_id — full details of one installed package including all config objects.
+pub async fn get_package_handler(
+    State(state): State<AppState>,
+    Path(PackageIdPath { package_id }): Path<PackageIdPath>,
+) -> Result<impl axum::response::IntoResponse, crate::error::AppError> {
+    let pkg = get_package(&state.pool, &package_id)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound(format!("package not found: {}", package_id)))?;
+
+    let name = pkg.payload.get("name").and_then(Value::as_str).map(String::from);
+    let version = pkg.payload.get("version").and_then(Value::as_str).map(String::from);
+    let schema = pkg.payload.get("schema").and_then(Value::as_str).map(String::from);
+
+    let mut detail = package_detail_data(&state.pool, &package_id).await?;
+    let obj = detail.as_object_mut().unwrap();
+    obj.insert("id".into(), json!(pkg.id));
+    obj.insert("name".into(), json!(name));
+    obj.insert("version".into(), json!(version));
+    obj.insert("schema".into(), json!(schema));
+    obj.insert("installedVersion".into(), json!(pkg.version));
+    obj.insert("updatedAt".into(), json!(pkg.updated_at));
+    obj.insert("manifest".into(), pkg.payload);
+
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: detail,
             meta: None,
         }),
     ))

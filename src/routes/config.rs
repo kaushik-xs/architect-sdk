@@ -4,12 +4,14 @@ use crate::handlers::config::{
     get_api_entities, get_columns, get_enums, get_indexes, get_kv_stores, get_relationships, get_schemas, get_tables,
     post_api_entities, post_columns, post_enums, post_indexes, post_kv_stores, post_relationships, post_schemas, post_tables,
 };
-use crate::handlers::package::{install_package, uninstall_package};
+use crate::handlers::package::{get_package_handler, install_package, list_packages_handler, uninstall_package};
 use crate::state::AppState;
-use axum::{routing::delete, routing::post, Router};
+use axum::{routing::delete, routing::get, routing::post, Router};
 
 pub fn config_routes(state: AppState) -> Router {
     Router::new()
+        .route("/config/packages", get(list_packages_handler))
+        .route("/config/packages/:package_id", get(get_package_handler))
         .route("/config/package", post(install_package))
         .route("/config/package/:package_id", delete(uninstall_package))
         .route("/config/schemas", post(post_schemas).get(get_schemas))
