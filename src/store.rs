@@ -300,34 +300,35 @@ pub struct PackageRow {
     pub payload: serde_json::Value,
     pub version: i64,
     pub updated_at: DateTime<Utc>,
+    pub semantic_version: Option<String>,
 }
 
 /// List all rows from _sys_packages ordered by id.
 pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
-    let rows: Vec<(String, serde_json::Value, i64, DateTime<Utc>)> =
-        sqlx::query_as(&format!("SELECT id, payload, version, updated_at FROM {} ORDER BY id", q))
+    let rows: Vec<(String, serde_json::Value, i64, DateTime<Utc>, Option<String>)> =
+        sqlx::query_as(&format!("SELECT id, payload, version, updated_at, semantic_version FROM {} ORDER BY id", q))
             .fetch_all(pool)
             .await
             .map_err(AppError::Db)?;
     Ok(rows
         .into_iter()
-        .map(|(id, payload, version, updated_at)| PackageRow { id, payload, version, updated_at })
+        .map(|(id, payload, version, updated_at, semantic_version)| PackageRow { id, payload, version, updated_at, semantic_version })
         .collect())
 }
 
 /// Fetch a single package row by id, or None if not installed.
 pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
-    let row: Option<(String, serde_json::Value, i64, DateTime<Utc>)> = sqlx::query_as(&format!(
-        "SELECT id, payload, version, updated_at FROM {} WHERE id = $1",
+    let row: Option<(String, serde_json::Value, i64, DateTime<Utc>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT id, payload, version, updated_at, semantic_version FROM {} WHERE id = $1",
         q
     ))
     .bind(id)
     .fetch_optional(pool)
     .await
     .map_err(AppError::Db)?;
-    Ok(row.map(|(id, payload, version, updated_at)| PackageRow { id, payload, version, updated_at }))
+    Ok(row.map(|(id, payload, version, updated_at, semantic_version)| PackageRow { id, payload, version, updated_at, semantic_version }))
 }
 
 /// Count rows in a config table for a given package.

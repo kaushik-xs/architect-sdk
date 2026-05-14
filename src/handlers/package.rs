@@ -203,6 +203,19 @@ pub async fn install_package(
     let schema_override = ctx.schema_override();
     let package_cache_key = ctx.package_cache_key().to_string();
 
+    let incoming_version = manifest_obj
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Some(existing) = get_package(config_pool, id).await? {
+        if existing.semantic_version.as_deref() == Some(incoming_version) {
+            return Err(AppError::Conflict(format!(
+                "package '{}' version '{}' is already installed",
+                id, incoming_version
+            )));
+        }
+    }
+
     let schemas_body = vec![serde_json::json!({
         "id": DEFAULT_SCHEMA_ID,
         "name": schema_name
