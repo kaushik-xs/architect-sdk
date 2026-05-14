@@ -187,6 +187,181 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     );
     let _ = sqlx::query(&alter_value_json).execute(pool).await;
 
+    ensure_migration_tables(pool).await?;
+
+    Ok(())
+}
+
+/// Create _sys_migration_plans and _sys_migration_audit tables if they don't exist.
+async fn ensure_migration_tables(pool: &PgPool) -> Result<(), AppError> {
+    let q_plans = qualified_sys_table("_sys_migration_plans");
+    sqlx::query(&format!(
+        r#"CREATE TABLE IF NOT EXISTS {} (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            from_version TEXT,
+            to_version TEXT NOT NULL,
+            plan_json JSONB NOT NULL,
+            zip_bytes BYTEA NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
+            applied_at TIMESTAMPTZ
+        )"#,
+        q_plans
+    )).execute(pool).await?;
+
+    let q_audit = qualified_sys_table("_sys_migration_audit");
+    sqlx::query(&format!(
+        r#"CREATE TABLE IF NOT EXISTS {} (
+            id BIGSERIAL PRIMARY KEY,
+            migration_plan_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            from_version TEXT,
+            to_version TEXT NOT NULL,
+            step_number INT NOT NULL,
+            operation TEXT NOT NULL,
+            schema_name TEXT NOT NULL,
+            table_name TEXT,
+            object_name TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            ddl TEXT,
+            safety TEXT NOT NULL,
+            risk TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        q_audit
+    )).execute(pool).await?;
+
+    Ok(())
+}
+
+/// Row returned from _sys_migration_plans.
+pub struct MigrationPlanRow {
+    pub id: String,
+    pub package_id: String,
+    pub tenant_id: String,
+    pub from_version: Option<String>,
+    pub to_version: String,
+    pub plan_json: serde_json::Value,
+    pub zip_bytes: Vec<u8>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub applied_at: Option<DateTime<Utc>>,
+}
+
+/// Persist a migration plan (zip bytes + serialized steps) for later confirmation.
+pub async fn save_migration_plan(
+    pool: &PgPool,
+    id: &str,
+    package_id: &str,
+    tenant_id: &str,
+    from_version: Option<&str>,
+    to_version: &str,
+    plan_json: &serde_json::Value,
+    zip_bytes: &[u8],
+) -> Result<(), AppError> {
+    let q = qualified_sys_table("_sys_migration_plans");
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW(), NOW() + INTERVAL '24 hours')",
+        q
+    ))
+    .bind(id)
+    .bind(package_id)
+    .bind(tenant_id)
+    .bind(from_version)
+    .bind(to_version)
+    .bind(plan_json)
+    .bind(zip_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a migration plan by id, or None if not found.
+pub async fn get_migration_plan(pool: &PgPool, id: &str) -> Result<Option<MigrationPlanRow>, AppError> {
+    let q = qualified_sys_table("_sys_migration_plans");
+    let row: Option<(String, String, String, Option<String>, String, serde_json::Value, Vec<u8>, String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)> =
+        sqlx::query_as(&format!(
+            "SELECT id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at FROM {} WHERE id = $1",
+            q
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::Db)?;
+    Ok(row.map(|(id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at)| {
+        MigrationPlanRow { id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at }
+    }))
+}
+
+/// Atomically mark a migration plan as applied. Returns false if already applied or not found.
+pub async fn mark_migration_plan_applied(pool: &PgPool, id: &str) -> Result<bool, AppError> {
+    let q = qualified_sys_table("_sys_migration_plans");
+    let result = sqlx::query(&format!(
+        "UPDATE {} SET status = 'applied', applied_at = NOW() WHERE id = $1 AND status = 'pending'",
+        q
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Append one audit record for a migration step execution.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_migration_audit(
+    pool: &PgPool,
+    migration_plan_id: &str,
+    package_id: &str,
+    tenant_id: &str,
+    from_version: Option<&str>,
+    to_version: &str,
+    step_number: i32,
+    operation: &str,
+    schema_name: &str,
+    table_name: Option<&str>,
+    object_name: &str,
+    object_type: &str,
+    description: &str,
+    ddl: Option<&str>,
+    safety: &str,
+    risk: &str,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<(), AppError> {
+    let q = qualified_sys_table("_sys_migration_audit");
+    sqlx::query(&format!(
+        "INSERT INTO {} (migration_plan_id, package_id, tenant_id, from_version, to_version, step_number, operation, schema_name, table_name, object_name, object_type, description, ddl, safety, risk, status, error_message, executed_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())",
+        q
+    ))
+    .bind(migration_plan_id)
+    .bind(package_id)
+    .bind(tenant_id)
+    .bind(from_version)
+    .bind(to_version)
+    .bind(step_number)
+    .bind(operation)
+    .bind(schema_name)
+    .bind(table_name)
+    .bind(object_name)
+    .bind(object_type)
+    .bind(description)
+    .bind(ddl)
+    .bind(safety)
+    .bind(risk)
+    .bind(status)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
