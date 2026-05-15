@@ -15,22 +15,6 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-
-    // Build enum-value lookup keyed by lowercase type name (plain and schema-qualified).
-    // Used to auto-populate ValidationRule.allowed for columns whose type is a known enum
-    // so that adding an enum value in config is immediately reflected in request validation
-    // without requiring the api_entity allowed list to be kept in sync manually.
-    let mut enum_allowed_by_type: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    for e in &config.enums {
-        let vals: Vec<serde_json::Value> = e.values.iter().map(|v| serde_json::Value::String(v.clone())).collect();
-        enum_allowed_by_type.insert(e.name.to_lowercase(), vals.clone());
-        if let Some(sid) = &e.schema_id {
-            if let Some(schema) = schemas_by_id.get(sid.as_str()) {
-                let qualified = format!("{}.{}", schema.name.to_lowercase(), e.name.to_lowercase());
-                enum_allowed_by_type.insert(qualified, vals);
-            }
-        }
-    }
     let columns_by_table: HashMap<_, Vec<&ColumnConfig>> = config
         .columns
         .iter()
@@ -131,25 +115,6 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             &column_id_to_name,
             &table_id_to_path,
         );
-
-        // Start with explicitly configured validation rules, then fill in `allowed` from the
-        // enum config for any column whose type maps to a known enum and has no explicit list.
-        // This means enum value additions in config are immediately enforced/allowed by the
-        // validator without requiring the api_entity validation block to be kept in sync.
-        let mut validation = api.validation.clone();
-        for col in table_columns {
-            let type_key = match &col.type_ {
-                ColumnTypeConfig::Simple(s) => s.to_lowercase(),
-                ColumnTypeConfig::Parameterized { name, .. } => name.to_lowercase(),
-            };
-            if let Some(enum_vals) = enum_allowed_by_type.get(&type_key) {
-                let rule = validation.entry(col.name.clone()).or_insert_with(ValidationRule::default);
-                if rule.allowed.is_none() {
-                    rule.allowed = Some(enum_vals.clone());
-                }
-            }
-        }
-
         let entity = ResolvedEntity {
             table_id: table.id.clone(),
             schema_name: schema.name.clone(),
@@ -161,7 +126,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             operations: api.operations.clone(),
             sensitive_columns,
             includes,
-            validation,
+            validation: api.validation.clone(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);
