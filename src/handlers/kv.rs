@@ -11,6 +11,20 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::Value;
 
+async fn validate_namespace(pool: &sqlx::PgPool, package_id: &str, namespace: &str) -> Result<(), AppError> {
+    let q = qualified_sys_table("_sys_kv_stores");
+    let exists: Option<(String,)> = sqlx::query_as(&format!(
+        "SELECT id FROM {} WHERE id = $1 AND package_id = $2",
+        q
+    ))
+    .bind(namespace)
+    .bind(package_id)
+    .fetch_optional(pool)
+    .await?;
+    exists.ok_or_else(|| AppError::NotFound(format!("kv namespace '{}' not found in package '{}'", namespace, package_id)))?;
+    Ok(())
+}
+
 /// GET /api/v1/package/:package_id/kv/:namespace — list keys (and values) in namespace.
 pub async fn kv_list_keys(
     TenantId(tenant_id_opt): TenantId,
@@ -27,6 +41,7 @@ pub async fn kv_list_keys(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
+    validate_namespace(pool, &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         "SELECT key, value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 ORDER BY key",
@@ -61,6 +76,7 @@ pub async fn kv_get(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
+    validate_namespace(pool, &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         "SELECT value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
@@ -94,6 +110,7 @@ pub async fn kv_put(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
+    validate_namespace(pool, &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         r#"
@@ -131,6 +148,7 @@ pub async fn kv_delete(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
+    validate_namespace(pool, &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         "DELETE FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
