@@ -124,6 +124,7 @@ pub async fn apply_migrations(
             ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
             ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
             ("archived_at", "TIMESTAMPTZ"),
+            ("created_by", "TEXT"),
         ] {
             if !config_col_names.contains(name) {
                 col_defs.push(format!("{} {}", quote(name), def_suffix));
@@ -696,7 +697,7 @@ pub fn compute_migration_plan(
             col_defs.push(def);
         }
         let cfg_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
-        for (name, suf) in [("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("archived_at", "TIMESTAMPTZ")] {
+        for (name, suf) in [("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("archived_at", "TIMESTAMPTZ"), ("created_by", "TEXT")] {
             if !cfg_col_names.contains(name) { col_defs.push(format!("{} {}", quote(name), suf)); }
         }
         let pk_cols = match &new_table.primary_key {

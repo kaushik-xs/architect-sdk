@@ -89,10 +89,11 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             .collect();
 
         let config_col_names: HashSet<String> = columns.iter().map(|c| c.name.clone()).collect();
-        for (name, nullable, has_default) in [
-            ("created_at", false, true),
-            ("updated_at", false, true),
-            ("archived_at", true, false),
+        for (name, nullable, has_default, pg_type) in [
+            ("created_at", false, true, Some("timestamptz")),
+            ("updated_at", false, true, Some("timestamptz")),
+            ("archived_at", true, false, Some("timestamptz")),
+            ("created_by", true, false, None),
         ] {
             if !config_col_names.contains(name) {
                 columns.push(ColumnInfo {
@@ -100,7 +101,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     pk_type: None,
                     nullable,
                     has_default,
-                    pg_type: Some("timestamptz".into()),
+                    pg_type: pg_type.map(str::to_owned),
                     is_asset: false,
                     asset_is_array: false,
                     asset_config: None,
