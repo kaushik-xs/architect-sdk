@@ -57,6 +57,44 @@ impl TenantRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+
+    /// All Database-strategy tenants as (tenant_id, database_url).
+    /// Used by the DDL broadcast to know which dedicated databases need migration.
+    pub fn database_tenant_targets(&self) -> Vec<(String, String)> {
+        self.by_id
+            .iter()
+            .filter_map(|(id, entry)| {
+                if matches!(entry.strategy, TenantStrategy::Database) {
+                    entry.database_url.as_ref().map(|url| (id.clone(), url.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// True if any RLS tenants share the central architect DB (no database_url).
+    /// When true, the broadcast must run DDL on the central pool once for all such tenants.
+    pub fn has_shared_rls_tenants(&self) -> bool {
+        self.by_id
+            .values()
+            .any(|e| matches!(e.strategy, TenantStrategy::Rls) && e.database_url.is_none())
+    }
+
+    /// RLS tenants that have their own dedicated database_url (not the central DB).
+    /// DDL is run per unique URL with rls_tenant_column enabled.
+    pub fn rls_dedicated_db_targets(&self) -> Vec<(String, String)> {
+        self.by_id
+            .iter()
+            .filter_map(|(id, entry)| {
+                if matches!(entry.strategy, TenantStrategy::Rls) {
+                    entry.database_url.as_ref().map(|url| (id.clone(), url.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Load tenant registry from architect._sys_tenants. Invalid rows are skipped (missing database_url for database strategy).

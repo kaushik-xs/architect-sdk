@@ -543,7 +543,7 @@ pub async fn resolve_tenant_context(
 }
 
 /// Get or create a pool for the given tenant_id and database_url. Config lives in architect DB; this pool is for app data when tenant uses a different DB.
-async fn get_or_create_tenant_pool(
+pub async fn get_or_create_tenant_pool(
     state: &AppState,
     tenant_id: &str,
     database_url: &str,

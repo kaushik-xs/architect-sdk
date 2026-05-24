@@ -1,25 +1,41 @@
 //! Package install/uninstall handlers. Install: zip upload, extract manifest + configs, apply configs, store manifest, reload model. Uninstall: revert migrations, delete _sys_* rows and package record. X-Tenant-ID is required.
-//! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in the tenant's target DB (for database/RLS with database_url).
+//! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in ALL registered tenant databases (broadcast). Bootstrap endpoint handles new Database-strategy tenants added after install.
 
-use crate::config::{load_from_pool, resolve};
+use crate::config::{FullConfig, load_from_pool, resolve};
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::{reload_model, replace_config};
-use crate::handlers::entity::resolve_tenant_context;
+use crate::handlers::entity::{get_or_create_tenant_pool, resolve_tenant_context};
 use crate::migration::{apply_migrations, compute_migration_plan, execute_migration_plan, revert_migrations, MigrationPlan};
 use crate::state::AppState;
 use crate::store::{
     count_package_kind, delete_package_and_config, get_migration_plan, get_package,
     list_package_ids, list_packages, mark_migration_plan_applied, save_migration_plan, upsert_package,
 };
+use crate::tenant::TenantStrategy;
 use axum::extract::{Multipart, Path, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use std::collections::HashSet;
 use std::io::Cursor;
 use uuid::Uuid;
 use zip::ZipArchive;
+
+/// Per-tenant DDL execution result, included in the install/upgrade response.
+#[derive(serde::Serialize)]
+struct TenantMigrationOutcome {
+    /// Tenant ID, or "central_rls_db" for the shared architect DB used by RLS tenants without a dedicated URL.
+    target: String,
+    /// "database" or "rls"
+    strategy: String,
+    /// "applied" | "applied_with_warnings" | "failed"
+    status: String,
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
 /// All config kinds that may appear in a package zip (excluding schemas, which are derived from manifest).
 const CONFIG_KINDS: &[&str] = &[
@@ -141,6 +157,210 @@ fn read_kind_from_zip<R: std::io::Read + std::io::Seek>(
     Ok(merged)
 }
 
+// ─── DDL broadcast helpers ───────────────────────────────────────────────────
+
+/// Apply DDL for one target pool — either the full `apply_migrations` (fresh install) or
+/// `execute_migration_plan` (upgrade). Returns a single `TenantMigrationOutcome`.
+async fn apply_ddl_to_pool(
+    migration_pool: &PgPool,
+    config_pool: &PgPool,
+    config: &FullConfig,
+    plan: Option<&MigrationPlan>,
+    package_id: &str,
+    target: &str,
+    strategy: &str,
+    from_version: Option<&str>,
+    to_version: &str,
+    rls_tenant_column: Option<&str>,
+) -> TenantMigrationOutcome {
+    match plan {
+        // Upgrade path: execute the pre-computed diff plan.
+        Some(p) => {
+            let migration_id = Uuid::new_v4().to_string();
+            match execute_migration_plan(
+                migration_pool, config_pool, p,
+                &migration_id, package_id, target,
+                from_version, to_version,
+            ).await {
+                Ok(result) => TenantMigrationOutcome {
+                    target: target.to_string(),
+                    strategy: strategy.to_string(),
+                    status: if result.warned > 0 {
+                        "applied_with_warnings".to_string()
+                    } else {
+                        "applied".to_string()
+                    },
+                    warnings: result.warnings,
+                    error: None,
+                },
+                Err(e) => {
+                    tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (upgrade)");
+                    TenantMigrationOutcome {
+                        target: target.to_string(),
+                        strategy: strategy.to_string(),
+                        status: "failed".to_string(),
+                        warnings: vec![],
+                        error: Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        // Fresh install path: apply the full schema.
+        None => {
+            match apply_migrations(migration_pool, config, None, rls_tenant_column).await {
+                Ok(()) => TenantMigrationOutcome {
+                    target: target.to_string(),
+                    strategy: strategy.to_string(),
+                    status: "applied".to_string(),
+                    warnings: vec![],
+                    error: None,
+                },
+                Err(e) => {
+                    tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (fresh install)");
+                    TenantMigrationOutcome {
+                        target: target.to_string(),
+                        strategy: strategy.to_string(),
+                        status: "failed".to_string(),
+                        warnings: vec![],
+                        error: Some(e.to_string()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply DDL for a package to every registered tenant database.
+///
+/// Targets (in order):
+/// 1. Central architect DB — once, if any RLS tenants share it (no dedicated database_url).
+/// 2. RLS tenants with a dedicated database_url — per unique URL, with RLS column enabled.
+/// 3. Database-strategy tenants — per tenant, without RLS column.
+///
+/// Failures on individual targets are collected as outcomes and do NOT abort the broadcast;
+/// the `_sys_*` config has already been committed and must not be rolled back here.
+async fn broadcast_ddl(
+    state: &AppState,
+    config_pool: &PgPool,
+    config: &FullConfig,
+    old_config: Option<&FullConfig>,
+    package_id: &str,
+    from_version: Option<&str>,
+    to_version: &str,
+) -> Vec<TenantMigrationOutcome> {
+    let mut outcomes = Vec::new();
+
+    // Compute the migration plan once for upgrades (pure function, no DB calls).
+    // `_rls_tenant_column` is intentionally ignored by compute_migration_plan, so
+    // the same plan is valid for both RLS and Database targets.
+    let plan: Option<MigrationPlan> = match old_config {
+        Some(old) => {
+            match compute_migration_plan(old, config, None, None) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not compute migration plan for broadcast");
+                    return vec![TenantMigrationOutcome {
+                        target: "all".to_string(),
+                        strategy: "n/a".to_string(),
+                        status: "failed".to_string(),
+                        warnings: vec![],
+                        error: Some(format!("migration plan error: {}", e)),
+                    }];
+                }
+            }
+        }
+        None => None,
+    };
+
+    // ── 1. Central DB — covers all RLS tenants without a dedicated database_url ──
+    if state.tenant_registry.has_shared_rls_tenants() {
+        let outcome = apply_ddl_to_pool(
+            &state.pool,
+            config_pool,
+            config,
+            plan.as_ref(),
+            package_id,
+            "central_rls_db",
+            "rls",
+            from_version,
+            to_version,
+            Some(crate::migration::RLS_TENANT_COLUMN),
+        ).await;
+        outcomes.push(outcome);
+    }
+
+    // ── 2. RLS tenants with their own dedicated DB ──
+    // Deduplicate by URL — multiple RLS tenants may share the same DB.
+    let mut seen_rls_urls: HashSet<String> = HashSet::new();
+    for (tid, db_url) in state.tenant_registry.rls_dedicated_db_targets() {
+        if !seen_rls_urls.insert(db_url.clone()) {
+            continue; // already migrated this DB
+        }
+        let pool = match get_or_create_tenant_pool(state, &tid, &db_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(target = %tid, error = %e, "could not connect to dedicated RLS tenant DB");
+                outcomes.push(TenantMigrationOutcome {
+                    target: tid.clone(),
+                    strategy: "rls".to_string(),
+                    status: "failed".to_string(),
+                    warnings: vec![],
+                    error: Some(format!("connection failed: {}", e)),
+                });
+                continue;
+            }
+        };
+        let outcome = apply_ddl_to_pool(
+            &pool,
+            config_pool,
+            config,
+            plan.as_ref(),
+            package_id,
+            &tid,
+            "rls",
+            from_version,
+            to_version,
+            Some(crate::migration::RLS_TENANT_COLUMN),
+        ).await;
+        outcomes.push(outcome);
+    }
+
+    // ── 3. Database-strategy tenants (each has their own DB, no RLS column) ──
+    for (tid, db_url) in state.tenant_registry.database_tenant_targets() {
+        let pool = match get_or_create_tenant_pool(state, &tid, &db_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(target = %tid, error = %e, "could not connect to Database tenant DB");
+                outcomes.push(TenantMigrationOutcome {
+                    target: tid.clone(),
+                    strategy: "database".to_string(),
+                    status: "failed".to_string(),
+                    warnings: vec![],
+                    error: Some(format!("connection failed: {}", e)),
+                });
+                continue;
+            }
+        };
+        let outcome = apply_ddl_to_pool(
+            &pool,
+            config_pool,
+            config,
+            plan.as_ref(),
+            package_id,
+            &tid,
+            "database",
+            from_version,
+            to_version,
+            None,
+        ).await;
+        outcomes.push(outcome);
+    }
+
+    outcomes
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// POST /api/v1/config/package: multipart form with file field containing a zip (manifest.json + config JSONs). X-Tenant-ID required.
 pub async fn install_package(
     TenantId(tenant_id_opt): TenantId,
@@ -203,8 +423,7 @@ pub async fn install_package(
 
     let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
     let config_pool = ctx.config_pool();
-    let migration_pool = ctx.migration_pool();
-    let schema_override = ctx.schema_override();
+    // migration_pool and schema_override are no longer used directly — broadcast_ddl handles all targets.
     let package_cache_key = ctx.package_cache_key().to_string();
 
     let incoming_version = manifest_obj
@@ -259,33 +478,37 @@ pub async fn install_package(
 
     let config = load_from_pool(config_pool, id).await.map_err(AppError::Config)?;
 
-    // Fresh install: full apply_migrations. Upgrade: compute diff and execute only changed DDL.
-    let migration_warnings: Vec<String> = if let Some(ref old) = old_config {
-        let plan = compute_migration_plan(old, &config, schema_override, ctx.rls_tenant_column())
-            .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
-        let migration_id = Uuid::new_v4().to_string();
-        let result = execute_migration_plan(
-            migration_pool, config_pool, &plan,
-            &migration_id, id, tenant_id, old_config.as_ref().and_then(|_| {
-                manifest_value.get("version").and_then(Value::as_str)
-            }),
-            incoming_version,
-        ).await?;
-        result.warnings
-    } else {
-        apply_migrations(migration_pool, &config, schema_override, ctx.rls_tenant_column()).await?;
-        Vec::new()
-    };
+    // Broadcast DDL to every registered tenant database.
+    // For a fresh install old_config is None (apply_migrations). For an upgrade it is Some (compute_migration_plan + execute).
+    let tenant_outcomes = broadcast_ddl(
+        &state,
+        config_pool,
+        &config,
+        old_config.as_ref(),
+        id,
+        old_config.as_ref().and_then(|_| manifest_value.get("version").and_then(Value::as_str)),
+        incoming_version,
+    ).await;
 
+    let migration_warnings: Vec<String> = tenant_outcomes
+        .iter()
+        .flat_map(|o| o.warnings.iter().cloned())
+        .collect();
+
+    // Rebuild the in-memory ResolvedModel once and populate every tenant cache slot.
     let new_model = resolve(&config).map_err(AppError::Config)?;
     {
-        let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
-        *guard = new_model.clone();
-        state
-            .package_models
-            .write()
-            .map_err(|_| AppError::BadRequest("state lock".into()))?
-            .insert(package_cache_key, new_model);
+        let mut model_guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        *model_guard = new_model.clone();
+        let mut pkg_guard = state.package_models.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        // Shared key used by all RLS tenants.
+        pkg_guard.insert(id.to_string(), new_model.clone());
+        // Per-tenant keys used by each Database-strategy tenant.
+        for (tid, _) in state.tenant_registry.database_tenant_targets() {
+            pkg_guard.insert(format!("{}:{}", id, tid), new_model.clone());
+        }
+        // Keep the requesting tenant's own cache slot in sync (covers edge cases).
+        pkg_guard.insert(package_cache_key, new_model);
     }
 
     #[derive(serde::Serialize)]
@@ -293,6 +516,8 @@ pub async fn install_package(
         package: Value,
         applied: Vec<String>,
         warnings: Vec<String>,
+        /// DDL execution result for each tenant database that was targeted.
+        tenant_migrations: Vec<TenantMigrationOutcome>,
     }
     Ok((
         axum::http::StatusCode::OK,
@@ -301,6 +526,7 @@ pub async fn install_package(
                 package: manifest_value,
                 applied,
                 warnings: migration_warnings,
+                tenant_migrations: tenant_outcomes,
             },
             meta: None,
         }),
@@ -736,6 +962,85 @@ pub async fn apply_migration_handler(
         }),
     ))
 }
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
+
+/// POST /api/v1/config/package/:package_id/bootstrap
+///
+/// Initialises a **new** Database-strategy tenant's database using the currently installed
+/// package schema. Use this after adding a new tenant to `_sys_tenants` when the package is
+/// already installed (calling `install_package` would return 409).
+///
+/// - Does NOT touch `_sys_*` tables or `_sys_packages` — config is unchanged.
+/// - Calls `apply_migrations` which is idempotent (IF NOT EXISTS guards on tables/schemas/indexes).
+/// - Returns 400 for RLS tenants: they share the central DB which already has the schema.
+/// - X-Tenant-ID header must identify the new tenant to bootstrap.
+pub async fn bootstrap_tenant_handler(
+    TenantId(tenant_id_opt): TenantId,
+    State(state): State<AppState>,
+    Path(PackageIdPath { package_id }): Path<PackageIdPath>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id = tenant_id_opt
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
+
+    let entry = state
+        .tenant_registry
+        .get(tenant_id)
+        .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
+
+    // Bootstrap is only needed for Database-strategy tenants.
+    // RLS tenants share the central DB — their tables are created by a normal install.
+    if !matches!(entry.strategy, TenantStrategy::Database) {
+        return Err(AppError::BadRequest(
+            "bootstrap only applies to Database-strategy tenants; RLS tenants share the central DB which is migrated by install_package".into(),
+        ));
+    }
+
+    let database_url = entry
+        .database_url
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest(format!("tenant {}: missing database_url", tenant_id)))?;
+
+    // Package must already be installed in _sys_*.
+    let _ = get_package(&state.pool, &package_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("package '{}' is not installed", package_id)))?;
+
+    let config = load_from_pool(&state.pool, &package_id)
+        .await
+        .map_err(AppError::Config)?;
+
+    let pool = get_or_create_tenant_pool(&state, tenant_id, database_url).await?;
+
+    // apply_migrations is idempotent: safe on both an empty DB and an already-migrated one.
+    apply_migrations(&pool, &config, None, None).await?;
+
+    // Populate the model cache for this tenant so entity routes resolve without a reload.
+    let model = crate::config::resolve(&config).map_err(AppError::Config)?;
+    {
+        state
+            .package_models
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?
+            .insert(format!("{}:{}", package_id, tenant_id), model);
+    }
+
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: serde_json::json!({
+                "tenant_id": tenant_id,
+                "package_id": package_id,
+                "status": "bootstrapped",
+            }),
+            meta: None,
+        }),
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a FullConfig from pre-parsed per-kind value maps (used in preview, without touching the DB).
 fn build_full_config_from_values(
