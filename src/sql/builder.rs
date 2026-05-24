@@ -651,11 +651,7 @@ pub fn insert(
         cols.push(quoted("tenant_id"));
         placeholders.push(format!("${}", param_num));
     }
-    let mut returning = select_column_list(entity);
-    if rls_tenant_id.is_some() {
-        returning.push_str(", ");
-        returning.push_str(&quoted("tenant_id"));
-    }
+    let returning = select_column_list(entity);
     q.sql = format!(
         "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
         table,
