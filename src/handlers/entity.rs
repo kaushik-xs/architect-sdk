@@ -1096,15 +1096,25 @@ pub async fn delete(
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
+    // Prefetch the full row before deletion so event conditions can be evaluated against real
+    // field values and the event context contains the complete entity (not just the id).
+    let pre_delete_row = if state.event_client.is_some() && !entity.events.is_empty() {
+        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+    } else {
+        None
+    };
     CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
     if let Some(client) = &state.event_client {
-        let delete_context = serde_json::json!({ "id": id_str });
+        let raw_row = pre_delete_row.unwrap_or_else(|| serde_json::json!({ "id": id_str }));
+        let mut api_row = raw_row.clone();
+        strip_sensitive_columns(&mut api_row, &entity.sensitive_columns);
+        value_keys_to_camel_case(&mut api_row);
         spawn_events(
             std::sync::Arc::clone(client),
             &entity,
             "delete",
-            delete_context.clone(),
-            delete_context,
+            raw_row,
+            api_row,
             tenant_id_opt.as_deref().unwrap_or("").to_string(),
             None,
         );
@@ -1538,15 +1548,25 @@ pub async fn delete_package(
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
+    // Prefetch the full row before deletion so event conditions can be evaluated against real
+    // field values and the event context contains the complete entity (not just the id).
+    let pre_delete_row = if state.event_client.is_some() && !entity.events.is_empty() {
+        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+    } else {
+        None
+    };
     CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
     if let Some(client) = &state.event_client {
-        let delete_context = serde_json::json!({ "id": id_str });
+        let raw_row = pre_delete_row.unwrap_or_else(|| serde_json::json!({ "id": id_str }));
+        let mut api_row = raw_row.clone();
+        strip_sensitive_columns(&mut api_row, &entity.sensitive_columns);
+        value_keys_to_camel_case(&mut api_row);
         spawn_events(
             std::sync::Arc::clone(client),
             &entity,
             "delete",
-            delete_context.clone(),
-            delete_context,
+            raw_row,
+            api_row,
             tenant_id_opt.as_deref().unwrap_or("").to_string(),
             None,
         );
