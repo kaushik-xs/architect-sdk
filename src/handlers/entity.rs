@@ -1399,8 +1399,12 @@ pub async fn create_package(
 
     RequestValidator::validate(&body, &entity.validation)?;
     let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
+    let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, row.clone(), tenant_id_str, None);
+    }
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -1502,8 +1506,12 @@ pub async fn update_package(
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str))?;
+    let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, row.clone(), tenant_id_str, None);
+    }
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
 }
 
@@ -1531,6 +1539,18 @@ pub async fn delete_package(
     }
     let id = parse_id(&id_str, &entity.pk_type)?;
     CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
+    if let Some(client) = &state.event_client {
+        let delete_context = serde_json::json!({ "id": id_str });
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "delete",
+            delete_context.clone(),
+            delete_context,
+            tenant_id_opt.as_deref().unwrap_or("").to_string(),
+            None,
+        );
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1570,10 +1590,17 @@ pub async fn bulk_create_package(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
+    let raw_rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
+    let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
+    }
+    let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    if let Some(client) = &state.event_client {
+        for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
+            spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, api_row, tid.clone(), None);
+        }
     }
     let count = rows.len() as u64;
     Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
@@ -1615,10 +1642,17 @@ pub async fn bulk_update_package(
     for item in &items {
         RequestValidator::validate(item, &entity.validation)?;
     }
-    let mut rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override).await?;
+    let raw_rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override).await?;
+    let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
+    }
+    let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    if let Some(client) = &state.event_client {
+        for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
+            spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, api_row, tid.clone(), None);
+        }
     }
     let count = rows.len() as u64;
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
