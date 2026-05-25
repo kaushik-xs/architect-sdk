@@ -52,7 +52,7 @@ impl DecisionHubClient {
                 tracing::warn!(event_type = %event_type, error = %e, "decision-hub publish failed");
             }
             Ok(_) => {
-                tracing::debug!(event_type = %event_type, "decision-hub event sent");
+                tracing::info!(event_type = %event_type, "decision-hub event accepted");
             }
         }
     }
@@ -164,6 +164,12 @@ pub fn spawn_events(
                 .as_deref()
                 .unwrap_or_else(|| default_event_name(trigger.on.as_str()));
             let event_type = format!("{}.{}:{}", package_id, table_name, suffix);
+            tracing::info!(
+                tenant_id = %tenant_id,
+                event_type = %event_type,
+                lifecycle = %lifecycle,
+                "publishing decision-hub event"
+            );
             let context = serde_json::json!({
                 "entity": api_row,
                 "operation": lifecycle,
