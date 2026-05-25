@@ -221,6 +221,35 @@ pub struct AssetColumnConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventCondition {
+    /// Column name (snake_case) to inspect on the saved row.
+    pub field: String,
+    /// Fire when the field's new value equals this (post-update check).
+    #[serde(default)]
+    pub changed_to: Option<serde_json::Value>,
+    /// Fire when the field's current value equals this.
+    #[serde(default)]
+    pub equals: Option<serde_json::Value>,
+    /// true = fire when field is non-null; false = fire when null.
+    #[serde(default)]
+    pub not_null: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EntityEventTrigger {
+    pub id: String,
+    /// Lifecycle hook: "create" | "update" | "delete" | "archive".
+    pub on: String,
+    /// Suffix of the event type sent to decision-hub.
+    /// Defaults to "created" / "updated" / "deleted" / "archived" when omitted.
+    #[serde(default)]
+    pub event_name: Option<String>,
+    /// Only fire when this condition is satisfied against the saved row (snake_case keys).
+    #[serde(default)]
+    pub condition: Option<EventCondition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiEntityConfig {
     pub entity_id: String,
     pub path_segment: String,
@@ -230,6 +259,12 @@ pub struct ApiEntityConfig {
     pub sensitive_columns: Vec<String>,
     #[serde(default)]
     pub validation: std::collections::HashMap<String, ValidationRule>,
+    /// Column whose null→non-null transition signals an archive. Required for on:"archive" triggers.
+    #[serde(default)]
+    pub archive_field: Option<String>,
+    /// Decision-hub event triggers for this entity.
+    #[serde(default)]
+    pub events: Vec<EntityEventTrigger>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

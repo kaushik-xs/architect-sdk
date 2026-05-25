@@ -57,10 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     apply_migrations(&pool, &config, None, None).await?;
-    let model = resolve(&config)?;
+    let model = resolve(&config)?.with_package_id(&package_id);
     let mut package_models = HashMap::new();
     package_models.insert(package_id.clone(), model.clone());
     let storage = architect_sdk::init_storage_provider().await;
+    let event_client = architect_sdk::events::DecisionHubClient::from_env();
     let state = AppState {
         pool: pool.clone(),
         model: Arc::new(RwLock::new(model)),
@@ -68,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tenant_pools: Arc::new(RwLock::new(HashMap::new())),
         tenant_registry: Arc::new(tenant_registry),
         storage,
+        event_client,
     };
 
     let api = Router::new()

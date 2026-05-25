@@ -496,7 +496,7 @@ pub async fn install_package(
         .collect();
 
     // Rebuild the in-memory ResolvedModel once and populate every tenant cache slot.
-    let new_model = resolve(&config).map_err(AppError::Config)?;
+    let new_model = resolve(&config).map_err(AppError::Config)?.with_package_id(id);
     {
         let mut model_guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
         *model_guard = new_model.clone();
@@ -936,7 +936,7 @@ pub async fn apply_migration_handler(
 
     // Reload in-memory model
     let new_config = load_from_pool(config_pool, &row.package_id).await.map_err(AppError::Config)?;
-    let new_model = resolve(&new_config).map_err(AppError::Config)?;
+    let new_model = resolve(&new_config).map_err(AppError::Config)?.with_package_id(&row.package_id);
     {
         let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
         *guard = new_model.clone();
@@ -1018,7 +1018,7 @@ pub async fn bootstrap_tenant_handler(
     apply_migrations(&pool, &config, None, None).await?;
 
     // Populate the model cache for this tenant so entity routes resolve without a reload.
-    let model = crate::config::resolve(&config).map_err(AppError::Config)?;
+    let model = crate::config::resolve(&config).map_err(AppError::Config)?.with_package_id(&package_id);
     {
         state
             .package_models

@@ -1,6 +1,7 @@
 //! Shared application state for all routes. Model is reloadable after package install.
 
 use crate::config::ResolvedModel;
+use crate::events::DecisionHubClient;
 use crate::storage::StorageProvider;
 use crate::tenant::TenantRegistry;
 use sqlx::PgPool;
@@ -22,4 +23,6 @@ pub struct AppState {
     /// Optional blob storage provider for asset columns (S3 or RustFS).
     /// Initialised from STORAGE_PROVIDER env var; None when not configured.
     pub storage: Option<Arc<dyn StorageProvider>>,
+    /// Optional decision-hub client. None when DECISION_HUB_URL is not set (events disabled).
+    pub event_client: Option<Arc<DecisionHubClient>>,
 }

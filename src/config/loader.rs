@@ -128,6 +128,9 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             sensitive_columns,
             includes,
             validation: api.validation.clone(),
+            events: api.events.clone(),
+            archive_field: api.archive_field.clone(),
+            package_id: String::new(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);

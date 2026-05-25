@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tenant_pools: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         tenant_registry: Arc::new(_registry),
         storage: None,
+        event_client: architect_sdk::events::DecisionHubClient::from_env(),
     };
 
     let app = common_routes_with_ready(state);

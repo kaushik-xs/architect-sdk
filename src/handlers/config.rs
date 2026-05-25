@@ -47,7 +47,7 @@ pub(crate) async fn replace_config(
 /// Reload in-memory model from DB so new/updated entities are available without restart. Loads config for DEFAULT_PACKAGE_ID.
 pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
     let config = load_from_pool(&state.pool, DEFAULT_PACKAGE_ID).await.map_err(AppError::Config)?;
-    let new_model = resolve(&config).map_err(AppError::Config)?;
+    let new_model = resolve(&config).map_err(AppError::Config)?.with_package_id(DEFAULT_PACKAGE_ID);
     let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
     *guard = new_model;
     Ok(())

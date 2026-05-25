@@ -3,6 +3,7 @@
 pub mod case;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod extractors;
 pub mod migration;
 pub mod response;

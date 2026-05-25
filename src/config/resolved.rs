@@ -1,6 +1,6 @@
 //! Resolved entity model: config validated and flattened for runtime use.
 
-use crate::config::types::AssetColumnConfig;
+use crate::config::types::{AssetColumnConfig, EntityEventTrigger};
 use crate::config::ValidationRule;
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +66,12 @@ pub struct ResolvedEntity {
     /// Available includes (related entities) for ?include= name1,name2. Built from relationships.
     pub includes: Vec<IncludeSpec>,
     pub validation: HashMap<String, ValidationRule>,
+    /// Decision-hub event triggers. Empty when no events are configured.
+    pub events: Vec<EntityEventTrigger>,
+    /// Column whose null→non-null transition signals an archive (for on:"archive" triggers).
+    pub archive_field: Option<String>,
+    /// Package id this entity belongs to. Set via ResolvedModel::with_package_id().
+    pub package_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -77,5 +83,17 @@ pub struct ResolvedModel {
 impl ResolvedModel {
     pub fn entity_by_path(&self, path: &str) -> Option<&ResolvedEntity> {
         self.entity_by_path.get(path)
+    }
+
+    /// Backfill `package_id` on all contained entities. Call this after `resolve()` when the
+    /// package id is known (e.g. from manifest.id or the route parameter).
+    pub fn with_package_id(mut self, package_id: &str) -> Self {
+        for e in &mut self.entities {
+            e.package_id = package_id.to_string();
+        }
+        for e in self.entity_by_path.values_mut() {
+            e.package_id = package_id.to_string();
+        }
+        self
     }
 }
