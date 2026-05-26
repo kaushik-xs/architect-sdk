@@ -122,7 +122,22 @@ pub async fn check_entity_permission_opt(
 
     let allowed = client.check(tenant_id, user_id, &resource, &action).await?;
 
-    if !allowed {
+    if allowed {
+        tracing::info!(
+            user_id = %user_id,
+            tenant_id = %tenant_id,
+            resource = %resource,
+            action = %action,
+            "permission granted"
+        );
+    } else {
+        tracing::warn!(
+            user_id = %user_id,
+            tenant_id = %tenant_id,
+            resource = %resource,
+            action = %action,
+            "permission denied"
+        );
         return Err(AppError::Unauthorized(format!(
             "action '{}' not permitted on '{}'",
             action, resource
