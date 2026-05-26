@@ -38,6 +38,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("storage: {0}")]
     Storage(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 #[derive(Serialize)]
@@ -69,6 +71,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
         };
         let body = ErrorBody {
             error: ErrorDetail {

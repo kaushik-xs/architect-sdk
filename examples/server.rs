@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     package_models.insert(package_id.clone(), model.clone());
     let storage = architect_sdk::init_storage_provider().await;
     let event_client = architect_sdk::events::DecisionHubClient::from_env();
+    let authrs_client = architect_sdk::authrs::AuthrsClient::from_env();
     let state = AppState {
         pool: pool.clone(),
         model: Arc::new(RwLock::new(model)),
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tenant_registry: Arc::new(tenant_registry),
         storage,
         event_client,
+        authrs_client,
     };
 
     let api = Router::new()

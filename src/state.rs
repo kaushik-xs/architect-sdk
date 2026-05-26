@@ -1,5 +1,6 @@
 //! Shared application state for all routes. Model is reloadable after package install.
 
+use crate::authrs::AuthrsClient;
 use crate::config::ResolvedModel;
 use crate::events::DecisionHubClient;
 use crate::storage::StorageProvider;
@@ -25,4 +26,6 @@ pub struct AppState {
     pub storage: Option<Arc<dyn StorageProvider>>,
     /// Optional decision-hub client. None when DECISION_HUB_URL is not set (events disabled).
     pub event_client: Option<Arc<DecisionHubClient>>,
+    /// Optional authrs permission-check client. None when AUTHRS_URL or SERVICE_NAME is not set (checks disabled).
+    pub authrs_client: Option<Arc<AuthrsClient>>,
 }

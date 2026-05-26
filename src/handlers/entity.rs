@@ -6,6 +6,7 @@ use crate::config::{load_from_pool, resolve, IncludeDirection, PkType, ResolvedM
 use crate::error::AppError;
 use crate::events::spawn_events;
 use crate::extractors::tenant::TenantId;
+use crate::extractors::user::UserId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
 use crate::sql::{parse_rsql, parse_sort, FilterNode, IncludeSelect};
 use crate::state::AppState;
@@ -744,6 +745,7 @@ fn collect_dotted_prefixes_rec(node: &FilterNode, out: &mut Vec<String>) {
 pub async fn list(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -766,6 +768,7 @@ pub async fn list(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
@@ -891,6 +894,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -911,6 +915,7 @@ pub async fn create(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
 
     // Dispatch by Content-Type: multipart for file uploads, JSON for everything else.
     let is_multipart = request
@@ -950,6 +955,7 @@ pub async fn create(
 pub async fn read(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -969,6 +975,7 @@ pub async fn read(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     let mut row = CrudService::read(&mut executor, &entity, &id, schema_override).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
@@ -1004,6 +1011,7 @@ pub async fn read(
 pub async fn update(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1024,6 +1032,7 @@ pub async fn update(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
 
     let is_multipart = request
@@ -1077,6 +1086,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
@@ -1095,6 +1105,7 @@ pub async fn delete(
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     // Prefetch the full row before deletion so event conditions can be evaluated against real
     // field values and the event context contains the complete entity (not just the id).
@@ -1125,6 +1136,7 @@ pub async fn delete(
 pub async fn bulk_create(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1144,6 +1156,7 @@ pub async fn bulk_create(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1182,6 +1195,7 @@ pub async fn bulk_create(
 pub async fn bulk_update(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1201,6 +1215,7 @@ pub async fn bulk_update(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1242,6 +1257,7 @@ pub async fn bulk_update(
 pub async fn list_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1262,6 +1278,7 @@ pub async fn list_package(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
@@ -1362,6 +1379,7 @@ pub async fn list_package(
 pub async fn create_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1383,6 +1401,7 @@ pub async fn create_package(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
 
     let is_multipart = request
         .headers()
@@ -1421,6 +1440,7 @@ pub async fn create_package(
 pub async fn read_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1441,6 +1461,7 @@ pub async fn read_package(
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     let mut row = CrudService::read(&mut executor, &entity, &id, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str.clone()))?;
     let include_names: Vec<String> = params.get("include").map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
@@ -1468,6 +1489,7 @@ pub async fn read_package(
 pub async fn update_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1489,6 +1511,7 @@ pub async fn update_package(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
 
     let is_multipart = request
@@ -1528,6 +1551,7 @@ pub async fn update_package(
 pub async fn delete_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
@@ -1547,6 +1571,7 @@ pub async fn delete_package(
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     // Prefetch the full row before deletion so event conditions can be evaluated against real
     // field values and the event context contains the complete entity (not just the id).
@@ -1577,6 +1602,7 @@ pub async fn delete_package(
 pub async fn bulk_create_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1597,6 +1623,7 @@ pub async fn bulk_create_package(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1629,6 +1656,7 @@ pub async fn bulk_create_package(
 pub async fn bulk_update_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -1649,6 +1677,7 @@ pub async fn bulk_update_package(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();

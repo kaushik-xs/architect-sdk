@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tenant_registry: Arc::new(_registry),
         storage: None,
         event_client: architect_sdk::events::DecisionHubClient::from_env(),
+        authrs_client: architect_sdk::authrs::AuthrsClient::from_env(),
     };
 
     let app = common_routes_with_ready(state);
