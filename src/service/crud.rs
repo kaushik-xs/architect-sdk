@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
+use crate::sql::{archive, delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, unarchive, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -117,6 +117,32 @@ impl CrudService {
         schema_override: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = delete(entity, schema_override);
+        Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
+    }
+
+    /// Archive one row by id: stamps archive_field with NOW() if it is currently NULL.
+    /// Returns the updated row, or None if the record was not found or already archived.
+    pub async fn archive<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        archive_field: &str,
+        id: &Value,
+        schema_override: Option<&str>,
+    ) -> Result<Option<Value>, AppError> {
+        let q = archive(entity, archive_field, schema_override);
+        Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
+    }
+
+    /// Unarchive one row by id: clears archive_field (sets to NULL) if it is currently NOT NULL.
+    /// Returns the updated row, or None if the record was not found or not archived.
+    pub async fn unarchive<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        archive_field: &str,
+        id: &Value,
+        schema_override: Option<&str>,
+    ) -> Result<Option<Value>, AppError> {
+        let q = unarchive(entity, archive_field, schema_override);
         Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
     }
 

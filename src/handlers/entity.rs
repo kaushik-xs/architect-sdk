@@ -1706,3 +1706,227 @@ pub async fn bulk_update_package(
     let count = rows.len() as u64;
     Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
 }
+
+/// Archive a single entity by id (default model).
+/// POST /api/v1/:path_segment/:id/archive
+/// Stamps archive_field with NOW(); returns 404 if not found or already archived.
+/// Authrs action: archive{PascalCaseName} (dedicated permission, not reusing patch/delete).
+pub async fn archive(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((path_segment, id_str)): Path<(String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
+    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls { tenant_id, pool, .. } => {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            rls_conn = Some(conn);
+            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+        }
+    };
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "archive") {
+        return Err(AppError::BadRequest("archive not allowed".into()));
+    }
+    let archive_field = entity
+        .archive_field
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "archive",
+    )
+    .await?;
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let mut row = CrudService::archive(&mut executor, &entity, archive_field, &id, schema_override)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    let raw_row = row.clone();
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "archive", raw_row, row.clone(), tenant_id_str, None);
+    }
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+/// Unarchive a single entity by id (default model).
+/// POST /api/v1/:path_segment/:id/unarchive
+/// Clears archive_field (sets to NULL); returns 404 if not found or not currently archived.
+/// Authrs action: unarchive{PascalCaseName} (dedicated permission, separate from archive).
+pub async fn unarchive(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((path_segment, id_str)): Path<(String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
+    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls { tenant_id, pool, .. } => {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            rls_conn = Some(conn);
+            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+        }
+    };
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "unarchive") {
+        return Err(AppError::BadRequest("unarchive not allowed".into()));
+    }
+    let archive_field = entity
+        .archive_field
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "unarchive",
+    )
+    .await?;
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let mut row = CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    let raw_row = row.clone();
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "unarchive", raw_row, row.clone(), tenant_id_str, None);
+    }
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+/// Unarchive a single entity by id (package-scoped model).
+/// POST /api/v1/package/:package_id/:path_segment/:id/unarchive
+pub async fn unarchive_package(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
+    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls { tenant_id, pool, .. } => {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            rls_conn = Some(conn);
+            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+        }
+    };
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "unarchive") {
+        return Err(AppError::BadRequest("unarchive not allowed".into()));
+    }
+    let archive_field = entity
+        .archive_field
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "unarchive",
+    )
+    .await?;
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let mut row = CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    let raw_row = row.clone();
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "unarchive", raw_row, row.clone(), tenant_id_str, None);
+    }
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}
+
+/// Archive a single entity by id (package-scoped model).
+/// POST /api/v1/package/:package_id/:path_segment/:id/archive
+pub async fn archive_package(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
+    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls { tenant_id, pool, .. } => {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            rls_conn = Some(conn);
+            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+        }
+    };
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
+    if !entity.operations.iter().any(|o| o == "archive") {
+        return Err(AppError::BadRequest("archive not allowed".into()));
+    }
+    let archive_field = entity
+        .archive_field
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "archive",
+    )
+    .await?;
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let mut row = CrudService::archive(&mut executor, &entity, archive_field, &id, schema_override)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    let raw_row = row.clone();
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+    if let Some(client) = &state.event_client {
+        spawn_events(std::sync::Arc::clone(client), &entity, "archive", raw_row, row.clone(), tenant_id_str, None);
+    }
+    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+}

@@ -631,6 +631,10 @@ pub fn insert(
         if c.pk_type.is_some() && !include_pk {
             continue;
         }
+        // archive_field may only be written via the dedicated archive endpoint, never via POST/create.
+        if entity.archive_field.as_deref().is_some_and(|af| name == af) {
+            continue;
+        }
         let val = body.get(name).cloned();
         if val.is_none() && c.has_default {
             continue;
@@ -683,6 +687,10 @@ pub fn update(
         if k == "tenant_id" {
             continue;
         }
+        // archive_field may only be written via the dedicated archive endpoint, never via PATCH.
+        if entity.archive_field.as_deref().is_some_and(|af| k == af) {
+            continue;
+        }
         let Some(c) = col_by_name.get(k.as_str()) else { continue };
         let v = coerce_json_value_for_pg_array(v.clone(), c.pg_type.as_deref());
         let param_num = q.push_param(v);
@@ -727,5 +735,49 @@ pub fn delete(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBu
     let ph = pk_placeholder(entity, 1);
     q.params.push(Value::Null);
     q.sql = format!("DELETE FROM {} WHERE {} = {} RETURNING {}", table, quoted(pk), ph, returning);
+    q
+}
+
+/// UPDATE by id: clear archive_field (set to NULL) where it is currently NOT NULL.
+/// Returns the updated row or None (record not found or not archived).
+pub fn unarchive(entity: &ResolvedEntity, archive_field: &str, schema_override: Option<&str>) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
+    let pk = &entity.pk_columns[0];
+    let returning = select_column_list(entity);
+    let ph = pk_placeholder(entity, 1);
+    q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    q.sql = format!(
+        "UPDATE {} SET {} = NULL WHERE {} = {} AND {} IS NOT NULL RETURNING {}",
+        table,
+        quoted(archive_field),
+        quoted(pk),
+        ph,
+        quoted(archive_field),
+        returning
+    );
+    q
+}
+
+/// UPDATE by id: stamp archive_field with NOW() where it is currently NULL.
+/// Returns the updated row or None (record not found or already archived).
+pub fn archive(entity: &ResolvedEntity, archive_field: &str, schema_override: Option<&str>) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let table = qualified_table(schema, &entity.table_name);
+    let pk = &entity.pk_columns[0];
+    let returning = select_column_list(entity);
+    let ph = pk_placeholder(entity, 1);
+    q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    q.sql = format!(
+        "UPDATE {} SET {} = NOW() WHERE {} = {} AND {} IS NULL RETURNING {}",
+        table,
+        quoted(archive_field),
+        quoted(pk),
+        ph,
+        quoted(archive_field),
+        returning
+    );
     q
 }
