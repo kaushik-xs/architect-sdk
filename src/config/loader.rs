@@ -129,7 +129,13 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             includes,
             validation: api.validation.clone(),
             events: api.events.clone(),
-            archive_field: api.archive_field.clone(),
+            archive_field: api.archive_field.clone().or_else(|| {
+                if api.operations.iter().any(|o| o == "archive" || o == "unarchive") {
+                    Some("archived_at".to_string())
+                } else {
+                    None
+                }
+            }),
             package_id: String::new(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());

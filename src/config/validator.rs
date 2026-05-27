@@ -19,15 +19,6 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
     let table_ids: HashSet<&str> = config.tables.iter().map(|t| t.id.as_str()).collect();
     let column_ids: HashSet<&str> = config.columns.iter().map(|c| c.id.as_str()).collect();
 
-    // Build map of table_id → set of column names for archive_field validation.
-    let table_column_names: std::collections::HashMap<&str, HashSet<&str>> = {
-        let mut m: std::collections::HashMap<&str, HashSet<&str>> = std::collections::HashMap::new();
-        for c in &config.columns {
-            m.entry(c.table_id.as_str()).or_default().insert(c.name.as_str());
-        }
-        m
-    };
-
     for e in &config.enums {
         let sid = e.schema_id.as_deref().unwrap_or(default_sid);
         if !schema_ids.contains(sid) {
@@ -112,26 +103,6 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
         }
         if !path_segments.insert(api.path_segment.as_str()) {
             return Err(ConfigError::DuplicatePathSegment(api.path_segment.clone()));
-        }
-        // Validate archive/unarchive operations: archive_field must be set and exist on the table.
-        let needs_archive_field = api.operations.iter().any(|o| o == "archive" || o == "unarchive");
-        if needs_archive_field {
-            let archive_field = api.archive_field.as_deref().ok_or_else(|| {
-                ConfigError::Validation(format!(
-                    "api_entity '{}': operations 'archive'/'unarchive' require archive_field to be set",
-                    api.path_segment
-                ))
-            })?;
-            let cols = table_column_names
-                .get(api.entity_id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            if !cols.contains(archive_field) {
-                return Err(ConfigError::Validation(format!(
-                    "api_entity '{}': archive_field '{}' does not exist on table '{}'",
-                    api.path_segment, archive_field, api.entity_id
-                )));
-            }
         }
     }
 
