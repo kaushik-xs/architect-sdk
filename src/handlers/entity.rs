@@ -110,10 +110,15 @@ struct UploadedFile {
 }
 
 /// Parse a multipart request into a text body map and a list of file fields.
+///
+/// Repeated text parts with the same field name are collected into a `Value::Array`
+/// so that callers can send multiple existing paths for an `asset[]` column alongside
+/// new file uploads under the same field name.
 async fn parse_multipart(
     mut multipart: axum::extract::Multipart,
 ) -> Result<(HashMap<String, Value>, Vec<UploadedFile>), AppError> {
-    let mut body: HashMap<String, Value> = HashMap::new();
+    // Accumulate all text values per field before converting to Value.
+    let mut text_fields: HashMap<String, Vec<String>> = HashMap::new();
     let mut files: Vec<UploadedFile> = Vec::new();
 
     while let Some(field) = multipart
@@ -140,9 +145,23 @@ async fn parse_multipart(
         } else {
             let text = String::from_utf8(data)
                 .map_err(|e| AppError::BadRequest(format!("field '{}' is not valid UTF-8: {}", field_name, e)))?;
-            body.insert(field_name, Value::String(text));
+            text_fields.entry(field_name).or_default().push(text);
         }
     }
+
+    // Convert: single value → Value::String, multiple values → Value::Array.
+    let body = text_fields
+        .into_iter()
+        .map(|(k, mut vals)| {
+            let v = if vals.len() == 1 {
+                Value::String(vals.remove(0))
+            } else {
+                Value::Array(vals.into_iter().map(Value::String).collect())
+            };
+            (k, v)
+        })
+        .collect();
+
     Ok((body, files))
 }
 
@@ -185,8 +204,14 @@ async fn process_asset_uploads(
         }
 
         if col.asset_is_array {
-            // Upload each file and collect paths into a JSON array.
-            let mut paths: Vec<Value> = Vec::new();
+            // Seed with any existing paths sent as text parts (Option B merge semantics):
+            // clients re-send paths they want to keep; omitted paths are dropped.
+            let mut paths: Vec<Value> = match body.get(&col_name) {
+                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::String(s)) if !s.is_empty() => vec![Value::String(s.clone())],
+                _ => Vec::new(),
+            };
+            // Upload new files and append their paths.
             for file in group {
                 if let Some(rule) = entity.validation.get(&col_name) {
                     validate_asset_field(&col_name, &file.filename, &file.content_type, file.data.len(), rule)?;
@@ -418,6 +443,95 @@ async fn sign_row_assets(
         }
     }
     Ok(())
+}
+
+// ── Asset storage cleanup helpers ────────────────────────────────────────────
+
+/// Extract all non-empty path strings stored in an asset or asset[] column of a DB row.
+fn collect_row_asset_paths(row: &Value, col_name: &str) -> Vec<String> {
+    match row.get(col_name) {
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                if let Value::String(s) = v {
+                    if !s.is_empty() { Some(s.clone()) } else { None }
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Best-effort delete of asset files that were present in `old_row` but are absent from
+/// `new_body` after a PATCH update. Only checks columns that appear in `new_body` (PATCH
+/// partial-update semantics: columns not included in the body are not being changed).
+/// Errors are logged as warnings — storage failures never abort the database write.
+async fn delete_dropped_asset_paths(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    old_row: &Value,
+    new_body: &HashMap<String, Value>,
+) {
+    let storage = match &state.storage {
+        Some(s) => s,
+        None => return,
+    };
+
+    let new_paths_for = |col_name: &str| -> HashSet<String> {
+        match new_body.get(col_name) {
+            Some(Value::String(s)) if !s.is_empty() => {
+                let mut set = HashSet::new();
+                set.insert(s.clone());
+                set
+            }
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| if let Value::String(s) = v { Some(s.clone()) } else { None })
+                .collect(),
+            _ => HashSet::new(),
+        }
+    };
+
+    for col in &entity.columns {
+        if !col.is_asset {
+            continue;
+        }
+        // Skip columns not being updated in this PATCH (not in body → unchanged).
+        if !new_body.contains_key(&col.name) {
+            continue;
+        }
+        let old_paths = collect_row_asset_paths(old_row, &col.name);
+        let new_paths = new_paths_for(&col.name);
+        for path in old_paths {
+            if !new_paths.contains(&path) {
+                if let Err(e) = storage.delete(&path).await {
+                    tracing::warn!(path = %path, error = %e, "failed to delete dropped asset from storage");
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort delete of all asset files attached to a row, called when the DB record
+/// itself is being deleted. Errors are logged as warnings.
+async fn delete_all_asset_paths(state: &AppState, entity: &ResolvedEntity, row: &Value) {
+    let storage = match &state.storage {
+        Some(s) => s,
+        None => return,
+    };
+    for col in &entity.columns {
+        if !col.is_asset {
+            continue;
+        }
+        for path in collect_row_asset_paths(row, &col.name) {
+            if let Err(e) = storage.delete(&path).await {
+                tracing::warn!(path = %path, error = %e, "failed to delete asset from storage on record delete");
+            }
+        }
+    }
 }
 
 /// Resolve include names to (name, spec, related_entity). Call with model read lock held.
@@ -1060,13 +1174,17 @@ pub async fn update(
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
 
-    // Pre-fetch the current DB row so changed_to conditions can detect genuine transitions.
-    // Only pays the extra round-trip when the entity has update triggers with changed_to conditions.
-    let pre_update_row = if state.event_client.is_some()
-        && entity.events.iter().any(|e| {
-            e.on == "update"
-                && e.condition.as_ref().map_or(false, |c| c.changed_to.is_some())
-        }) {
+    // Pre-fetch the current DB row when needed:
+    //   • entity has asset columns + storage configured → hard-delete dropped files after update
+    //   • event triggers with changed_to conditions → detect genuine field transitions
+    let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
+    let needs_pre_read = (entity_has_assets && state.storage.is_some())
+        || (state.event_client.is_some()
+            && entity.events.iter().any(|e| {
+                e.on == "update"
+                    && e.condition.as_ref().map_or(false, |c| c.changed_to.is_some())
+            }));
+    let pre_update_row = if needs_pre_read {
         CrudService::read(&mut executor, &entity, &id, schema_override).await?
     } else {
         None
@@ -1074,6 +1192,14 @@ pub async fn update(
 
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
+
+    // Hard-delete any asset files dropped from storage after a successful DB write.
+    if let Some(ref old_row) = pre_update_row {
+        if entity_has_assets {
+            delete_dropped_asset_paths(&state, &entity, old_row, &body).await;
+        }
+    }
+
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -1107,14 +1233,24 @@ pub async fn delete(
     }
     crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    // Prefetch the full row before deletion so event conditions can be evaluated against real
-    // field values and the event context contains the complete entity (not just the id).
-    let pre_delete_row = if state.event_client.is_some() && !entity.events.is_empty() {
+    // Prefetch the full row before deletion for event triggers and asset storage cleanup.
+    let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
+    let pre_delete_row = if (state.event_client.is_some() && !entity.events.is_empty())
+        || (entity_has_assets && state.storage.is_some())
+    {
         CrudService::read(&mut executor, &entity, &id, schema_override).await?
     } else {
         None
     };
     CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
+
+    // Hard-delete all asset files belonging to this record after a successful DB delete.
+    if let Some(ref old_row) = pre_delete_row {
+        if entity_has_assets {
+            delete_all_asset_paths(&state, &entity, old_row).await;
+        }
+    }
+
     if let Some(client) = &state.event_client {
         let raw_row = pre_delete_row.unwrap_or_else(|| serde_json::json!({ "id": id_str }));
         let mut api_row = raw_row.clone();
@@ -1538,7 +1674,24 @@ pub async fn update_package(
     }
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
+
+    // Pre-read for asset hard-delete on PATCH.
+    let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
+    let pre_update_row = if entity_has_assets && state.storage.is_some() {
+        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+    } else {
+        None
+    };
+
     let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str))?;
+
+    // Hard-delete dropped asset files after a successful DB write.
+    if let Some(ref old_row) = pre_update_row {
+        if entity_has_assets {
+            delete_dropped_asset_paths(&state, &entity, old_row, &body).await;
+        }
+    }
+
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -1573,14 +1726,24 @@ pub async fn delete_package(
     }
     crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    // Prefetch the full row before deletion so event conditions can be evaluated against real
-    // field values and the event context contains the complete entity (not just the id).
-    let pre_delete_row = if state.event_client.is_some() && !entity.events.is_empty() {
+    // Prefetch the full row before deletion for event triggers and asset storage cleanup.
+    let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
+    let pre_delete_row = if (state.event_client.is_some() && !entity.events.is_empty())
+        || (entity_has_assets && state.storage.is_some())
+    {
         CrudService::read(&mut executor, &entity, &id, schema_override).await?
     } else {
         None
     };
     CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
+
+    // Hard-delete all asset files belonging to this record after a successful DB delete.
+    if let Some(ref old_row) = pre_delete_row {
+        if entity_has_assets {
+            delete_all_asset_paths(&state, &entity, old_row).await;
+        }
+    }
+
     if let Some(client) = &state.event_client {
         let raw_row = pre_delete_row.unwrap_or_else(|| serde_json::json!({ "id": id_str }));
         let mut api_row = raw_row.clone();
