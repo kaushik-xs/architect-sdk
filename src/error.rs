@@ -8,6 +8,13 @@ use axum::{
 use serde::Serialize;
 use thiserror::Error;
 
+#[derive(Serialize, Debug, Clone)]
+pub struct BulkFieldError {
+    pub index: usize,
+    pub field: String,
+    pub message: String,
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("missing reference: {kind} id '{id}'")]
@@ -40,6 +47,8 @@ pub enum AppError {
     Storage(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("bulk validation failed")]
+    BulkValidation(Vec<BulkFieldError>),
 }
 
 #[derive(Serialize)]
@@ -57,6 +66,17 @@ pub struct ErrorDetail {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::BulkValidation(ref errors) = self {
+            let affected: std::collections::HashSet<usize> = errors.iter().map(|e| e.index).collect();
+            let body = ErrorBody {
+                error: ErrorDetail {
+                    code: "bulk_validation_error".to_string(),
+                    message: format!("Validation failed for {} item(s)", affected.len()),
+                    details: Some(serde_json::to_value(errors).unwrap_or(serde_json::Value::Null)),
+                },
+            };
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
         let (status, code) = match &self {
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
@@ -72,6 +92,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::BulkValidation(_) => unreachable!(),
         };
         let body = ErrorBody {
             error: ErrorDetail {

@@ -94,6 +94,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             ("updated_at", false, true, Some("timestamptz")),
             ("archived_at", true, false, Some("timestamptz")),
             ("created_by", true, false, None),
+            ("updated_by", true, false, None),
         ] {
             if !config_col_names.contains(name) {
                 columns.push(ColumnInfo {

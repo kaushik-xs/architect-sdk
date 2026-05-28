@@ -83,29 +83,33 @@ impl CrudService {
 
     /// Insert one row; body may include or omit PK (if has default). Returns created row.
     /// When rls_tenant_id is Some (RLS strategy), tenant_id column is set automatically.
+    /// When caller_user_id is Some, created_by is set to that value.
     pub async fn create<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         body: &HashMap<String, Value>,
         schema_override: Option<&str>,
         rls_tenant_id: Option<&str>,
+        caller_user_id: Option<&str>,
     ) -> Result<Value, AppError> {
         let include_pk = body.contains_key(&entity.pk_columns[0]);
-        let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
+        let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
         let row = Self::execute_returning_one_exec(executor, &q).await?
             .ok_or_else(|| AppError::Db(sqlx::Error::RowNotFound))?;
         Ok(row)
     }
 
     /// Update one row by id. Returns updated row.
+    /// When caller_user_id is Some, updated_by is set to that value.
     pub async fn update<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         id: &Value,
         body: &HashMap<String, Value>,
         schema_override: Option<&str>,
+        caller_user_id: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
-        let q = update(entity, id, body, schema_override);
+        let q = update(entity, id, body, schema_override, caller_user_id);
         Self::execute_returning_one_exec(executor, &q).await
     }
 
@@ -148,12 +152,14 @@ impl CrudService {
 
     /// Bulk create in a transaction (when using pool) or on the same connection (when using conn). Returns vec of created rows.
     /// When rls_tenant_id is Some (RLS strategy), tenant_id column is set automatically on each row.
+    /// When caller_user_id is Some, created_by is set on each row.
     pub async fn bulk_create<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         items: &[HashMap<String, Value>],
         schema_override: Option<&str>,
         rls_tenant_id: Option<&str>,
+        caller_user_id: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -168,7 +174,7 @@ impl CrudService {
                 let mut tx = pool.begin().await?;
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
                     let row = Self::execute_returning_one_tx(&mut tx, &q).await?.unwrap_or(Value::Null);
                     out.push(row);
                 }
@@ -177,7 +183,7 @@ impl CrudService {
             TenantExecutor::Conn(conn) => {
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
                     let row = Self::execute_returning_one_conn(&mut **conn, &q).await?.unwrap_or(Value::Null);
                     out.push(row);
                 }
@@ -187,11 +193,13 @@ impl CrudService {
     }
 
     /// Bulk update in a transaction (when using pool) or on the same connection (when using conn). Each item must have id. Returns vec of updated rows.
+    /// When caller_user_id is Some, updated_by is set on each row.
     pub async fn bulk_update<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         items: &[HashMap<String, Value>],
         schema_override: Option<&str>,
+        caller_user_id: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -209,7 +217,7 @@ impl CrudService {
                     let id = body.get(pk).ok_or_else(|| AppError::Validation(format!("each item must have '{}'", pk)))?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(entity, id, &body_without_pk, schema_override);
+                    let q = update(entity, id, &body_without_pk, schema_override, caller_user_id);
                     if let Some(row) = Self::execute_returning_one_tx(&mut tx, &q).await? {
                         out.push(row);
                     }
@@ -221,7 +229,7 @@ impl CrudService {
                     let id = body.get(pk).ok_or_else(|| AppError::Validation(format!("each item must have '{}'", pk)))?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(entity, id, &body_without_pk, schema_override);
+                    let q = update(entity, id, &body_without_pk, schema_override, caller_user_id);
                     if let Some(row) = Self::execute_returning_one_conn(&mut **conn, &q).await? {
                         out.push(row);
                     }

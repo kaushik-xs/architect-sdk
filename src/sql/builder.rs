@@ -620,6 +620,7 @@ pub fn insert(
     include_pk: bool,
     schema_override: Option<&str>,
     rls_tenant_id: Option<&str>,
+    caller_user_id: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -635,7 +636,17 @@ pub fn insert(
         if entity.archive_field.as_deref().is_some_and(|af| name == af) {
             continue;
         }
-        let val = body.get(name).cloned();
+        // updated_by is only meaningful on updates, leave NULL on insert.
+        if name == "updated_by" {
+            continue;
+        }
+        let val = if name == "created_by" {
+            caller_user_id
+                .map(|uid| Value::String(uid.to_string()))
+                .or_else(|| body.get(name).cloned())
+        } else {
+            body.get(name).cloned()
+        };
         if val.is_none() && c.has_default {
             continue;
         }
@@ -673,6 +684,7 @@ pub fn update(
     id: &Value,
     body: &HashMap<String, Value>,
     schema_override: Option<&str>,
+    caller_user_id: Option<&str>,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -702,6 +714,12 @@ pub fn update(
         sets.push(format!("{} = {}", quoted(k), rhs));
     }
     sets.push(format!("{} = NOW()", quoted("updated_at")));
+    if let Some(uid) = caller_user_id {
+        if entity.columns.iter().any(|c| c.name == "updated_by") {
+            let param_num = q.push_param(Value::String(uid.to_string()));
+            sets.push(format!("{} = ${}", quoted("updated_by"), param_num));
+        }
+    }
     if sets.is_empty() {
         let cols = select_column_list(entity);
         let ph = pk_placeholder(entity, 1);

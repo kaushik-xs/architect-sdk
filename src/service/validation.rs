@@ -38,6 +38,28 @@ impl RequestValidator {
         }
         Ok(())
     }
+
+    /// Like `validate` but collects all errors instead of stopping at the first.
+    /// Returns a vec of (field, message) pairs.
+    pub fn validate_collecting(
+        body: &HashMap<String, Value>,
+        rules: &HashMap<String, ValidationRule>,
+    ) -> Vec<(String, String)> {
+        let mut errors = Vec::new();
+        for (col, rule) in rules {
+            let val = body.get(col);
+            if rule.required == Some(true) && (val.is_none() || val == Some(&Value::Null)) {
+                errors.push((col.clone(), format!("{} is required", col)));
+                continue;
+            }
+            if let Some(v) = val {
+                if let Err(AppError::Validation(msg)) = validate_field(col, v, rule) {
+                    errors.push((col.clone(), msg));
+                }
+            }
+        }
+        errors
+    }
 }
 
 fn validate_field(col: &str, v: &Value, rule: &ValidationRule) -> Result<(), AppError> {

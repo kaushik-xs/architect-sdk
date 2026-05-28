@@ -1,9 +1,9 @@
 //! Entity CRUD handlers: create, read, update, delete, list, bulk.
 //! Request bodies and query param keys are accepted in camelCase and converted to snake_case for DB; response row keys are converted to camelCase.
 
-use crate::case::{hashmap_keys_to_snake_case, to_snake_case, value_keys_to_camel_case};
+use crate::case::{hashmap_keys_to_snake_case, to_camel_case, to_snake_case, value_keys_to_camel_case};
 use crate::config::{load_from_pool, resolve, IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
-use crate::error::AppError;
+use crate::error::{AppError, BulkFieldError};
 use crate::events::spawn_events;
 use crate::extractors::tenant::TenantId;
 use crate::extractors::user::UserId;
@@ -1056,7 +1056,7 @@ pub async fn create(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
+    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -1190,7 +1190,7 @@ pub async fn update(
         None
     };
 
-    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?
+    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override, user_id_opt.as_deref()).await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
 
     // Hard-delete any asset files dropped from storage after a successful DB write.
@@ -1303,10 +1303,16 @@ pub async fn bulk_create(
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
     };
-    for item in &items {
-        RequestValidator::validate(item, &entity.validation)?;
+    let mut all_errors: Vec<BulkFieldError> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
+            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+        }
     }
-    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
+    if !all_errors.is_empty() {
+        return Err(AppError::BulkValidation(all_errors));
+    }
+    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1362,10 +1368,16 @@ pub async fn bulk_update(
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
     };
-    for item in &items {
-        RequestValidator::validate(item, &entity.validation)?;
+    let mut all_errors: Vec<BulkFieldError> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
+            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+        }
     }
-    let mut rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override).await?;
+    if !all_errors.is_empty() {
+        return Err(AppError::BulkValidation(all_errors));
+    }
+    let mut rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1563,7 +1575,7 @@ pub async fn create_package(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id()).await?;
+    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -1683,7 +1695,7 @@ pub async fn update_package(
         None
     };
 
-    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str))?;
+    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override, user_id_opt.as_deref()).await?.ok_or_else(|| AppError::NotFound(id_str))?;
 
     // Hard-delete dropped asset files after a successful DB write.
     if let Some(ref old_row) = pre_update_row {
@@ -1797,10 +1809,16 @@ pub async fn bulk_create_package(
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
     };
-    for item in &items {
-        RequestValidator::validate(item, &entity.validation)?;
+    let mut all_errors: Vec<BulkFieldError> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
+            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+        }
     }
-    let raw_rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id()).await?;
+    if !all_errors.is_empty() {
+        return Err(AppError::BulkValidation(all_errors));
+    }
+    let raw_rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
     let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1851,10 +1869,16 @@ pub async fn bulk_update_package(
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
     };
-    for item in &items {
-        RequestValidator::validate(item, &entity.validation)?;
+    let mut all_errors: Vec<BulkFieldError> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
+            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+        }
     }
-    let raw_rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override).await?;
+    if !all_errors.is_empty() {
+        return Err(AppError::BulkValidation(all_errors));
+    }
+    let raw_rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
     let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
