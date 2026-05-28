@@ -53,6 +53,23 @@ fn body_to_map(value: Value) -> Result<HashMap<String, Value>, AppError> {
     }
 }
 
+/// Convert a vec of (row_index, AppError) from CrudService collecting methods into BulkFieldErrors.
+/// Parses PostgreSQL error detail to extract the offending column name.
+fn db_errors_to_bulk_field_errors(row_errors: Vec<(usize, AppError)>) -> Vec<BulkFieldError> {
+    use crate::error::{db_error_field, db_error_message};
+    row_errors
+        .into_iter()
+        .map(|(index, e)| {
+            let raw_field = db_error_field(&e);
+            let message = db_error_message(&e, raw_field.as_deref());
+            let field = raw_field
+                .map(|f| to_camel_case(&f))
+                .unwrap_or_else(|| "unknown".to_string());
+            BulkFieldError { index, field, message }
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value {
     let col_info = entity.columns.iter().find(|c| c.name == col);
@@ -1312,7 +1329,10 @@ pub async fn bulk_create(
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let mut rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let (mut rows, db_errs) = CrudService::bulk_create_collecting(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+    }
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1377,7 +1397,10 @@ pub async fn bulk_update(
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let mut rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    let (mut rows, db_errs) = CrudService::bulk_update_collecting(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+    }
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1818,7 +1841,10 @@ pub async fn bulk_create_package(
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let raw_rows = CrudService::bulk_create(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let (raw_rows, db_errs) = CrudService::bulk_create_collecting(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+    }
     let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -1878,7 +1904,10 @@ pub async fn bulk_update_package(
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let raw_rows = CrudService::bulk_update(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    let (raw_rows, db_errs) = CrudService::bulk_update_collecting(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+    }
     let mut rows = raw_rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);

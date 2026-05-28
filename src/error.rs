@@ -64,6 +64,60 @@ pub struct ErrorDetail {
     pub details: Option<serde_json::Value>,
 }
 
+/// Extract the column name from a PostgreSQL error.
+/// Downcasts to `PgDatabaseError` to access the `detail` field, which looks like:
+/// "Key (u_id)=(M-101) already exists."
+pub fn db_error_field(e: &AppError) -> Option<String> {
+    if let AppError::Db(sqlx::Error::Database(ref db_err)) = e {
+        // detail() is on PgDatabaseError, not the base DatabaseError trait
+        if let Some(pg_err) = db_err.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+            if let Some(detail) = pg_err.detail() {
+                if let Some(start) = detail.find('(') {
+                    if let Some(end) = detail[start + 1..].find(')') {
+                        let field = &detail[start + 1..start + 1 + end];
+                        // Reject composite keys (contains comma) and blanks
+                        if !field.is_empty() && !field.contains(',') {
+                            return Some(field.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build a human-readable message for a DB error, using the extracted field name when available.
+pub fn db_error_message(e: &AppError, field: Option<&str>) -> String {
+    if let AppError::Db(sqlx::Error::Database(ref db_err)) = e {
+        match db_err.kind() {
+            sqlx::error::ErrorKind::UniqueViolation => {
+                return match field {
+                    Some(f) => format!("{} already exists", f),
+                    None => "duplicate value violates unique constraint".to_string(),
+                }
+            }
+            sqlx::error::ErrorKind::ForeignKeyViolation => {
+                return match field {
+                    Some(f) => format!("{} references a non-existent record", f),
+                    None => "foreign key constraint violation".to_string(),
+                }
+            }
+            sqlx::error::ErrorKind::NotNullViolation => {
+                return match field {
+                    Some(f) => format!("{} cannot be null", f),
+                    None => "not null constraint violation".to_string(),
+                }
+            }
+            sqlx::error::ErrorKind::CheckViolation => {
+                return "check constraint violation".to_string();
+            }
+            _ => {}
+        }
+    }
+    e.to_string()
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         if let AppError::BulkValidation(ref errors) = self {

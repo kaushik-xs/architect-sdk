@@ -215,6 +215,74 @@ impl CrudService {
         Ok(out)
     }
 
+    /// Like `bulk_create` but uses savepoints to isolate per-row DB errors.
+    /// Returns `(successful_rows, row_errors)`. If any errors occur the transaction is
+    /// rolled back and successful_rows will be empty — call site decides how to surface errors.
+    pub async fn bulk_create_collecting<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        items: &[HashMap<String, Value>],
+        schema_override: Option<&str>,
+        rls_tenant_id: Option<&str>,
+        caller_user_id: Option<&str>,
+    ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
+        const BULK_LIMIT: usize = 100;
+        if items.len() > BULK_LIMIT {
+            return Err(AppError::BadRequest(format!("bulk create limited to {} items", BULK_LIMIT)));
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut row_errors: Vec<(usize, AppError)> = Vec::new();
+        match executor {
+            TenantExecutor::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                for (idx, body) in items.iter().enumerate() {
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                    let include_pk = body.contains_key(&entity.pk_columns[0]);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
+                    match Self::execute_returning_one_tx(&mut tx, &q).await {
+                        Ok(row) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            out.push(row.unwrap_or(Value::Null));
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if row_errors.is_empty() {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                    out.clear();
+                }
+            }
+            TenantExecutor::Conn(conn) => {
+                for (idx, body) in items.iter().enumerate() {
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                    let include_pk = body.contains_key(&entity.pk_columns[0]);
+                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
+                    match Self::execute_returning_one_conn(&mut **conn, &q).await {
+                        Ok(row) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            out.push(row.unwrap_or(Value::Null));
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if !row_errors.is_empty() {
+                    out.clear();
+                }
+            }
+        }
+        Ok((out, row_errors))
+    }
+
     /// Bulk update in a transaction (when using pool) or on the same connection (when using conn). Each item must have id. Returns vec of updated rows.
     /// When caller_user_id is Some, updated_by is set on each row.
     pub async fn bulk_update<'a>(
@@ -260,6 +328,97 @@ impl CrudService {
             }
         }
         Ok(out)
+    }
+
+    /// Like `bulk_update` but uses savepoints to isolate per-row DB errors.
+    /// Missing pk on an item is recorded as a row error rather than aborting early.
+    /// Returns `(successful_rows, row_errors)`. If any errors occur the transaction is
+    /// rolled back and successful_rows will be empty.
+    pub async fn bulk_update_collecting<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        items: &[HashMap<String, Value>],
+        schema_override: Option<&str>,
+        caller_user_id: Option<&str>,
+    ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
+        const BULK_LIMIT: usize = 100;
+        if items.len() > BULK_LIMIT {
+            return Err(AppError::BadRequest(format!("bulk update limited to {} items", BULK_LIMIT)));
+        }
+        let pk = entity.pk_columns[0].clone();
+        let mut out = Vec::with_capacity(items.len());
+        let mut row_errors: Vec<(usize, AppError)> = Vec::new();
+        match executor {
+            TenantExecutor::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                for (idx, body) in items.iter().enumerate() {
+                    let id = match body.get(&pk) {
+                        Some(id) => id.clone(),
+                        None => {
+                            row_errors.push((idx, AppError::Validation(format!("each item must have '{}'", pk))));
+                            continue;
+                        }
+                    };
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                    let mut body_without_pk = body.clone();
+                    body_without_pk.remove(&pk);
+                    let q = update(entity, &id, &body_without_pk, schema_override, caller_user_id);
+                    match Self::execute_returning_one_tx(&mut tx, &q).await {
+                        Ok(Some(row)) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            out.push(row);
+                        }
+                        Ok(None) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if row_errors.is_empty() {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                    out.clear();
+                }
+            }
+            TenantExecutor::Conn(conn) => {
+                for (idx, body) in items.iter().enumerate() {
+                    let id = match body.get(&pk) {
+                        Some(id) => id.clone(),
+                        None => {
+                            row_errors.push((idx, AppError::Validation(format!("each item must have '{}'", pk))));
+                            continue;
+                        }
+                    };
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                    let mut body_without_pk = body.clone();
+                    body_without_pk.remove(&pk);
+                    let q = update(entity, &id, &body_without_pk, schema_override, caller_user_id);
+                    match Self::execute_returning_one_conn(&mut **conn, &q).await {
+                        Ok(Some(row)) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            out.push(row);
+                        }
+                        Ok(None) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if !row_errors.is_empty() {
+                    out.clear();
+                }
+            }
+        }
+        Ok((out, row_errors))
     }
 
     async fn query_one_exec<'a>(
