@@ -96,6 +96,9 @@ impl CrudService {
         let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
         let row = Self::execute_returning_one_exec(executor, &q).await?
             .ok_or_else(|| AppError::Db(sqlx::Error::RowNotFound))?;
+        if entity.audit_log {
+            Self::insert_audit(executor, entity, "create", &row, None, caller_user_id, schema_override).await?;
+        }
         Ok(row)
     }
 
@@ -109,19 +112,39 @@ impl CrudService {
         schema_override: Option<&str>,
         caller_user_id: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
+        let pre_row = if entity.audit_log {
+            let q = select_by_id(entity, schema_override);
+            Self::query_one_exec(executor, &q.sql, &[id.clone()]).await?
+        } else {
+            None
+        };
         let q = update(entity, id, body, schema_override, caller_user_id);
-        Self::execute_returning_one_exec(executor, &q).await
+        let result = Self::execute_returning_one_exec(executor, &q).await?;
+        if entity.audit_log {
+            if let Some(ref post_row) = result {
+                Self::insert_audit(executor, entity, "update", post_row, pre_row.as_ref(), caller_user_id, schema_override).await?;
+            }
+        }
+        Ok(result)
     }
 
     /// Delete one row by id. Returns deleted row or None.
+    /// When caller_user_id is Some, audit_by is set on the audit record.
     pub async fn delete<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
         id: &Value,
         schema_override: Option<&str>,
+        caller_user_id: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = delete(entity, schema_override);
-        Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
+        let result = Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await?;
+        if entity.audit_log {
+            if let Some(ref deleted_row) = result {
+                Self::insert_audit(executor, entity, "delete", deleted_row, None, caller_user_id, schema_override).await?;
+            }
+        }
+        Ok(result)
     }
 
     /// Archive one row by id: stamps archive_field with NOW() if it is currently NULL.
@@ -332,6 +355,95 @@ impl CrudService {
     fn to_sqlx_param(v: &Value) -> PgBindValue {
         PgBindValue::from_json(v).unwrap_or(PgBindValue::Null)
     }
+
+    async fn insert_audit<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        action: &str,
+        row: &Value,
+        pre_row: Option<&Value>,
+        audit_by: Option<&str>,
+        schema_override: Option<&str>,
+    ) -> Result<(), AppError> {
+        let schema = schema_override.unwrap_or(&entity.schema_name);
+        let audit_table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            format!("{}_audit", entity.table_name).replace('"', "\"\"")
+        );
+
+        let changed = if action == "update" {
+            pre_row.map(|pre| compute_changed_fields(pre, row, entity))
+        } else {
+            None
+        };
+
+        let mut col_names: Vec<String> = vec![
+            "\"audit_action\"".to_string(),
+            "\"audit_by\"".to_string(),
+            "\"changed_fields\"".to_string(),
+        ];
+        let mut placeholders: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+
+        params.push(Value::String(action.to_string()));
+        placeholders.push(format!("${}", params.len()));
+
+        params.push(audit_by.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null));
+        placeholders.push(format!("${}", params.len()));
+
+        params.push(changed.unwrap_or(Value::Null));
+        placeholders.push(format!("${}::jsonb", params.len()));
+
+        let row_obj = row.as_object();
+        for col in &entity.columns {
+            let val = row_obj.and_then(|o| o.get(&col.name)).cloned().unwrap_or(Value::Null);
+            let param_num = params.len() + 1;
+            let ph = col
+                .pg_type
+                .as_deref()
+                .map(|t| format!("${}::{}", param_num, t))
+                .unwrap_or_else(|| format!("${}", param_num));
+            col_names.push(format!("\"{}\"", col.name));
+            placeholders.push(ph);
+            params.push(val);
+        }
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            audit_table,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+        tracing::debug!(sql = %sql, "audit insert");
+
+        let mut query = sqlx::query(&sql);
+        for p in &params {
+            query = query.bind(Self::to_sqlx_param(p));
+        }
+        match executor {
+            TenantExecutor::Pool(pool) => { query.execute(*pool).await?; }
+            TenantExecutor::Conn(conn) => { query.execute(&mut **conn).await?; }
+        }
+        Ok(())
+    }
+}
+
+fn compute_changed_fields(pre: &Value, post: &Value, entity: &ResolvedEntity) -> Value {
+    let pre_obj = match pre.as_object() { Some(o) => o, None => return Value::Null };
+    let post_obj = match post.as_object() { Some(o) => o, None => return Value::Null };
+    let mut changes = serde_json::Map::new();
+    for col in &entity.columns {
+        let pre_val = pre_obj.get(&col.name).unwrap_or(&Value::Null);
+        let post_val = post_obj.get(&col.name).unwrap_or(&Value::Null);
+        if pre_val != post_val {
+            let mut diff = serde_json::Map::new();
+            diff.insert("old".to_string(), pre_val.clone());
+            diff.insert("new".to_string(), post_val.clone());
+            changes.insert(col.name.clone(), Value::Object(diff));
+        }
+    }
+    Value::Object(changes)
 }
 
 fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {

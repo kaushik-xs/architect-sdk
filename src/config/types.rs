@@ -47,6 +47,10 @@ pub struct TableConfig {
     pub unique: Vec<Vec<String>>,
     #[serde(default)]
     pub check: Vec<TableCheck>,
+    /// When true, a companion `{table}_audit` table is created and every create/update/delete
+    /// is recorded there with the full row snapshot, action type, timestamp, and actor.
+    #[serde(default)]
+    pub audit_log: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

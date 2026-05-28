@@ -158,6 +158,25 @@ pub async fn apply_migrations(
         );
         sqlx::query(&sql).execute(pool).await?;
 
+        if t.audit_log {
+            let schema_raw = schema_override.unwrap_or(&schema.name);
+            let audit_sql = audit_table_ddl(schema_raw, &t.name, cols);
+            sqlx::query(&audit_sql).execute(pool).await?;
+            let pk_col = match &t.primary_key {
+                PrimaryKeyConfig::Single(s) => s.clone(),
+                PrimaryKeyConfig::Composite(v) => v[0].clone(),
+            };
+            let audit_full = format!("{}.{}", quote(schema_raw), quote(&format!("{}_audit", t.name)));
+            let idx_sql = format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({}, {})",
+                quote(&format!("{}_audit_record_idx", t.name)),
+                audit_full,
+                quote(&pk_col),
+                quote("audit_at")
+            );
+            let _ = sqlx::query(&idx_sql).execute(pool).await;
+        }
+
         if let Some(col) = rls_tenant_column {
             if !config_col_names.contains(col) {
                 let q_col = quote(col);
@@ -365,9 +384,16 @@ pub async fn revert_migrations(
                 id: sid.to_string(),
             })
         })?;
-        let schema_name = quote(schema_override.unwrap_or(&schema.name));
+        let schema_raw = schema_override.unwrap_or(&schema.name);
+        let schema_name = quote(schema_raw);
         let table_name = quote(&t.name);
         let full_name = format!("{}.{}", schema_name, table_name);
+        if t.audit_log {
+            let audit_full = format!("{}.{}", schema_name, quote(&format!("{}_audit", t.name)));
+            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {} CASCADE", audit_full))
+                .execute(pool)
+                .await;
+        }
         let drop_sql = format!("DROP TABLE IF EXISTS {} CASCADE", full_name);
         let _ = sqlx::query(&drop_sql).execute(pool).await;
     }
@@ -722,7 +748,52 @@ pub fn compute_migration_plan(
             risk: MigrationRisk::None,
             risk_detail: None,
         });
+        if new_table.audit_log {
+            let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols);
+            steps.push(MigrationStep {
+                step: 0,
+                operation: MigrationOperation::CreateTable,
+                schema: schema.clone(),
+                table: Some(format!("{}_audit", new_table.name)),
+                object: format!("{}_audit", new_table.name),
+                object_type: "table".into(),
+                description: format!("Create audit table \"{}\".\"{}\"", schema, format!("{}_audit", new_table.name)),
+                ddl: Some(audit_ddl),
+                safety: MigrationSafety::Safe,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            });
+        }
     }
+
+    // Existing tables that gained audit_log
+    for new_table in &new.tables {
+        if added_table_ids.contains(new_table.id.as_str()) {
+            continue;
+        }
+        if let Some(old_table) = old_tables.get(new_table.id.as_str()) {
+            if !old_table.audit_log && new_table.audit_log {
+                let sid = new_table.schema_id.as_deref().unwrap_or(default_new_sid);
+                let schema = schema_name_for(sid, &new_schemas);
+                let cols = cols_by_table.get(new_table.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+                let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols);
+                steps.push(MigrationStep {
+                    step: 0,
+                    operation: MigrationOperation::CreateTable,
+                    schema: schema.clone(),
+                    table: Some(format!("{}_audit", new_table.name)),
+                    object: format!("{}_audit", new_table.name),
+                    object_type: "table".into(),
+                    description: format!("Enable audit log: create \"{}\".\"{}\"", schema, format!("{}_audit", new_table.name)),
+                    ddl: Some(audit_ddl),
+                    safety: MigrationSafety::Safe,
+                    risk: MigrationRisk::None,
+                    risk_detail: None,
+                });
+            }
+        }
+    }
+
     for old_table in &old.tables {
         if !new_tables.contains_key(old_table.id.as_str()) {
             let sid = old_table.schema_id.as_deref().unwrap_or(default_old_sid);
@@ -1162,6 +1233,42 @@ pub async fn execute_migration_plan(
     }
 
     Ok(MigrationExecutionResult { applied, warned, warnings })
+}
+
+/// Build CREATE TABLE DDL for the `{table}_audit` companion table.
+/// All source columns are replicated as nullable with no constraints, plus five audit metadata
+/// columns prepended: audit_id (PK), audit_action, audit_at, audit_by, changed_fields.
+fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnConfig]) -> String {
+    let empty: HashMap<&str, &SchemaConfig> = HashMap::new();
+    let audit_name = format!("{}_audit", table_name);
+    let audit_full = format!("{}.{}", quote(schema_name), quote(&audit_name));
+
+    let mut col_defs: Vec<String> = Vec::new();
+    col_defs.push(format!("{} UUID NOT NULL DEFAULT gen_random_uuid()", quote("audit_id")));
+    col_defs.push(format!("{} TEXT NOT NULL", quote("audit_action")));
+    col_defs.push(format!("{} TIMESTAMPTZ NOT NULL DEFAULT NOW()", quote("audit_at")));
+    col_defs.push(format!("{} TEXT", quote("audit_by")));
+    col_defs.push(format!("{} JSONB", quote("changed_fields")));
+
+    let config_col_names: HashSet<&str> = source_cols.iter().map(|c| c.name.as_str()).collect();
+    for c in source_cols {
+        let typ = type_str(&c.type_, &empty);
+        col_defs.push(format!("{} {}", quote(&c.name), typ));
+    }
+    for (name, typ) in [
+        ("created_at", "TIMESTAMPTZ"),
+        ("updated_at", "TIMESTAMPTZ"),
+        ("archived_at", "TIMESTAMPTZ"),
+        ("created_by", "TEXT"),
+        ("updated_by", "TEXT"),
+    ] {
+        if !config_col_names.contains(name) {
+            col_defs.push(format!("{} {}", quote(name), typ));
+        }
+    }
+    col_defs.push(format!("PRIMARY KEY ({})", quote("audit_id")));
+
+    format!("CREATE TABLE IF NOT EXISTS {} (\n  {}\n)", audit_full, col_defs.join(",\n  "))
 }
 
 fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {

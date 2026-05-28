@@ -72,6 +72,8 @@ pub struct ResolvedEntity {
     pub archive_field: Option<String>,
     /// Package id this entity belongs to. Set via ResolvedModel::with_package_id().
     pub package_id: String,
+    /// When true, a companion `{table}_audit` table exists and every write is journaled there.
+    pub audit_log: bool,
 }
 
 #[derive(Clone, Debug)]

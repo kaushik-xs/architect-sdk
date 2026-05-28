@@ -1242,7 +1242,7 @@ pub async fn delete(
     } else {
         None
     };
-    CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
+    CrudService::delete(&mut executor, &entity, &id, schema_override, user_id_opt.as_deref()).await?;
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {
@@ -1747,7 +1747,7 @@ pub async fn delete_package(
     } else {
         None
     };
-    CrudService::delete(&mut executor, &entity, &id, schema_override).await?;
+    CrudService::delete(&mut executor, &entity, &id, schema_override, user_id_opt.as_deref()).await?;
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {

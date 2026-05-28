@@ -138,9 +138,42 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 }
             }),
             package_id: String::new(),
+            audit_log: table.audit_log,
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);
+    }
+
+    // Synthesize read-only audit entities for every entity with audit_log enabled.
+    // The companion `{table}_audit` table is created by apply_migrations; here we expose it
+    // as `{path_segment}_audit` with only list + read operations.
+    let audit_entities: Vec<ResolvedEntity> = entities
+        .iter()
+        .filter(|e| e.audit_log)
+        .map(|e| {
+            let audit_entity = ResolvedEntity {
+                table_id: format!("{}_audit", e.table_id),
+                schema_name: e.schema_name.clone(),
+                table_name: format!("{}_audit", e.table_name),
+                path_segment: format!("{}_audit", e.path_segment),
+                pk_columns: vec!["audit_id".to_string()],
+                pk_type: PkType::Uuid,
+                columns: build_audit_columns(&e.columns),
+                operations: vec!["list".to_string(), "read".to_string()],
+                sensitive_columns: e.sensitive_columns.clone(),
+                includes: Vec::new(),
+                validation: HashMap::new(),
+                events: Vec::new(),
+                archive_field: None,
+                package_id: e.package_id.clone(),
+                audit_log: false,
+            };
+            audit_entity
+        })
+        .collect();
+    for ae in audit_entities {
+        entity_by_path.insert(ae.path_segment.clone(), ae.clone());
+        entities.push(ae);
     }
 
     Ok(ResolvedModel {
@@ -248,6 +281,76 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Build the column list for a synthetic audit entity.
+/// Prepends the five audit metadata columns then appends all source columns with pk_type cleared
+/// (audit_id is the new PK, so source PKs become regular queryable columns).
+fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
+    let mut cols = Vec::with_capacity(5 + source_columns.len());
+    cols.push(ColumnInfo {
+        name: "audit_id".to_string(),
+        pk_type: Some(PkType::Uuid),
+        nullable: false,
+        has_default: true,
+        pg_type: Some("uuid".to_string()),
+        is_asset: false,
+        asset_is_array: false,
+        asset_config: None,
+    });
+    cols.push(ColumnInfo {
+        name: "audit_action".to_string(),
+        pk_type: None,
+        nullable: false,
+        has_default: false,
+        pg_type: None,
+        is_asset: false,
+        asset_is_array: false,
+        asset_config: None,
+    });
+    cols.push(ColumnInfo {
+        name: "audit_at".to_string(),
+        pk_type: None,
+        nullable: false,
+        has_default: true,
+        pg_type: Some("timestamptz".to_string()),
+        is_asset: false,
+        asset_is_array: false,
+        asset_config: None,
+    });
+    cols.push(ColumnInfo {
+        name: "audit_by".to_string(),
+        pk_type: None,
+        nullable: true,
+        has_default: false,
+        pg_type: None,
+        is_asset: false,
+        asset_is_array: false,
+        asset_config: None,
+    });
+    cols.push(ColumnInfo {
+        name: "changed_fields".to_string(),
+        pk_type: None,
+        nullable: true,
+        has_default: false,
+        pg_type: Some("jsonb".to_string()),
+        is_asset: false,
+        asset_is_array: false,
+        asset_config: None,
+    });
+    for col in source_columns {
+        cols.push(ColumnInfo {
+            name: col.name.clone(),
+            pk_type: None,
+            nullable: col.nullable,
+            has_default: col.has_default,
+            pg_type: col.pg_type.clone(),
+            is_asset: col.is_asset,
+            asset_is_array: col.asset_is_array,
+            asset_config: col.asset_config.clone(),
+        });
+    }
+    cols
 }
 
 fn infer_pk_type(col: &ColumnConfig) -> PkType {
