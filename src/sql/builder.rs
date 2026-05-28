@@ -70,7 +70,7 @@ fn resolve_schema<'a>(entity: &'a ResolvedEntity, schema_override: Option<&'a st
 }
 
 /// Postgres array columns: API accepts JSON `["a","b"]`; bind as array literal + `$n::varchar(255)[]` etc.
-fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Value {
+pub fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Value {
     if !pg_type.is_some_and(|t| t.ends_with("[]")) {
         return val;
     }

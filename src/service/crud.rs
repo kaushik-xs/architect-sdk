@@ -2,7 +2,7 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{archive, delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, unarchive, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
+use crate::sql::{archive, coerce_json_value_for_pg_array, delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, unarchive, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -556,7 +556,8 @@ impl CrudService {
 
         let row_obj = row.as_object();
         for col in &entity.columns {
-            let val = row_obj.and_then(|o| o.get(&col.name)).cloned().unwrap_or(Value::Null);
+            let raw = row_obj.and_then(|o| o.get(&col.name)).cloned().unwrap_or(Value::Null);
+            let val = coerce_json_value_for_pg_array(raw, col.pg_type.as_deref());
             let param_num = params.len() + 1;
             let ph = col
                 .pg_type
