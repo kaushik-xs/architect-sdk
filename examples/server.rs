@@ -2,12 +2,11 @@
 //! If PACKAGE_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _sys_* tables (empty until fed via config APIs or package install).
 
 use architect_sdk::{
-    apply_migrations, common_routes_with_ready, config_routes, ensure_database_exists,
+    apply_migrations, common_routes_with_ready, config_routes, create_pool, ensure_database_exists,
     ensure_sys_tables, entity_routes, load_from_pool, load_registry_from_pool, resolve, AppState,
     FullConfig, DEFAULT_PACKAGE_ID,
 };
 use axum::Router;
-use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -22,14 +21,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/architect".into());
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://architect.db".into());
     ensure_database_exists(&database_url).await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
 
-    ensure_sys_tables(&pool).await?;
+    // create_pool uses the compiled-in dialect automatically (sqlite by default).
+    let pool = create_pool(&database_url, 5).await?;
+
+    let dialect = architect_sdk::db::active_dialect();
+    ensure_sys_tables(&pool, dialect.as_ref()).await?;
 
     let tenant_registry = load_registry_from_pool(&pool)
         .await
@@ -50,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (cfg, DEFAULT_PACKAGE_ID.to_string())
         }
     };
-    apply_migrations(&pool, &config, None, None).await?;
+    apply_migrations(&pool, &config, None, None, dialect.as_ref()).await?;
     let model = resolve(&config)?.with_package_id(&package_id);
     let mut package_models = HashMap::new();
     package_models.insert(package_id.clone(), model.clone());
@@ -66,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage,
         event_client,
         authrs_client,
+        dialect,
     };
 
     let api = Router::new()
