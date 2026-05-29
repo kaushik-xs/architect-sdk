@@ -147,6 +147,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             }),
             package_id: String::new(),
             audit_log: table.audit_log,
+            parent_ref_column: api.parent_ref_column.clone(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);
@@ -175,6 +176,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 archive_field: None,
                 package_id: e.package_id.clone(),
                 audit_log: false,
+                parent_ref_column: None,
             };
             audit_entity
         })

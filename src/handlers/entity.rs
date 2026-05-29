@@ -81,6 +81,138 @@ fn db_errors_to_bulk_field_errors(row_errors: Vec<(usize, AppError)>) -> Vec<Bul
         .collect()
 }
 
+/// Strips `parent_ref` from each item (mutating in place) and returns a parallel vec of the
+/// extracted natural-key strings. Indices with no `parent_ref` get `None`.
+fn extract_parent_refs(items: &mut [HashMap<String, Value>]) -> Vec<Option<String>> {
+    items
+        .iter_mut()
+        .map(|item| {
+            item.remove("parent_ref").and_then(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// After a successful bulk insert, resolve `parentRef` natural-key values to UUIDs, issue
+/// UPDATE queries to write `parent_id`, and update `rows` in place.
+///
+/// Resolution order: same-batch parents first (looked up from `rows`), then pre-existing rows
+/// already in the DB (fetched with a single SELECT … WHERE ref_col = ANY($1)).
+async fn resolve_and_update_parent_refs<'a>(
+    executor: &mut crate::service::TenantExecutor<'a>,
+    rows: &mut [Value],
+    parent_refs: &[Option<String>],
+    entity: &ResolvedEntity,
+    ref_col: &str,
+    schema_override: Option<&str>,
+) -> Result<(), AppError> {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let schema = schema_override.unwrap_or(&entity.schema_name);
+    let table_q = format!("{}.{}", q(schema), q(&entity.table_name));
+    let pk = entity.pk_columns[0].clone();
+
+    // Collect distinct ref values that need resolution.
+    let needed: Vec<String> = parent_refs
+        .iter()
+        .filter_map(|o| o.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    if needed.is_empty() {
+        return Ok(());
+    }
+
+    // Build ref → uuid from same-batch rows first.
+    let mut ref_to_uuid: HashMap<String, String> = HashMap::new();
+    for row in rows.iter() {
+        if let Some(obj) = row.as_object() {
+            let ref_val = obj.get(ref_col).and_then(|v| v.as_str());
+            let uuid_val = obj.get(&pk).and_then(|v| v.as_str());
+            if let (Some(r), Some(u)) = (ref_val, uuid_val) {
+                ref_to_uuid.insert(r.to_string(), u.to_string());
+            }
+        }
+    }
+
+    // Fetch any pre-existing parents not covered by the batch.
+    let missing: Vec<&str> = needed
+        .iter()
+        .filter(|r| !ref_to_uuid.contains_key(*r))
+        .map(|r| r.as_str())
+        .collect();
+
+    if !missing.is_empty() {
+        let select_sql = format!(
+            "SELECT {pk_q}, {ref_q} FROM {table} WHERE {ref_q} = ANY($1)",
+            pk_q = q(&pk),
+            ref_q = q(ref_col),
+            table = table_q,
+        );
+        let db_rows: Vec<(String, String)> = match executor {
+            crate::service::TenantExecutor::Pool(pool) => {
+                sqlx::query_as::<_, (String, String)>(&select_sql)
+                    .bind(missing)
+                    .fetch_all(*pool)
+                    .await?
+            }
+            crate::service::TenantExecutor::Conn(conn) => {
+                sqlx::query_as::<_, (String, String)>(&select_sql)
+                    .bind(missing)
+                    .fetch_all(&mut **conn)
+                    .await?
+            }
+        };
+        for (uuid, ref_val) in db_rows {
+            ref_to_uuid.insert(ref_val, uuid);
+        }
+    }
+
+    // Issue UPDATE parent_id for each row that had a parentRef, and patch in-memory row.
+    let update_sql = format!(
+        "UPDATE {table} SET {pid} = $1 WHERE {pk_q} = $2",
+        table = table_q,
+        pid = q("parent_id"),
+        pk_q = q(&pk),
+    );
+    for (i, opt_ref) in parent_refs.iter().enumerate() {
+        let Some(ref_val) = opt_ref else { continue };
+        let Some(parent_uuid) = ref_to_uuid.get(ref_val) else {
+            continue; // unresolvable ref — leave parent_id NULL
+        };
+        let row_uuid = rows[i]
+            .as_object()
+            .and_then(|o| o.get(&pk))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let Some(row_uuid) = row_uuid else { continue };
+
+        match executor {
+            crate::service::TenantExecutor::Pool(pool) => {
+                sqlx::query(&update_sql)
+                    .bind(parent_uuid)
+                    .bind(&row_uuid)
+                    .execute(*pool)
+                    .await?;
+            }
+            crate::service::TenantExecutor::Conn(conn) => {
+                sqlx::query(&update_sql)
+                    .bind(parent_uuid)
+                    .bind(&row_uuid)
+                    .execute(&mut **conn)
+                    .await?;
+            }
+        }
+
+        if let Some(obj) = rows[i].as_object_mut() {
+            obj.insert("parent_id".to_string(), Value::String(parent_uuid.clone()));
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn query_value_for_column(entity: &ResolvedEntity, col: &str, s: &str) -> Value {
     let col_info = entity.columns.iter().find(|c| c.name == col);
@@ -1657,7 +1789,7 @@ pub async fn bulk_create(
         "post",
     )
     .await?;
-    let items: Vec<HashMap<String, Value>> = match body {
+    let mut items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
             for v in arr {
@@ -1666,6 +1798,12 @@ pub async fn bulk_create(
             out
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
+    };
+    // Strip parentRef before validation so it doesn't trigger unknown-field errors.
+    let parent_refs = if entity.parent_ref_column.is_some() {
+        extract_parent_refs(&mut items)
+    } else {
+        vec![None; items.len()]
     };
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -1693,6 +1831,19 @@ pub async fn bulk_create(
         return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
             db_errs,
         )));
+    }
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        if parent_refs.iter().any(|r| r.is_some()) {
+            resolve_and_update_parent_refs(
+                &mut executor,
+                &mut rows,
+                &parent_refs,
+                &entity,
+                ref_col,
+                schema_override,
+            )
+            .await?;
+        }
     }
     let raw_rows = rows.clone();
     for row in &mut rows {
@@ -2507,7 +2658,7 @@ pub async fn bulk_create_package(
         "post",
     )
     .await?;
-    let items: Vec<HashMap<String, Value>> = match body {
+    let mut items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
             for v in arr {
@@ -2516,6 +2667,11 @@ pub async fn bulk_create_package(
             out
         }
         _ => return Err(AppError::BadRequest("body must be a JSON array".into())),
+    };
+    let parent_refs = if entity.parent_ref_column.is_some() {
+        extract_parent_refs(&mut items)
+    } else {
+        vec![None; items.len()]
     };
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -2530,7 +2686,7 @@ pub async fn bulk_create_package(
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let (raw_rows, db_errs) = CrudService::bulk_create_collecting(
+    let (mut rows, db_errs) = CrudService::bulk_create_collecting(
         &mut executor,
         &entity,
         &items,
@@ -2544,7 +2700,20 @@ pub async fn bulk_create_package(
             db_errs,
         )));
     }
-    let mut rows = raw_rows.clone();
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        if parent_refs.iter().any(|r| r.is_some()) {
+            resolve_and_update_parent_refs(
+                &mut executor,
+                &mut rows,
+                &parent_refs,
+                &entity,
+                ref_col,
+                schema_override,
+            )
+            .await?;
+        }
+    }
+    let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);

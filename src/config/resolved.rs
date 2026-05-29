@@ -74,6 +74,8 @@ pub struct ResolvedEntity {
     pub package_id: String,
     /// When true, a companion `{table}_audit` table exists and every write is journaled there.
     pub audit_log: bool,
+    /// Natural-key column used to resolve `parentRef` in bulk create (e.g. `"location_id"`).
+    pub parent_ref_column: Option<String>,
 }
 
 #[derive(Clone, Debug)]
