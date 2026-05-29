@@ -12,14 +12,17 @@ use axum::Json;
 use serde_json::Value;
 
 async fn validate_namespace(
-    pool: &sqlx::PgPool,
+    pool: &crate::db::pool::Pool,
+    dialect: &dyn crate::db::Dialect,
     package_id: &str,
     namespace: &str,
 ) -> Result<(), AppError> {
     let q = qualified_sys_table("_sys_kv_stores");
     let exists: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT id FROM {} WHERE id = $1 AND package_id = $2",
-        q
+        "SELECT id FROM {} WHERE id = {} AND package_id = {}",
+        q,
+        dialect.placeholder(1),
+        dialect.placeholder(2)
     ))
     .bind(namespace)
     .bind(package_id)
@@ -50,11 +53,12 @@ pub async fn kv_list_keys(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
-    validate_namespace(pool, &package_id, &namespace).await?;
+    validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
+    let d = state.dialect.as_ref();
     let sql = format!(
-        "SELECT key, value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 ORDER BY key",
-        q_table
+        "SELECT key, value FROM {} WHERE tenant_id = {} AND package_id = {} AND namespace = {} ORDER BY key",
+        q_table, d.placeholder(1), d.placeholder(2), d.placeholder(3)
     );
     let rows: Vec<(String, Value)> = sqlx::query_as(&sql)
         .bind(tenant_id)
@@ -85,11 +89,12 @@ pub async fn kv_get(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
-    validate_namespace(pool, &package_id, &namespace).await?;
+    validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
+    let d = state.dialect.as_ref();
     let sql = format!(
-        "SELECT value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
-        q_table
+        "SELECT value FROM {} WHERE tenant_id = {} AND package_id = {} AND namespace = {} AND key = {}",
+        q_table, d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4)
     );
     let row: Option<(Value,)> = sqlx::query_as(&sql)
         .bind(tenant_id)
@@ -121,16 +126,23 @@ pub async fn kv_put(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
-    validate_namespace(pool, &package_id, &namespace).await?;
+    validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
+    let d = state.dialect.as_ref();
+    let (p1, p2, p3, p4, p5) = (
+        d.placeholder(1),
+        d.placeholder(2),
+        d.placeholder(3),
+        d.placeholder(4),
+        d.placeholder(5),
+    );
+    let set_pairs = format!("value = {p5}, updated_at = {}", d.now_fn());
+    let conflict = d.upsert_conflict(&["tenant_id", "package_id", "namespace", "key"], &set_pairs);
     let sql = format!(
-        r#"
-        INSERT INTO {} (tenant_id, package_id, namespace, key, value, updated_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
-        ON CONFLICT (tenant_id, package_id, namespace, key)
-        DO UPDATE SET value = $5, updated_at = NOW()
-        "#,
-        q_table
+        "INSERT INTO {tbl} (tenant_id, package_id, namespace, key, value, updated_at) \
+         VALUES ({p1}, {p2}, {p3}, {p4}, {p5}, {now}) {conflict}",
+        tbl = q_table,
+        now = d.now_fn(),
     );
     sqlx::query(&sql)
         .bind(tenant_id)
@@ -159,13 +171,15 @@ pub async fn kv_delete(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
     let pool = &state.pool;
-    validate_namespace(pool, &package_id, &namespace).await?;
+    validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
-    let sql = format!(
-        "DELETE FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
-        q_table
+    let d = state.dialect.as_ref();
+    let sql =
+        format!(
+        "DELETE FROM {} WHERE tenant_id = {} AND package_id = {} AND namespace = {} AND key = {}",
+        q_table, d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4)
     );
-    let result: sqlx::postgres::PgQueryResult = sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)

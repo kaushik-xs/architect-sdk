@@ -3,10 +3,11 @@
 
 use crate::config::types::*;
 use crate::config::{validate, FullConfig};
-use crate::db::{parse_canonical, postgres as pg};
+use crate::db::parse_canonical;
+use crate::db::pool::Pool;
+use crate::db::Dialect;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 
 fn quote(s: &str) -> String {
@@ -21,10 +22,11 @@ pub const RLS_TENANT_COLUMN: &str = "tenant_id";
 /// When `schema_override` is `Some(s)`, app tables/indexes/FKs are created in schema `s` instead of config schema names (e.g. for schema-strategy tenants).
 /// When `rls_tenant_column` is `Some(col)`, each table gets that column (if missing), RLS enabled, and policies using `current_setting('app.tenant_id', true)`.
 pub async fn apply_migrations(
-    pool: &PgPool,
+    pool: &Pool,
     config: &FullConfig,
     schema_override: Option<&str>,
     rls_tenant_column: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> Result<(), AppError> {
     validate(config)?;
     let default_sid = config
@@ -79,18 +81,20 @@ pub async fn apply_migrations(
         })?;
         let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let type_name = quote(&e.name);
-        let values: Vec<String> = e
-            .values
-            .iter()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
-            .collect();
-        let sql = format!(
-            "CREATE TYPE {}.{} AS ENUM ({})",
-            schema_name,
-            type_name,
-            values.join(", ")
-        );
-        let _ = sqlx::query(&sql).execute(pool).await;
+        if dialect.supports_named_enum_types() {
+            let values: Vec<String> = e
+                .values
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect();
+            let sql = format!(
+                "CREATE TYPE {}.{} AS ENUM ({})",
+                schema_name,
+                type_name,
+                values.join(", ")
+            );
+            let _ = sqlx::query(&sql).execute(pool).await;
+        }
     }
 
     for t in &config.tables {
@@ -111,7 +115,7 @@ pub async fn apply_migrations(
             .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
-            let typ = pg::ddl_type(&parse_canonical(&c.type_));
+            let typ = dialect.ddl_type(&parse_canonical(&c.type_));
             let mut def = format!("{} {}", quote(&c.name), typ);
             if !c.nullable {
                 def.push_str(" NOT NULL");
@@ -127,10 +131,16 @@ pub async fn apply_migrations(
         }
 
         let config_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        let ts_default = format!(
+            "{} NOT NULL DEFAULT {}",
+            dialect.sys_timestamp_type(),
+            dialect.now_fn()
+        );
+        let ts_nullable = dialect.sys_timestamp_type().to_string();
         for (name, def_suffix) in [
-            ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
-            ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
-            ("archived_at", "TIMESTAMPTZ"),
+            ("created_at", ts_default.as_str()),
+            ("updated_at", ts_default.as_str()),
+            ("archived_at", ts_nullable.as_str()),
             ("created_by", "TEXT"),
             ("updated_by", "TEXT"),
         ] {
@@ -167,7 +177,7 @@ pub async fn apply_migrations(
 
         if t.audit_log {
             let schema_raw = schema_override.unwrap_or(&schema.name);
-            let audit_sql = audit_table_ddl(schema_raw, &t.name, cols);
+            let audit_sql = audit_table_ddl(schema_raw, &t.name, cols, dialect);
             sqlx::query(&audit_sql).execute(pool).await?;
             let pk_col = match &t.primary_key {
                 PrimaryKeyConfig::Single(s) => s.clone(),
@@ -189,60 +199,64 @@ pub async fn apply_migrations(
         }
 
         if let Some(col) = rls_tenant_column {
-            if !config_col_names.contains(col) {
+            if dialect.supports_rls() {
+                if !config_col_names.contains(col) {
+                    let q_col = quote(col);
+                    let add_col = format!(
+                        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
+                        full_name, q_col
+                    );
+                    sqlx::query(&add_col).execute(pool).await?;
+                }
+                let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
+                sqlx::query(&enable_rls).execute(pool).await?;
                 let q_col = quote(col);
-                let add_col = format!(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
-                    full_name, q_col
-                );
-                sqlx::query(&add_col).execute(pool).await?;
-            }
-            let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
-            sqlx::query(&enable_rls).execute(pool).await?;
-            let q_col = quote(col);
-            let setting = "current_setting('app.tenant_id', true)";
-            let cond = format!("{} = {}", q_col, setting);
-            let policy_prefix = format!("rls_tenant_{}", t.name);
-            let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
-                ("select", "SELECT", Some(cond.as_str()), None),
-                ("insert", "INSERT", None, Some(cond.as_str())),
-                ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
-                ("delete", "DELETE", Some(cond.as_str()), None),
-            ];
-            for (suffix, cmd, using_cond, with_check) in policies.iter() {
-                let policy_name = format!("{}_{}", policy_prefix, suffix);
-                let drop_sql = format!(
-                    "DROP POLICY IF EXISTS {} ON {}",
-                    quote(&policy_name),
-                    full_name
-                );
-                let _ = sqlx::query(&drop_sql).execute(pool).await;
-                let create_sql = match (using_cond, with_check) {
-                    (Some(u), Some(w)) => format!(
-                        "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
+                let setting = "current_setting('app.tenant_id', true)";
+                let cond = format!("{} = {}", q_col, setting);
+                let policy_prefix = format!("rls_tenant_{}", t.name);
+                let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+                    ("select", "SELECT", Some(cond.as_str()), None),
+                    ("insert", "INSERT", None, Some(cond.as_str())),
+                    ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
+                    ("delete", "DELETE", Some(cond.as_str()), None),
+                ];
+                for (suffix, cmd, using_cond, with_check) in policies.iter() {
+                    let policy_name = format!("{}_{}", policy_prefix, suffix);
+                    let drop_sql = format!(
+                        "DROP POLICY IF EXISTS {} ON {}",
                         quote(&policy_name),
-                        full_name,
-                        cmd,
-                        u,
-                        w
-                    ),
-                    (Some(u), None) => format!(
-                        "CREATE POLICY {} ON {} FOR {} USING ( {} )",
-                        quote(&policy_name),
-                        full_name,
-                        cmd,
-                        u
-                    ),
-                    (None, Some(w)) => format!(
-                        "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
-                        quote(&policy_name),
-                        full_name,
-                        cmd,
-                        w
-                    ),
-                    (None, None) => continue,
-                };
-                sqlx::query(&create_sql).execute(pool).await?;
+                        full_name
+                    );
+                    let _ = sqlx::query(&drop_sql).execute(pool).await;
+                    let create_sql = match (using_cond, with_check) {
+                        (Some(u), Some(w)) => format!(
+                            "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
+                            quote(&policy_name),
+                            full_name,
+                            cmd,
+                            u,
+                            w
+                        ),
+                        (Some(u), None) => format!(
+                            "CREATE POLICY {} ON {} FOR {} USING ( {} )",
+                            quote(&policy_name),
+                            full_name,
+                            cmd,
+                            u
+                        ),
+                        (None, Some(w)) => format!(
+                            "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
+                            quote(&policy_name),
+                            full_name,
+                            cmd,
+                            w
+                        ),
+                        (None, None) => continue,
+                    };
+                    sqlx::query(&create_sql).execute(pool).await?;
+                }
+            } else {
+                tracing::warn!(table = %full_name, dialect = %dialect.name(), "RLS requested but not supported by this dialect; skipping");
             }
         }
     }
@@ -390,7 +404,7 @@ pub async fn apply_migrations(
 /// Revert migrations for a package: drop tables, enum types, and schema (if not public) in reverse order of apply.
 /// Uses the same schema_override as apply_migrations (tables/enums live in that schema).
 pub async fn revert_migrations(
-    pool: &PgPool,
+    pool: &Pool,
     config: &FullConfig,
     schema_override: Option<&str>,
 ) -> Result<(), AppError> {
@@ -599,6 +613,7 @@ pub fn compute_migration_plan(
     new: &FullConfig,
     schema_override: Option<&str>,
     _rls_tenant_column: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> Result<MigrationPlan, AppError> {
     validate(new)?;
 
@@ -794,7 +809,7 @@ pub fn compute_migration_plan(
             .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
-            let typ = pg::ddl_type(&parse_canonical(&c.type_));
+            let typ = dialect.ddl_type(&parse_canonical(&c.type_));
             let mut def = format!("{} {}", quote(&c.name), typ);
             if !c.nullable {
                 def.push_str(" NOT NULL");
@@ -809,6 +824,10 @@ pub fn compute_migration_plan(
             col_defs.push(def);
         }
         let cfg_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        // Note: compute_migration_plan is a pure DDL-generation function; timestamp strings are
+        // embedded in the DDL output for display/execution. We use postgres-compatible strings
+        // here since the plan is always applied to a real DB via execute_migration_plan which
+        // uses the dialect there. If dialect-awareness is needed here in future, pass dialect in.
         for (name, suf) in [
             ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
             ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
@@ -857,7 +876,7 @@ pub fn compute_migration_plan(
             risk_detail: None,
         });
         if new_table.audit_log {
-            let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols);
+            let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols, dialect);
             steps.push(MigrationStep {
                 step: 0,
                 operation: MigrationOperation::CreateTable,
@@ -890,7 +909,7 @@ pub fn compute_migration_plan(
                     .get(new_table.id.as_str())
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols);
+                let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols, dialect);
                 steps.push(MigrationStep {
                     step: 0,
                     operation: MigrationOperation::CreateTable,
@@ -988,8 +1007,8 @@ pub fn compute_migration_plan(
             }
 
             // Type change
-            let old_type = pg::ddl_type(&parse_canonical(&old_col.type_));
-            let new_type = pg::ddl_type(&parse_canonical(&new_col.type_));
+            let old_type = dialect.ddl_type(&parse_canonical(&old_col.type_));
+            let new_type = dialect.ddl_type(&parse_canonical(&new_col.type_));
             if old_type.to_uppercase() != new_type.to_uppercase() {
                 let col_name = &new_col.name;
                 steps.push(MigrationStep {
@@ -1146,7 +1165,7 @@ pub fn compute_migration_plan(
             }
         } else {
             // New column: ADD COLUMN
-            let new_type = pg::ddl_type(&parse_canonical(&new_col.type_));
+            let new_type = dialect.ddl_type(&parse_canonical(&new_col.type_));
             let mut col_def = format!("{} {}", quote(&new_col.name), new_type);
             if !new_col.nullable {
                 col_def.push_str(" NOT NULL");
@@ -1433,8 +1452,8 @@ pub fn compute_migration_plan(
 /// Returns counts and any warning messages collected from best-effort failures.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_migration_plan(
-    migration_pool: &PgPool,
-    config_pool: &PgPool,
+    migration_pool: &Pool,
+    config_pool: &Pool,
     plan: &MigrationPlan,
     migration_plan_id: &str,
     package_id: &str,
@@ -1582,32 +1601,46 @@ pub async fn execute_migration_plan(
 /// Build CREATE TABLE DDL for the `{table}_audit` companion table.
 /// All source columns are replicated as nullable with no constraints, plus five audit metadata
 /// columns prepended: audit_id (PK), audit_action, audit_at, audit_by, changed_fields.
-fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnConfig]) -> String {
+fn audit_table_ddl(
+    schema_name: &str,
+    table_name: &str,
+    source_cols: &[&ColumnConfig],
+    dialect: &dyn Dialect,
+) -> String {
     let audit_name = format!("{}_audit", table_name);
     let audit_full = format!("{}.{}", quote(schema_name), quote(&audit_name));
 
     let mut col_defs: Vec<String> = Vec::new();
     col_defs.push(format!(
-        "{} UUID NOT NULL DEFAULT gen_random_uuid()",
-        quote("audit_id")
+        "{} {} NOT NULL DEFAULT {}",
+        quote("audit_id"),
+        "UUID",
+        dialect.uuid_default_expr()
     ));
     col_defs.push(format!("{} TEXT NOT NULL", quote("audit_action")));
     col_defs.push(format!(
-        "{} TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        quote("audit_at")
+        "{} {} NOT NULL DEFAULT {}",
+        quote("audit_at"),
+        dialect.audit_timestamp_type(),
+        dialect.now_fn()
     ));
     col_defs.push(format!("{} TEXT", quote("audit_by")));
-    col_defs.push(format!("{} JSONB", quote("changed_fields")));
+    col_defs.push(format!(
+        "{} {}",
+        quote("changed_fields"),
+        dialect.sys_json_type()
+    ));
 
     let config_col_names: HashSet<&str> = source_cols.iter().map(|c| c.name.as_str()).collect();
     for c in source_cols {
-        let typ = pg::ddl_type(&parse_canonical(&c.type_));
+        let typ = dialect.ddl_type(&parse_canonical(&c.type_));
         col_defs.push(format!("{} {}", quote(&c.name), typ));
     }
+    let audit_ts = dialect.audit_timestamp_type();
     for (name, typ) in [
-        ("created_at", "TIMESTAMPTZ"),
-        ("updated_at", "TIMESTAMPTZ"),
-        ("archived_at", "TIMESTAMPTZ"),
+        ("created_at", audit_ts),
+        ("updated_at", audit_ts),
+        ("archived_at", audit_ts),
         ("created_by", "TEXT"),
         ("updated_by", "TEXT"),
     ] {
@@ -1623,4 +1656,3 @@ fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnCo
         col_defs.join(",\n  ")
     )
 }
-

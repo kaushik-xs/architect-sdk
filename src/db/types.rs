@@ -124,10 +124,7 @@ fn parse_canonical_str(s: &str, params: Option<&[u32]>) -> CanonicalType {
     // Array suffix: strip "[]" and recurse.
     if lower.ends_with("[]") {
         let inner_str = &s[..s.len() - 2];
-        let inner = parse_canonical_str(
-            inner_str,
-            None,
-        );
+        let inner = parse_canonical_str(inner_str, None);
         return CanonicalType::Array(Box::new(inner));
     }
 
@@ -225,4 +222,83 @@ fn two_params(explicit: Option<&[u32]>, inline: &Option<Vec<u32>>) -> Option<(u8
         .filter(|p| p.len() >= 2)
         .or_else(|| inline.as_deref().filter(|p| p.len() >= 2))?;
     Some((src[0] as u8, src[1] as u8))
+}
+
+// ─── Dialect-agnostic helpers ─────────────────────────────────────────────────
+
+/// Classify a [`CanonicalType`] into a [`TypeCategory`] for RSQL operator validation.
+/// This logic is shared across all dialects via `Dialect::type_category`.
+pub fn type_category(t: &CanonicalType) -> TypeCategory {
+    match t {
+        CanonicalType::Text
+        | CanonicalType::Varchar(_)
+        | CanonicalType::Char(_)
+        | CanonicalType::Asset => TypeCategory::Text,
+        CanonicalType::SmallInt
+        | CanonicalType::Int
+        | CanonicalType::BigInt
+        | CanonicalType::Serial
+        | CanonicalType::BigSerial => TypeCategory::Int,
+        CanonicalType::Real | CanonicalType::Double | CanonicalType::Decimal(_) => {
+            TypeCategory::Float
+        }
+        CanonicalType::Boolean => TypeCategory::Bool,
+        CanonicalType::Uuid => TypeCategory::Uuid,
+        CanonicalType::Date => TypeCategory::Date,
+        CanonicalType::Timestamp | CanonicalType::TimestampNtz => TypeCategory::Timestamp,
+        CanonicalType::Time | CanonicalType::Timetz => TypeCategory::Time,
+        CanonicalType::Json | CanonicalType::Jsonb | CanonicalType::AssetArray => {
+            TypeCategory::Json
+        }
+        CanonicalType::Bytes => TypeCategory::Bytes,
+        CanonicalType::Array(_) | CanonicalType::Custom(_) => TypeCategory::Other,
+    }
+}
+
+/// Classify a cast-name string (as stored in `ColumnInfo.pg_type`) into a [`TypeCategory`].
+/// Used as a fallback when the [`CanonicalType`] is not directly available (e.g. synthetic
+/// audit columns).
+pub fn type_category_from_cast(cast: &str) -> TypeCategory {
+    let base = cast
+        .trim_end_matches("[]")
+        .split('(')
+        .next()
+        .unwrap_or(cast)
+        .trim()
+        .to_lowercase();
+    match base.as_str() {
+        "text" | "varchar" | "char" | "bpchar" | "citext" | "name" | "character varying"
+        | "character" => TypeCategory::Text,
+        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial" | "bigserial"
+        | "smallserial" => TypeCategory::Int,
+        "float4" | "float8" | "numeric" | "decimal" | "real" | "money" | "double precision" => {
+            TypeCategory::Float
+        }
+        "bool" | "boolean" => TypeCategory::Bool,
+        "uuid" => TypeCategory::Uuid,
+        "date" => TypeCategory::Date,
+        "timestamp"
+        | "timestamptz"
+        | "timestamp with time zone"
+        | "timestamp without time zone" => TypeCategory::Timestamp,
+        "time" | "timetz" | "time with time zone" | "time without time zone" => TypeCategory::Time,
+        "json" | "jsonb" => TypeCategory::Json,
+        "bytea" => TypeCategory::Bytes,
+        _ => TypeCategory::Other,
+    }
+}
+
+/// Return the cast name for a canonical type using the compiled-in dialect.
+///
+/// Populated from the active dialect at compile time so that `resolve()` (which has no
+/// dialect parameter) can fill `ColumnInfo.pg_type` correctly without a runtime lookup.
+pub fn active_cast_name(t: &CanonicalType) -> Option<String> {
+    #[cfg(feature = "postgres")]
+    return crate::db::postgres::cast_name(t);
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = t;
+        None
+    }
 }

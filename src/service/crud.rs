@@ -1,20 +1,41 @@
 //! Generic CRUD execution against PostgreSQL.
 
 use crate::config::ResolvedEntity;
+use crate::db::pool::{Connection, DbRow, Pool};
+use crate::db::Dialect;
 use crate::error::AppError;
 use crate::sql::{
     archive, coerce_json_value_for_pg_array, delete, insert, select_by_column_in, select_by_id,
-    select_list, select_list_with_includes, unarchive, update, FilterNode, IncludeSelect,
-    PgBindValue, QueryBuf, SortSpec,
+    select_list, select_list_with_includes, unarchive, update, BindValue, FilterNode,
+    IncludeSelect, QueryBuf, SortSpec,
 };
 use serde_json::Value;
-use sqlx::PgPool;
 use std::collections::HashMap;
 
 /// Execution target: either a pool (for database/schema strategy) or a single connection (for RLS, with SET LOCAL already applied).
-pub enum TenantExecutor<'a> {
-    Pool(&'a PgPool),
-    Conn(&'a mut sqlx::PgConnection),
+pub enum TenantExecutorInner<'a> {
+    Pool(&'a Pool),
+    Conn(&'a mut Connection),
+}
+
+pub struct TenantExecutor<'a> {
+    pub executor: TenantExecutorInner<'a>,
+    pub dialect: &'a dyn crate::db::Dialect,
+}
+
+impl<'a> TenantExecutor<'a> {
+    pub fn pool(pool: &'a Pool, dialect: &'a dyn crate::db::Dialect) -> Self {
+        TenantExecutor {
+            executor: TenantExecutorInner::Pool(pool),
+            dialect,
+        }
+    }
+    pub fn conn(conn: &'a mut Connection, dialect: &'a dyn crate::db::Dialect) -> Self {
+        TenantExecutor {
+            executor: TenantExecutorInner::Conn(conn),
+            dialect,
+        }
+    }
 }
 
 pub struct CrudService;
@@ -32,6 +53,7 @@ impl CrudService {
         offset: Option<u32>,
         filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
@@ -44,6 +66,7 @@ impl CrudService {
             Some(offset),
             filter_includes,
             schema_override,
+            dialect,
         )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
@@ -61,6 +84,7 @@ impl CrudService {
         includes: &[IncludeSelect<'_>],
         filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
@@ -74,6 +98,7 @@ impl CrudService {
             includes,
             filter_includes,
             schema_override,
+            dialect,
         )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
@@ -84,8 +109,9 @@ impl CrudService {
         entity: &ResolvedEntity,
         id: &Value,
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let q = select_by_id(entity, schema_override);
+        let q = select_by_id(entity, schema_override, dialect);
         Self::query_one_exec(executor, &q.sql, std::slice::from_ref(id)).await
     }
 
@@ -96,11 +122,12 @@ impl CrudService {
         column_name: &str,
         values: &[Value],
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
         if values.is_empty() {
             return Ok(Vec::new());
         }
-        let q = select_by_column_in(entity, column_name, values, schema_override);
+        let q = select_by_column_in(entity, column_name, values, schema_override, dialect);
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 
@@ -114,6 +141,7 @@ impl CrudService {
         schema_override: Option<&str>,
         rls_tenant_id: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Value, AppError> {
         let include_pk = body.contains_key(&entity.pk_columns[0]);
         let q = insert(
@@ -123,6 +151,7 @@ impl CrudService {
             schema_override,
             rls_tenant_id,
             caller_user_id,
+            dialect,
         );
         let row = Self::execute_returning_one_exec(executor, &q)
             .await?
@@ -151,14 +180,15 @@ impl CrudService {
         body: &HashMap<String, Value>,
         schema_override: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
         let pre_row = if entity.audit_log {
-            let q = select_by_id(entity, schema_override);
+            let q = select_by_id(entity, schema_override, dialect);
             Self::query_one_exec(executor, &q.sql, std::slice::from_ref(id)).await?
         } else {
             None
         };
-        let q = update(entity, id, body, schema_override, caller_user_id);
+        let q = update(entity, id, body, schema_override, caller_user_id, dialect);
         let result = Self::execute_returning_one_exec(executor, &q).await?;
         if entity.audit_log {
             if let Some(ref post_row) = result {
@@ -185,8 +215,9 @@ impl CrudService {
         id: &Value,
         schema_override: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let q = delete(entity, schema_override);
+        let q = delete(entity, schema_override, dialect);
         let result = Self::execute_returning_one_with_params_exec(
             executor,
             &q.sql,
@@ -218,8 +249,9 @@ impl CrudService {
         archive_field: &str,
         id: &Value,
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let q = archive(entity, archive_field, schema_override);
+        let q = archive(entity, archive_field, schema_override, dialect);
         Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
             .await
     }
@@ -232,8 +264,9 @@ impl CrudService {
         archive_field: &str,
         id: &Value,
         schema_override: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let q = unarchive(entity, archive_field, schema_override);
+        let q = unarchive(entity, archive_field, schema_override, dialect);
         Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
             .await
     }
@@ -248,6 +281,7 @@ impl CrudService {
         schema_override: Option<&str>,
         rls_tenant_id: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -257,8 +291,8 @@ impl CrudService {
             )));
         }
         let mut out = Vec::with_capacity(items.len());
-        match executor {
-            TenantExecutor::Pool(pool) => {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
@@ -269,6 +303,7 @@ impl CrudService {
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
+                        dialect,
                     );
                     let row = Self::execute_returning_one_tx(&mut tx, &q)
                         .await?
@@ -277,7 +312,7 @@ impl CrudService {
                 }
                 tx.commit().await?;
             }
-            TenantExecutor::Conn(conn) => {
+            TenantExecutorInner::Conn(ref mut conn) => {
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
                     let q = insert(
@@ -287,6 +322,7 @@ impl CrudService {
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
+                        dialect,
                     );
                     let row = Self::execute_returning_one_conn(conn, &q)
                         .await?
@@ -308,6 +344,7 @@ impl CrudService {
         schema_override: Option<&str>,
         rls_tenant_id: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -318,8 +355,8 @@ impl CrudService {
         }
         let mut out = Vec::with_capacity(items.len());
         let mut row_errors: Vec<(usize, AppError)> = Vec::new();
-        match executor {
-            TenantExecutor::Pool(pool) => {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for (idx, body) in items.iter().enumerate() {
                     let sp = format!("sp_{}", idx);
@@ -334,6 +371,7 @@ impl CrudService {
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
+                        dialect,
                     );
                     match Self::execute_returning_one_tx(&mut tx, &q).await {
                         Ok(row) => {
@@ -357,7 +395,7 @@ impl CrudService {
                     out.clear();
                 }
             }
-            TenantExecutor::Conn(conn) => {
+            TenantExecutorInner::Conn(ref mut conn) => {
                 for (idx, body) in items.iter().enumerate() {
                     let sp = format!("sp_{}", idx);
                     sqlx::query(&format!("SAVEPOINT {}", sp))
@@ -371,6 +409,7 @@ impl CrudService {
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
+                        dialect,
                     );
                     match Self::execute_returning_one_conn(conn, &q).await {
                         Ok(row) => {
@@ -403,6 +442,7 @@ impl CrudService {
         items: &[HashMap<String, Value>],
         schema_override: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -413,8 +453,8 @@ impl CrudService {
         }
         let pk = &entity.pk_columns[0];
         let mut out = Vec::with_capacity(items.len());
-        match executor {
-            TenantExecutor::Pool(pool) => {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for body in items {
                     let id = body.get(pk).ok_or_else(|| {
@@ -428,6 +468,7 @@ impl CrudService {
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
+                        dialect,
                     );
                     if let Some(row) = Self::execute_returning_one_tx(&mut tx, &q).await? {
                         out.push(row);
@@ -435,7 +476,7 @@ impl CrudService {
                 }
                 tx.commit().await?;
             }
-            TenantExecutor::Conn(conn) => {
+            TenantExecutorInner::Conn(ref mut conn) => {
                 for body in items {
                     let id = body.get(pk).ok_or_else(|| {
                         AppError::Validation(format!("each item must have '{}'", pk))
@@ -448,6 +489,7 @@ impl CrudService {
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
+                        dialect,
                     );
                     if let Some(row) = Self::execute_returning_one_conn(conn, &q).await? {
                         out.push(row);
@@ -468,6 +510,7 @@ impl CrudService {
         items: &[HashMap<String, Value>],
         schema_override: Option<&str>,
         caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
@@ -479,8 +522,8 @@ impl CrudService {
         let pk = entity.pk_columns[0].clone();
         let mut out = Vec::with_capacity(items.len());
         let mut row_errors: Vec<(usize, AppError)> = Vec::new();
-        match executor {
-            TenantExecutor::Pool(pool) => {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for (idx, body) in items.iter().enumerate() {
                     let id = match body.get(&pk) {
@@ -505,6 +548,7 @@ impl CrudService {
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
+                        dialect,
                     );
                     match Self::execute_returning_one_tx(&mut tx, &q).await {
                         Ok(Some(row)) => {
@@ -533,7 +577,7 @@ impl CrudService {
                     out.clear();
                 }
             }
-            TenantExecutor::Conn(conn) => {
+            TenantExecutorInner::Conn(ref mut conn) => {
                 for (idx, body) in items.iter().enumerate() {
                     let id = match body.get(&pk) {
                         Some(id) => id.clone(),
@@ -557,6 +601,7 @@ impl CrudService {
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
+                        dialect,
                     );
                     match Self::execute_returning_one_conn(conn, &q).await {
                         Ok(Some(row)) => {
@@ -593,9 +638,11 @@ impl CrudService {
     ) -> Result<Option<Value>, AppError> {
         tracing::debug!(sql = %sql, params = ?params, "query");
         let bind = Self::to_sqlx_param(&params[0]);
-        let row = match executor {
-            TenantExecutor::Pool(pool) => sqlx::query(sql).bind(bind).fetch_optional(*pool).await?,
-            TenantExecutor::Conn(conn) => {
+        let row = match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
+                sqlx::query(sql).bind(bind).fetch_optional(pool).await?
+            }
+            TenantExecutorInner::Conn(ref mut conn) => {
                 sqlx::query(sql)
                     .bind(bind)
                     .fetch_optional(&mut **conn)
@@ -615,9 +662,9 @@ impl CrudService {
         for p in params {
             query = query.bind(Self::to_sqlx_param(p));
         }
-        let rows = match executor {
-            TenantExecutor::Pool(pool) => query.fetch_all(*pool).await?,
-            TenantExecutor::Conn(conn) => query.fetch_all(&mut **conn).await?,
+        let rows = match executor.executor {
+            TenantExecutorInner::Pool(pool) => query.fetch_all(pool).await?,
+            TenantExecutorInner::Conn(ref mut conn) => query.fetch_all(&mut **conn).await?,
         };
         Ok(rows.iter().map(row_to_json).collect())
     }
@@ -631,9 +678,9 @@ impl CrudService {
         for p in &q.params {
             query = query.bind(Self::to_sqlx_param(p));
         }
-        let row = match executor {
-            TenantExecutor::Pool(pool) => query.fetch_optional(*pool).await?,
-            TenantExecutor::Conn(conn) => query.fetch_optional(&mut **conn).await?,
+        let row = match executor.executor {
+            TenantExecutorInner::Pool(pool) => query.fetch_optional(pool).await?,
+            TenantExecutorInner::Conn(ref mut conn) => query.fetch_optional(&mut **conn).await?,
         };
         Ok(row.map(|r| row_to_json(&r)))
     }
@@ -648,15 +695,15 @@ impl CrudService {
         for p in params {
             query = query.bind(Self::to_sqlx_param(p));
         }
-        let row = match executor {
-            TenantExecutor::Pool(pool) => query.fetch_optional(*pool).await?,
-            TenantExecutor::Conn(conn) => query.fetch_optional(&mut **conn).await?,
+        let row = match executor.executor {
+            TenantExecutorInner::Pool(pool) => query.fetch_optional(pool).await?,
+            TenantExecutorInner::Conn(ref mut conn) => query.fetch_optional(&mut **conn).await?,
         };
         Ok(row.map(|r| row_to_json(&r)))
     }
 
     async fn execute_returning_one_conn(
-        conn: &mut sqlx::PgConnection,
+        conn: &mut Connection,
         q: &QueryBuf,
     ) -> Result<Option<Value>, AppError> {
         tracing::debug!(sql = %q.sql, params = ?q.params, "query (conn)");
@@ -669,7 +716,7 @@ impl CrudService {
     }
 
     async fn execute_returning_one_tx(
-        tx: &mut sqlx::PgConnection,
+        tx: &mut Connection,
         q: &QueryBuf,
     ) -> Result<Option<Value>, AppError> {
         tracing::debug!(sql = %q.sql, params = ?q.params, "query (tx)");
@@ -681,8 +728,8 @@ impl CrudService {
         Ok(row.map(|r| row_to_json(&r)))
     }
 
-    fn to_sqlx_param(v: &Value) -> PgBindValue {
-        PgBindValue::from_json(v).unwrap_or(PgBindValue::Null)
+    fn to_sqlx_param(v: &Value) -> BindValue {
+        BindValue::from_json(v).unwrap_or(BindValue::Null)
     }
 
     async fn insert_audit<'a>(
@@ -758,11 +805,11 @@ impl CrudService {
         for p in &params {
             query = query.bind(Self::to_sqlx_param(p));
         }
-        match executor {
-            TenantExecutor::Pool(pool) => {
-                query.execute(*pool).await?;
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
+                query.execute(pool).await?;
             }
-            TenantExecutor::Conn(conn) => {
+            TenantExecutorInner::Conn(ref mut conn) => {
                 query.execute(&mut **conn).await?;
             }
         }
@@ -793,7 +840,7 @@ fn compute_changed_fields(pre: &Value, post: &Value, entity: &ResolvedEntity) ->
     Value::Object(changes)
 }
 
-fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
+fn row_to_json(row: &DbRow) -> Value {
     use sqlx::Column;
     use sqlx::Row;
     let mut map = serde_json::Map::new();
@@ -805,7 +852,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
     Value::Object(map)
 }
 
-fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
+fn cell_to_value(row: &DbRow, name: &str) -> Value {
     use sqlx::Row;
     if let Ok(Some(n)) = row.try_get::<Option<i16>, _>(name) {
         return Value::Number(n.into());
@@ -829,9 +876,11 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     if let Ok(Some(b)) = row.try_get::<Option<bool>, _>(name) {
         return Value::Bool(b);
     }
+    #[cfg(feature = "postgres")]
     if let Ok(Some(vec)) = row.try_get::<Option<Vec<String>>, _>(name) {
         return Value::Array(vec.into_iter().map(Value::String).collect());
     }
+    #[cfg(feature = "postgres")]
     if let Ok(Some(vec)) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(name) {
         return Value::Array(
             vec.into_iter()
@@ -839,6 +888,7 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
                 .collect(),
         );
     }
+    #[cfg(feature = "postgres")]
     if let Ok(Some(vec)) = row.try_get::<Option<Vec<i64>>, _>(name) {
         return Value::Array(vec.into_iter().map(|n| Value::Number(n.into())).collect());
     }

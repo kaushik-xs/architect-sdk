@@ -1,8 +1,8 @@
 //! Multi-tenant registry: strategy and config per tenant, loaded from central DB.
 
+use crate::db::pool::Pool;
 use crate::error::AppError;
 use crate::store::qualified_sys_table;
-use sqlx::PgPool;
 use std::collections::HashMap;
 
 /// Tenant isolation strategy.
@@ -104,7 +104,7 @@ impl TenantRegistry {
 }
 
 /// Load tenant registry from architect._sys_tenants. Invalid rows are skipped (missing database_url for database strategy).
-pub async fn load_registry_from_pool(pool: &PgPool) -> Result<TenantRegistry, AppError> {
+pub async fn load_registry_from_pool(pool: &Pool) -> Result<TenantRegistry, AppError> {
     let q_table = qualified_sys_table("_sys_tenants");
     let sql = format!(
         "SELECT id, strategy, database_url FROM {} ORDER BY id",

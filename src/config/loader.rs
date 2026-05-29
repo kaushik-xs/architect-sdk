@@ -5,10 +5,10 @@ use crate::config::resolved::{
 };
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
-use crate::db::{parse_canonical, postgres as pg};
+use crate::db::pool::Pool;
+use crate::db::{active_cast_name, parse_canonical};
 use crate::error::ConfigError;
 use crate::store::qualified_sys_table;
-use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 
 /// Build resolved model from full config (call after validate).
@@ -78,9 +78,8 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     canonical,
                     crate::db::CanonicalType::Asset | crate::db::CanonicalType::AssetArray
                 );
-                let asset_is_array =
-                    matches!(canonical, crate::db::CanonicalType::AssetArray);
-                let pg_type = pg::cast_name(&canonical);
+                let asset_is_array = matches!(canonical, crate::db::CanonicalType::AssetArray);
+                let pg_type = active_cast_name(&canonical);
                 ColumnInfo {
                     name: c.name.clone(),
                     pk_type: if is_pk { Some(pk_type.clone()) } else { None },
@@ -95,10 +94,14 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             .collect();
 
         let config_col_names: HashSet<String> = columns.iter().map(|c| c.name.clone()).collect();
+        // Use active_cast_name so the cast is correct per dialect
+        // (timestamptz for Postgres, None for SQLite/MySQL which need no cast).
+        let ts_cast = active_cast_name(&crate::db::CanonicalType::Timestamp);
+        let ts_cast_str: Option<&str> = ts_cast.as_deref();
         for (name, nullable, has_default, pg_type) in [
-            ("created_at", false, true, Some("timestamptz")),
-            ("updated_at", false, true, Some("timestamptz")),
-            ("archived_at", true, false, Some("timestamptz")),
+            ("created_at", false, true, ts_cast_str),
+            ("updated_at", false, true, ts_cast_str),
+            ("archived_at", true, false, ts_cast_str),
             ("created_by", true, false, None),
             ("updated_by", true, false, None),
         ] {
@@ -243,7 +246,6 @@ fn build_includes_for_table(
     includes
 }
 
-
 /// Build the column list for a synthetic audit entity.
 /// Prepends the five audit metadata columns then appends all source columns with pk_type cleared
 /// (audit_id is the new PK, so source PKs become regular queryable columns).
@@ -338,7 +340,7 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
 }
 
 /// Load full config from architect._sys_* tables for one package. Tables must already exist (ensure_sys_tables).
-pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfig, ConfigError> {
+pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig, ConfigError> {
     let mut schemas =
         load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas"), package_id)
             .await?;
@@ -394,7 +396,7 @@ pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfi
 }
 
 async fn load_config_table<T>(
-    pool: &PgPool,
+    pool: &Pool,
     table: &str,
     package_id: &str,
 ) -> Result<Vec<T>, ConfigError>

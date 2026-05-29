@@ -22,8 +22,6 @@ use axum::{
     Json,
 };
 use serde_json::Value;
-use sqlx::pool::PoolConnection;
-use sqlx::Postgres;
 use std::collections::{HashMap, HashSet};
 
 /// Remove sensitive column keys from a row object. No-op if sensitive_columns is empty.
@@ -113,25 +111,26 @@ async fn enrich_with_parent_ref<'a>(
         return Ok(());
     }
 
-    // Fetch id → natural_key for all parent rows in one query.
+    // Fetch id → natural_key for all parent rows in one query using portable IN (...).
+    let d = executor.dialect;
+    let phs: Vec<String> = (1..=parent_ids.len()).map(|i| d.placeholder(i)).collect();
     let select_sql = format!(
-        "SELECT {pk_q}::text, {ref_q} FROM {table} WHERE {pk_q} = ANY($1)",
-        pk_q = q(pk),
-        ref_q = q(ref_col),
+        "SELECT {pk_q}, {ref_q} FROM {table} WHERE {pk_q} IN ({placeholders})",
+        pk_q = d.quote_ident(pk),
+        ref_q = d.quote_ident(ref_col),
         table = table_q,
+        placeholders = phs.join(", "),
     );
-    let db_rows: Vec<(String, String)> = match executor {
-        crate::service::TenantExecutor::Pool(pool) => {
-            sqlx::query_as::<_, (String, String)>(&select_sql)
-                .bind(&parent_ids)
-                .fetch_all(*pool)
-                .await?
+    let db_rows: Vec<(String, String)> = {
+        let mut qry = sqlx::query_as::<_, (String, String)>(&select_sql);
+        for id in &parent_ids {
+            qry = qry.bind(id.to_string());
         }
-        crate::service::TenantExecutor::Conn(conn) => {
-            sqlx::query_as::<_, (String, String)>(&select_sql)
-                .bind(&parent_ids)
-                .fetch_all(&mut **conn)
-                .await?
+        match executor.executor {
+            crate::service::TenantExecutorInner::Pool(pool) => qry.fetch_all(pool).await?,
+            crate::service::TenantExecutorInner::Conn(ref mut conn) => {
+                qry.fetch_all(&mut **conn).await?
+            }
         }
     };
     let uuid_to_ref: HashMap<String, String> = db_rows.into_iter().collect();
@@ -219,24 +218,25 @@ async fn resolve_and_update_parent_refs<'a>(
 
     if !missing.is_empty() {
         // Cast pk to text in the SELECT so sqlx can decode it as String regardless of column type.
+        let d = executor.dialect;
+        let phs: Vec<String> = (1..=missing.len()).map(|i| d.placeholder(i)).collect();
         let select_sql = format!(
-            "SELECT {pk_q}::text, {ref_q} FROM {table} WHERE {ref_q} = ANY($1)",
-            pk_q = q(&pk),
-            ref_q = q(ref_col),
+            "SELECT {pk_q}, {ref_q} FROM {table} WHERE {ref_q} IN ({placeholders})",
+            pk_q = d.quote_ident(&pk),
+            ref_q = d.quote_ident(ref_col),
             table = table_q,
+            placeholders = phs.join(", "),
         );
-        let db_rows: Vec<(String, String)> = match executor {
-            crate::service::TenantExecutor::Pool(pool) => {
-                sqlx::query_as::<_, (String, String)>(&select_sql)
-                    .bind(missing)
-                    .fetch_all(*pool)
-                    .await?
+        let db_rows: Vec<(String, String)> = {
+            let mut qry = sqlx::query_as::<_, (String, String)>(&select_sql);
+            for s in missing.iter() {
+                qry = qry.bind(s.to_string());
             }
-            crate::service::TenantExecutor::Conn(conn) => {
-                sqlx::query_as::<_, (String, String)>(&select_sql)
-                    .bind(missing)
-                    .fetch_all(&mut **conn)
-                    .await?
+            match executor.executor {
+                crate::service::TenantExecutorInner::Pool(pool) => qry.fetch_all(pool).await?,
+                crate::service::TenantExecutorInner::Conn(ref mut conn) => {
+                    qry.fetch_all(&mut **conn).await?
+                }
             }
         };
         for (uuid, ref_val) in db_rows {
@@ -281,15 +281,15 @@ async fn resolve_and_update_parent_refs<'a>(
                 .map_err(|_| AppError::BadRequest(format!("invalid uuid: {}", parent_uuid_str)))?;
             let row_uuid = uuid::Uuid::parse_str(&row_uuid_str)
                 .map_err(|_| AppError::BadRequest(format!("invalid uuid: {}", row_uuid_str)))?;
-            match executor {
-                crate::service::TenantExecutor::Pool(pool) => {
+            match executor.executor {
+                crate::service::TenantExecutorInner::Pool(pool) => {
                     sqlx::query(&update_sql)
                         .bind(parent_uuid)
                         .bind(row_uuid)
-                        .execute(*pool)
+                        .execute(pool)
                         .await?;
                 }
-                crate::service::TenantExecutor::Conn(conn) => {
+                crate::service::TenantExecutorInner::Conn(ref mut conn) => {
                     sqlx::query(&update_sql)
                         .bind(parent_uuid)
                         .bind(row_uuid)
@@ -298,15 +298,15 @@ async fn resolve_and_update_parent_refs<'a>(
                 }
             }
         } else {
-            match executor {
-                crate::service::TenantExecutor::Pool(pool) => {
+            match executor.executor {
+                crate::service::TenantExecutorInner::Pool(pool) => {
                     sqlx::query(&update_sql)
                         .bind(parent_uuid_str)
                         .bind(&row_uuid_str)
-                        .execute(*pool)
+                        .execute(pool)
                         .await?;
                 }
-                crate::service::TenantExecutor::Conn(conn) => {
+                crate::service::TenantExecutorInner::Conn(ref mut conn) => {
                     sqlx::query(&update_sql)
                         .bind(parent_uuid_str)
                         .bind(&row_uuid_str)
@@ -440,6 +440,28 @@ async fn parse_multipart(
         .collect();
 
     Ok((body, files))
+}
+
+/// Return an error if the entity has asset/asset[] columns but no storage provider is configured.
+/// Called at the top of every write handler so the error is immediate and descriptive.
+fn require_storage_for_assets(state: &AppState, entity: &ResolvedEntity) -> Result<(), AppError> {
+    if state.storage.is_none() {
+        let asset_cols: Vec<&str> = entity
+            .columns
+            .iter()
+            .filter(|c| c.is_asset)
+            .map(|c| c.name.as_str())
+            .collect();
+        if !asset_cols.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "entity '{}' has asset column(s) [{}] but no storage provider is configured. \
+                 Set the STORAGE_PROVIDER environment variable (s3 | azure | gcs | rustfs).",
+                entity.path_segment,
+                asset_cols.join(", ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Upload all file fields that correspond to asset columns, inserting paths into body.
@@ -892,21 +914,21 @@ fn resolve_includes(
 /// Resolved tenant context: pool (or pool to acquire from for RLS), schema override, and for RLS the tenant_id to set.
 pub enum TenantContext {
     Pool {
-        pool: sqlx::PgPool,
+        pool: crate::db::pool::Pool,
         schema_override: Option<String>,
-        config_pool: sqlx::PgPool,
+        config_pool: crate::db::pool::Pool,
         package_cache_key: String,
     },
     Rls {
         tenant_id: String,
-        pool: sqlx::PgPool,
-        config_pool: sqlx::PgPool,
+        pool: crate::db::pool::Pool,
+        config_pool: crate::db::pool::Pool,
         package_cache_key: String,
     },
 }
 
 impl TenantContext {
-    pub fn config_pool(&self) -> &sqlx::PgPool {
+    pub fn config_pool(&self) -> &crate::db::pool::Pool {
         match self {
             TenantContext::Pool { config_pool, .. } | TenantContext::Rls { config_pool, .. } => {
                 config_pool
@@ -914,7 +936,7 @@ impl TenantContext {
         }
     }
     /// Pool used for DDL (migrations) and entity data. For schema/rls with database_url this is the tenant DB; otherwise architect DB.
-    pub fn migration_pool(&self) -> &sqlx::PgPool {
+    pub fn migration_pool(&self) -> &crate::db::pool::Pool {
         match self {
             TenantContext::Pool { pool, .. } | TenantContext::Rls { pool, .. } => pool,
         }
@@ -1012,7 +1034,7 @@ pub async fn get_or_create_tenant_pool(
     state: &AppState,
     tenant_id: &str,
     database_url: &str,
-) -> Result<sqlx::PgPool, AppError> {
+) -> Result<crate::db::pool::Pool, AppError> {
     let existing = {
         let guard = state
             .tenant_pools
@@ -1023,10 +1045,35 @@ pub async fn get_or_create_tenant_pool(
     if let Some(p) = existing {
         return Ok(p);
     }
-    let new_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await?;
+    let new_pool = {
+        #[cfg(feature = "postgres")]
+        {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(database_url)
+                .await?
+        }
+        #[cfg(feature = "mysql")]
+        {
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(5)
+                .connect(database_url)
+                .await?
+        }
+        #[cfg(feature = "sqlite")]
+        {
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect(database_url)
+                .await?
+        }
+        #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
+        {
+            return Err(AppError::BadRequest(
+                "no database dialect feature enabled".into(),
+            ));
+        }
+    };
     {
         let mut guard = state
             .tenant_pools
@@ -1043,7 +1090,7 @@ pub async fn get_or_create_tenant_pool(
 /// package_id is used for load_from_pool (config table package_id); cache_key is for the in-memory cache (e.g. "pkg" or "pkg:tenant_id").
 pub(crate) async fn get_or_load_package_model(
     state: &AppState,
-    config_pool: &sqlx::PgPool,
+    config_pool: &crate::db::pool::Pool,
     cache_key: &str,
     package_id: &str,
 ) -> Result<ResolvedModel, AppError> {
@@ -1113,6 +1160,7 @@ async fn attach_includes<'a>(
     _entity: &ResolvedEntity,
     rows: &mut [Value],
     resolved_includes: &[(String, crate::config::IncludeSpec, ResolvedEntity)],
+    dialect: &dyn crate::db::Dialect,
 ) -> Result<(), AppError> {
     if resolved_includes.is_empty() || rows.is_empty() {
         return Ok(());
@@ -1130,6 +1178,7 @@ async fn attach_includes<'a>(
                     &spec.their_key_column,
                     &keys,
                     schema_override,
+                    dialect,
                 )
                 .await?;
                 let mut key_to_row: HashMap<String, Value> = HashMap::new();
@@ -1168,6 +1217,7 @@ async fn attach_includes<'a>(
                     &spec.their_key_column,
                     &keys,
                     schema_override,
+                    dialect,
                 )
                 .await?;
                 let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
@@ -1234,25 +1284,28 @@ pub async fn list(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
 
@@ -1365,6 +1418,7 @@ pub async fn list(
             offset,
             &filter_include_selects,
             schema_override,
+            state.dialect.as_ref(),
         )
         .await?
     } else {
@@ -1388,6 +1442,7 @@ pub async fn list(
             data_include_selects.as_slice(),
             &filter_include_selects,
             schema_override,
+            state.dialect.as_ref(),
         )
         .await?;
         post_process_include_columns(&mut rows, &resolved_data);
@@ -1428,25 +1483,28 @@ pub async fn create(
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -1459,6 +1517,7 @@ pub async fn create(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -1500,6 +1559,7 @@ pub async fn create(
         schema_override,
         ctx.rls_tenant_id(),
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     let raw_row = row.clone();
@@ -1534,25 +1594,28 @@ pub async fn read(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -1574,9 +1637,15 @@ pub async fn read(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(id_str))?;
+    let mut row = CrudService::read(
+        &mut executor,
+        &entity,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(id_str))?;
     let include_names: Vec<String> = params
         .get("include")
         .map(|s| {
@@ -1601,6 +1670,7 @@ pub async fn read(
             &entity,
             &mut rows,
             &resolved,
+            state.dialect.as_ref(),
         )
         .await?;
         row = rows[0].clone();
@@ -1649,25 +1719,28 @@ pub async fn update(
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -1680,6 +1753,7 @@ pub async fn update(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -1725,7 +1799,14 @@ pub async fn update(
                 e.on == "update" && e.condition.as_ref().is_some_and(|c| c.changed_to.is_some())
             }));
     let pre_update_row = if needs_pre_read {
-        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+        CrudService::read(
+            &mut executor,
+            &entity,
+            &id,
+            schema_override,
+            state.dialect.as_ref(),
+        )
+        .await?
     } else {
         None
     };
@@ -1737,6 +1818,7 @@ pub async fn update(
         &body,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?
     .ok_or_else(|| AppError::NotFound(id_str))?;
@@ -1779,25 +1861,28 @@ pub async fn delete(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -1824,7 +1909,14 @@ pub async fn delete(
     let pre_delete_row = if (state.event_client.is_some() && !entity.events.is_empty())
         || (entity_has_assets && state.storage.is_some())
     {
-        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+        CrudService::read(
+            &mut executor,
+            &entity,
+            &id,
+            schema_override,
+            state.dialect.as_ref(),
+        )
+        .await?
     } else {
         None
     };
@@ -1834,6 +1926,7 @@ pub async fn delete(
         &id,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
 
@@ -1871,25 +1964,28 @@ pub async fn bulk_create(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -1902,6 +1998,7 @@ pub async fn bulk_create(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -1946,6 +2043,7 @@ pub async fn bulk_create(
         schema_override,
         ctx.rls_tenant_id(),
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     if !db_errs.is_empty() {
@@ -2004,25 +2102,28 @@ pub async fn bulk_update(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -2035,6 +2136,7 @@ pub async fn bulk_update(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2072,6 +2174,7 @@ pub async fn bulk_update(
         &items,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     if !db_errs.is_empty() {
@@ -2127,25 +2230,28 @@ pub async fn list_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2240,6 +2346,7 @@ pub async fn list_package(
             offset,
             &filter_include_selects,
             schema_override,
+            state.dialect.as_ref(),
         )
         .await?
     } else {
@@ -2263,6 +2370,7 @@ pub async fn list_package(
             data_include_selects.as_slice(),
             &filter_include_selects,
             schema_override,
+            state.dialect.as_ref(),
         )
         .await?;
         post_process_include_columns(&mut rows, &resolved_data);
@@ -2307,25 +2415,28 @@ pub async fn create_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2335,6 +2446,7 @@ pub async fn create_package(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2375,6 +2487,7 @@ pub async fn create_package(
         schema_override,
         ctx.rls_tenant_id(),
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     let raw_row = row.clone();
@@ -2416,25 +2529,28 @@ pub async fn read_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2453,9 +2569,15 @@ pub async fn read_package(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(id_str.clone()))?;
+    let mut row = CrudService::read(
+        &mut executor,
+        &entity,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(id_str.clone()))?;
     let include_names: Vec<String> = params
         .get("include")
         .map(|s| {
@@ -2474,6 +2596,7 @@ pub async fn read_package(
             &entity,
             &mut rows,
             &resolved,
+            state.dialect.as_ref(),
         )
         .await?;
         row = rows[0].clone();
@@ -2528,25 +2651,28 @@ pub async fn update_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2556,6 +2682,7 @@ pub async fn update_package(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2594,7 +2721,14 @@ pub async fn update_package(
     // Pre-read for asset hard-delete on PATCH.
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
     let pre_update_row = if entity_has_assets && state.storage.is_some() {
-        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+        CrudService::read(
+            &mut executor,
+            &entity,
+            &id,
+            schema_override,
+            state.dialect.as_ref(),
+        )
+        .await?
     } else {
         None
     };
@@ -2606,6 +2740,7 @@ pub async fn update_package(
         &body,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?
     .ok_or_else(|| AppError::NotFound(id_str))?;
@@ -2655,25 +2790,28 @@ pub async fn delete_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2697,7 +2835,14 @@ pub async fn delete_package(
     let pre_delete_row = if (state.event_client.is_some() && !entity.events.is_empty())
         || (entity_has_assets && state.storage.is_some())
     {
-        CrudService::read(&mut executor, &entity, &id, schema_override).await?
+        CrudService::read(
+            &mut executor,
+            &entity,
+            &id,
+            schema_override,
+            state.dialect.as_ref(),
+        )
+        .await?
     } else {
         None
     };
@@ -2707,6 +2852,7 @@ pub async fn delete_package(
         &id,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
 
@@ -2751,25 +2897,28 @@ pub async fn bulk_create_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2779,6 +2928,7 @@ pub async fn bulk_create_package(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2822,6 +2972,7 @@ pub async fn bulk_create_package(
         schema_override,
         ctx.rls_tenant_id(),
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     if !db_errs.is_empty() {
@@ -2887,25 +3038,28 @@ pub async fn bulk_update_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -2915,6 +3069,7 @@ pub async fn bulk_update_package(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2952,6 +3107,7 @@ pub async fn bulk_update_package(
         &items,
         schema_override,
         user_id_opt.as_deref(),
+        state.dialect.as_ref(),
     )
     .await?;
     if !db_errs.is_empty() {
@@ -3001,25 +3157,28 @@ pub async fn archive(
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -3044,9 +3203,16 @@ pub async fn archive(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::archive(&mut executor, &entity, archive_field, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    let mut row = CrudService::archive(
+        &mut executor,
+        &entity,
+        archive_field,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -3083,25 +3249,28 @@ pub async fn unarchive(
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = state
@@ -3126,12 +3295,16 @@ pub async fn unarchive(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row =
-        CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!("{} not found or not currently archived", id_str))
-            })?;
+    let mut row = CrudService::unarchive(
+        &mut executor,
+        &entity,
+        archive_field,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -3173,25 +3346,28 @@ pub async fn unarchive_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -3213,12 +3389,16 @@ pub async fn unarchive_package(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row =
-        CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!("{} not found or not currently archived", id_str))
-            })?;
+    let mut row = CrudService::unarchive(
+        &mut executor,
+        &entity,
+        archive_field,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -3260,25 +3440,28 @@ pub async fn archive_package(
     )
     .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<PoolConnection<Postgres>> = None;
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
             schema_override,
             ..
-        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
         TenantContext::Rls {
             tenant_id, pool, ..
         } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!(
-                "SET LOCAL app.tenant_id = '{}'",
-                tenant_id.replace('\'', "''")
-            ))
-            .execute(&mut *conn)
-            .await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
             rls_conn = Some(conn);
-            (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
         }
     };
     let entity = model
@@ -3300,9 +3483,16 @@ pub async fn archive_package(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::archive(&mut executor, &entity, archive_field, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    let mut row = CrudService::archive(
+        &mut executor,
+        &entity,
+        archive_field,
+        &id,
+        schema_override,
+        state.dialect.as_ref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);

@@ -65,17 +65,17 @@ pub struct ErrorDetail {
 }
 
 /// Extract the column name from a PostgreSQL error.
-/// Downcasts to `PgDatabaseError` to access the `detail` field, which looks like:
-/// "Key (u_id)=(M-101) already exists."
+/// Extract a field name from a database constraint violation error, where available.
+/// On Postgres, this parses the `detail` field of `PgDatabaseError` (e.g. "Key (email)=... already exists").
+/// On other dialects the function returns `None` — callers fall back to generic messages.
 pub fn db_error_field(e: &AppError) -> Option<String> {
+    #[cfg(feature = "postgres")]
     if let AppError::Db(sqlx::Error::Database(ref db_err)) = e {
-        // detail() is on PgDatabaseError, not the base DatabaseError trait
         if let Some(pg_err) = db_err.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
             if let Some(detail) = pg_err.detail() {
                 if let Some(start) = detail.find('(') {
                     if let Some(end) = detail[start + 1..].find(')') {
                         let field = &detail[start + 1..start + 1 + end];
-                        // Reject composite keys (contains comma) and blanks
                         if !field.is_empty() && !field.contains(',') {
                             return Some(field.trim().to_string());
                         }
@@ -84,6 +84,8 @@ pub fn db_error_field(e: &AppError) -> Option<String> {
             }
         }
     }
+    #[cfg(not(feature = "postgres"))]
+    let _ = e;
     None
 }
 
