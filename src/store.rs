@@ -812,8 +812,8 @@ pub async fn create_pool(database_url: &str, max_connections: u32) -> Result<Poo
 pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> {
     #[cfg(feature = "postgres")]
     {
-        use std::str::FromStr;
         use sqlx::ConnectOptions as _;
+        use std::str::FromStr;
         let (admin_url, db_name) = parse_db_name_from_url(database_url)?;
         if db_name.is_empty() || db_name == "postgres" {
             return Ok(());
