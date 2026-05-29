@@ -274,6 +274,12 @@ pub struct ApiEntityConfig {
     /// Decision-hub event triggers for this entity.
     #[serde(default)]
     pub events: Vec<EntityEventTrigger>,
+    /// Column holding the human-readable natural key used to resolve `parentRef` during bulk
+    /// create (e.g. `"location_id"` for locations, `"product_id"` for products). When set, bulk
+    /// create accepts a virtual `parentRef` field; the SDK resolves it to a UUID and writes
+    /// `parent_id` in a second pass after all rows are inserted.
+    #[serde(default)]
+    pub parent_ref_column: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
