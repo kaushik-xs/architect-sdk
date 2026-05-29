@@ -13,6 +13,12 @@ repository = "https://github.com/kaushik-xs/architect-sdk"
 name = "architect_sdk"
 path = "src/lib.rs"
 
+[features]
+storage-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+storage-azure = ["dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_identity", "dep:time"]
+storage-gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
+storage-all = ["storage-s3", "storage-azure", "storage-gcs"]
+
 [dependencies]
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
@@ -31,8 +37,16 @@ regex = "1"
 dotenvy = "0.15"
 zip = "2.2"
 utoipa = { version = "5", features = ["chrono", "uuid"] }
-aws-sdk-s3 = "1"
-aws-config = "1"
 flate2 = "1"
 zstd = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Storage backends (optional — enable via features)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+azure_storage = { version = "0.20", optional = true }
+azure_storage_blobs = { version = "0.20", optional = true }
+azure_identity = { version = "0.20", optional = true }
+time = { version = "0.3", optional = true }
+google-cloud-storage = { version = "0.22", optional = true }
+google-cloud-auth = { version = "0.17", optional = true }

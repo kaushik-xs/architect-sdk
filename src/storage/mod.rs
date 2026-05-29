@@ -1,10 +1,23 @@
-//! Storage provider abstraction: upload, presign, delete for S3 and RustFS (S3-compatible).
+//! Storage provider abstraction: upload, presign, delete.
+//!
+//! Enable backends via Cargo features:
+//!   - `storage-s3`   — AWS S3 and S3-compatible endpoints (RustFS, MinIO)
+//!   - `storage-azure` — Azure Blob Storage
+//!   - `storage-gcs`  — Google Cloud Storage
+//!   - `storage-all`  — all three
+//!
+//! Set `STORAGE_PROVIDER` env var to `s3`, `rustfs`, `azure`, or `gcs` at runtime.
 
 use crate::error::AppError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use std::time::Duration;
+
+
+#[cfg(feature = "storage-azure")]
+pub mod azure;
+#[cfg(feature = "storage-gcs")]
+pub mod gcs;
 
 // ── Public result types ───────────────────────────────────────────────────────
 
@@ -28,11 +41,17 @@ pub trait StorageProvider: Send + Sync {
 
 // ── S3 / RustFS provider ──────────────────────────────────────────────────────
 
+#[cfg(feature = "storage-s3")]
 pub struct S3Provider {
     client: aws_sdk_s3::Client,
     bucket: String,
 }
 
+#[cfg(feature = "storage-s3")]
+#[allow(clippy::wildcard_imports)]
+use std::time::Duration;
+
+#[cfg(feature = "storage-s3")]
 impl S3Provider {
     /// Construct from environment variables.
     /// Required: STORAGE_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
@@ -57,6 +76,7 @@ impl S3Provider {
     }
 }
 
+#[cfg(feature = "storage-s3")]
 #[async_trait]
 impl StorageProvider for S3Provider {
     async fn upload(&self, path: &str, data: Vec<u8>, content_type: &str) -> Result<(), AppError> {
@@ -109,16 +129,31 @@ impl StorageProvider for S3Provider {
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Build a storage provider from env vars. Returns None when STORAGE_PROVIDER is not set.
-/// Set STORAGE_PROVIDER=s3 for AWS S3 or STORAGE_PROVIDER=rustfs for on-premises RustFS.
+///
+/// Supported values for `STORAGE_PROVIDER`:
+///   - `s3` / `rustfs` — AWS S3 or S3-compatible (requires feature `storage-s3`)
+///   - `azure`         — Azure Blob Storage      (requires feature `storage-azure`)
+///   - `gcs`           — Google Cloud Storage    (requires feature `storage-gcs`)
 pub async fn init_storage_provider() -> Option<Arc<dyn StorageProvider>> {
     let provider_type = std::env::var("STORAGE_PROVIDER").ok()?.to_lowercase();
     match provider_type.as_str() {
+        #[cfg(feature = "storage-s3")]
         "s3" | "rustfs" => {
             let p = S3Provider::from_env().await?;
             Some(Arc::new(p) as Arc<dyn StorageProvider>)
         }
+        #[cfg(feature = "storage-azure")]
+        "azure" => {
+            let p = azure::AzureProvider::from_env()?;
+            Some(Arc::new(p) as Arc<dyn StorageProvider>)
+        }
+        #[cfg(feature = "storage-gcs")]
+        "gcs" => {
+            let p = gcs::GcsProvider::from_env().await?;
+            Some(Arc::new(p) as Arc<dyn StorageProvider>)
+        }
         _ => {
-            tracing::warn!(provider = %provider_type, "unknown STORAGE_PROVIDER; storage disabled");
+            tracing::warn!(provider = %provider_type, "unknown STORAGE_PROVIDER or feature not enabled; storage disabled");
             None
         }
     }
