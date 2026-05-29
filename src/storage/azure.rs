@@ -10,9 +10,9 @@
 
 use crate::error::AppError;
 use async_trait::async_trait;
+use azure_storage::shared_access_signature::service_sas::BlobSasPermissions;
 use azure_storage::ConnectionString;
 use azure_storage::StorageCredentials;
-use azure_storage::shared_access_signature::service_sas::BlobSasPermissions;
 use azure_storage_blobs::prelude::BlobServiceClient;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
@@ -124,7 +124,9 @@ impl StorageProvider for AzureProvider {
                     &key_response.user_deligation_key,
                 )
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure User Delegation SAS error: {}", e)))?;
+                .map_err(|e| {
+                    AppError::Storage(format!("Azure User Delegation SAS error: {}", e))
+                })?;
 
             blob_client
                 .generate_signed_blob_url(&sas)

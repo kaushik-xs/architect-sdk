@@ -30,7 +30,11 @@ pub async fn apply_migrations(
         .schemas
         .first()
         .map(|s| s.id.as_str())
-        .ok_or_else(|| AppError::Config(crate::error::ConfigError::Validation("at least one schema required".into())))?;
+        .ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::Validation(
+                "at least one schema required".into(),
+            ))
+        })?;
 
     if let Some(s) = schema_override {
         let name = quote(s);
@@ -41,13 +45,11 @@ pub async fn apply_migrations(
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-    let columns_by_table: HashMap<_, Vec<&ColumnConfig>> = config.columns.iter().fold(
-        HashMap::new(),
-        |mut m, c| {
+    let columns_by_table: HashMap<_, Vec<&ColumnConfig>> =
+        config.columns.iter().fold(HashMap::new(), |mut m, c| {
             m.entry(c.table_id.as_str()).or_default().push(c);
             m
-        },
-    );
+        });
 
     // When schema_override is set, we only create the override schema; otherwise create config schemas.
     if schema_override.is_none() {
@@ -68,15 +70,19 @@ pub async fn apply_migrations(
 
     for e in &config.enums {
         let sid = e.schema_id.as_deref().unwrap_or(default_sid);
-        let schema = schemas_by_id
-            .get(sid)
-            .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
                 id: sid.to_string(),
-            }))?;
+            })
+        })?;
         let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let type_name = quote(&e.name);
-        let values: Vec<String> = e.values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+        let values: Vec<String> = e
+            .values
+            .iter()
+            .map(|v| format!("'{}'", v.replace('\'', "''")))
+            .collect();
         let sql = format!(
             "CREATE TYPE {}.{} AS ENUM ({})",
             schema_name,
@@ -88,12 +94,12 @@ pub async fn apply_migrations(
 
     for t in &config.tables {
         let sid = t.schema_id.as_deref().unwrap_or(default_sid);
-        let schema = schemas_by_id
-            .get(sid)
-            .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
                 id: sid.to_string(),
-            }))?;
+            })
+        })?;
         let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let table_name = quote(&t.name);
         let full_name = format!("{}.{}", schema_name, table_name);
@@ -166,7 +172,11 @@ pub async fn apply_migrations(
                 PrimaryKeyConfig::Single(s) => s.clone(),
                 PrimaryKeyConfig::Composite(v) => v[0].clone(),
             };
-            let audit_full = format!("{}.{}", quote(schema_raw), quote(&format!("{}_audit", t.name)));
+            let audit_full = format!(
+                "{}.{}",
+                quote(schema_raw),
+                quote(&format!("{}_audit", t.name))
+            );
             let idx_sql = format!(
                 "CREATE INDEX IF NOT EXISTS {} ON {} ({}, {})",
                 quote(&format!("{}_audit_record_idx", t.name)),
@@ -180,7 +190,10 @@ pub async fn apply_migrations(
         if let Some(col) = rls_tenant_column {
             if !config_col_names.contains(col) {
                 let q_col = quote(col);
-                let add_col = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT", full_name, q_col);
+                let add_col = format!(
+                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
+                    full_name, q_col
+                );
                 sqlx::query(&add_col).execute(pool).await?;
             }
             let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
@@ -197,20 +210,34 @@ pub async fn apply_migrations(
             ];
             for (suffix, cmd, using_cond, with_check) in policies.iter() {
                 let policy_name = format!("{}_{}", policy_prefix, suffix);
-                let drop_sql = format!("DROP POLICY IF EXISTS {} ON {}", quote(&policy_name), full_name);
+                let drop_sql = format!(
+                    "DROP POLICY IF EXISTS {} ON {}",
+                    quote(&policy_name),
+                    full_name
+                );
                 let _ = sqlx::query(&drop_sql).execute(pool).await;
                 let create_sql = match (using_cond, with_check) {
                     (Some(u), Some(w)) => format!(
                         "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
-                        quote(&policy_name), full_name, cmd, u, w
+                        quote(&policy_name),
+                        full_name,
+                        cmd,
+                        u,
+                        w
                     ),
                     (Some(u), None) => format!(
                         "CREATE POLICY {} ON {} FOR {} USING ( {} )",
-                        quote(&policy_name), full_name, cmd, u
+                        quote(&policy_name),
+                        full_name,
+                        cmd,
+                        u
                     ),
                     (None, Some(w)) => format!(
                         "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
-                        quote(&policy_name), full_name, cmd, w
+                        quote(&policy_name),
+                        full_name,
+                        cmd,
+                        w
                     ),
                     (None, None) => continue,
                 };
@@ -242,7 +269,9 @@ pub async fn apply_migrations(
         for col in &idx.columns {
             match col {
                 IndexColumnEntry::Name(n) => col_parts.push(quote(n)),
-                IndexColumnEntry::Spec { name, direction, .. } => {
+                IndexColumnEntry::Spec {
+                    name, direction, ..
+                } => {
                     let dir = direction
                         .as_deref()
                         .map(|d| format!(" {}", d.to_uppercase()))
@@ -288,12 +317,14 @@ pub async fn apply_migrations(
                 id: from_sid.to_string(),
             })
         })?;
-        let from_table = tables_by_id.get(rel.from_table_id.as_str()).ok_or_else(|| {
-            AppError::Config(crate::error::ConfigError::MissingReference {
-                kind: "table",
-                id: rel.from_table_id.clone(),
-            })
-        })?;
+        let from_table = tables_by_id
+            .get(rel.from_table_id.as_str())
+            .ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "table",
+                    id: rel.from_table_id.clone(),
+                })
+            })?;
         let to_schema = schemas_by_id.get(to_sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
@@ -315,34 +346,29 @@ pub async fn apply_migrations(
             .iter()
             .find(|c| c.id == rel.from_column_id)
             .map(|c| c.name.as_str())
-            .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
-                kind: "column",
-                id: rel.from_column_id.clone(),
-            }))?;
+            .ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "column",
+                    id: rel.from_column_id.clone(),
+                })
+            })?;
         let to_col = config
             .columns
             .iter()
             .find(|c| c.id == rel.to_column_id)
             .map(|c| c.name.as_str())
-            .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
-                kind: "column",
-                id: rel.to_column_id.clone(),
-            }))?;
+            .ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "column",
+                    id: rel.to_column_id.clone(),
+                })
+            })?;
 
         let from_full = format!("{}.{}", quote(from_schema_name), quote(&from_table.name));
         let to_full = format!("{}.{}", quote(to_schema_name), quote(&to_table.name));
-        let constraint_name = rel
-            .name
-            .as_deref()
-            .unwrap_or(&rel.id);
-        let on_update = rel
-            .on_update
-            .as_deref()
-            .unwrap_or("NO ACTION");
-        let on_delete = rel
-            .on_delete
-            .as_deref()
-            .unwrap_or("NO ACTION");
+        let constraint_name = rel.name.as_deref().unwrap_or(&rel.id);
+        let on_update = rel.on_update.as_deref().unwrap_or("NO ACTION");
+        let on_delete = rel.on_delete.as_deref().unwrap_or("NO ACTION");
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}) ON UPDATE {} ON DELETE {}",
@@ -371,7 +397,11 @@ pub async fn revert_migrations(
         .schemas
         .first()
         .map(|s| s.id.as_str())
-        .ok_or_else(|| AppError::Config(crate::error::ConfigError::Validation("at least one schema required".into())))?;
+        .ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::Validation(
+                "at least one schema required".into(),
+            ))
+        })?;
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
 
@@ -457,7 +487,8 @@ pub enum MigrationOperation {
 
 impl std::fmt::Display for MigrationOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = serde_json::to_value(self).ok()
+        let s = serde_json::to_value(self)
+            .ok()
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| format!("{:?}", self));
         write!(f, "{}", s)
@@ -534,7 +565,12 @@ impl MigrationPlan {
                 MigrationSafety::WarnOnly => warn_only += 1,
             }
         }
-        MigrationSummary { total: self.steps.len(), safe, best_effort, warn_only }
+        MigrationSummary {
+            total: self.steps.len(),
+            safe,
+            best_effort,
+            warn_only,
+        }
     }
 }
 
@@ -568,25 +604,45 @@ pub fn compute_migration_plan(
     let default_old_sid = old.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
     let default_new_sid = new.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
 
-    let old_schemas: HashMap<&str, &SchemaConfig> = old.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
-    let new_schemas: HashMap<&str, &SchemaConfig> = new.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
-    let old_tables: HashMap<&str, &TableConfig> = old.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-    let new_tables: HashMap<&str, &TableConfig> = new.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-    let old_columns: HashMap<&str, &ColumnConfig> = old.columns.iter().map(|c| (c.id.as_str(), c)).collect();
-    let old_enums: HashMap<&str, &EnumConfig> = old.enums.iter().map(|e| (e.id.as_str(), e)).collect();
-    let new_enums: HashMap<&str, &EnumConfig> = new.enums.iter().map(|e| (e.id.as_str(), e)).collect();
-    let old_indexes: HashMap<&str, &IndexConfig> = old.indexes.iter().map(|i| (i.id.as_str(), i)).collect();
-    let new_indexes: HashMap<&str, &IndexConfig> = new.indexes.iter().map(|i| (i.id.as_str(), i)).collect();
-    let old_rels: HashMap<&str, &RelationshipConfig> = old.relationships.iter().map(|r| (r.id.as_str(), r)).collect();
-    let new_rels: HashMap<&str, &RelationshipConfig> = new.relationships.iter().map(|r| (r.id.as_str(), r)).collect();
+    let old_schemas: HashMap<&str, &SchemaConfig> =
+        old.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+    let new_schemas: HashMap<&str, &SchemaConfig> =
+        new.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+    let old_tables: HashMap<&str, &TableConfig> =
+        old.tables.iter().map(|t| (t.id.as_str(), t)).collect();
+    let new_tables: HashMap<&str, &TableConfig> =
+        new.tables.iter().map(|t| (t.id.as_str(), t)).collect();
+    let old_columns: HashMap<&str, &ColumnConfig> =
+        old.columns.iter().map(|c| (c.id.as_str(), c)).collect();
+    let old_enums: HashMap<&str, &EnumConfig> =
+        old.enums.iter().map(|e| (e.id.as_str(), e)).collect();
+    let new_enums: HashMap<&str, &EnumConfig> =
+        new.enums.iter().map(|e| (e.id.as_str(), e)).collect();
+    let old_indexes: HashMap<&str, &IndexConfig> =
+        old.indexes.iter().map(|i| (i.id.as_str(), i)).collect();
+    let new_indexes: HashMap<&str, &IndexConfig> =
+        new.indexes.iter().map(|i| (i.id.as_str(), i)).collect();
+    let old_rels: HashMap<&str, &RelationshipConfig> = old
+        .relationships
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    let new_rels: HashMap<&str, &RelationshipConfig> = new
+        .relationships
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
 
     let empty: HashMap<&str, &SchemaConfig> = HashMap::new();
     let mut steps: Vec<MigrationStep> = Vec::new();
 
     let schema_name_for = |sid: &str, schemas: &HashMap<&str, &SchemaConfig>| -> String {
-        schema_override
-            .map(String::from)
-            .unwrap_or_else(|| schemas.get(sid).map(|s| s.name.clone()).unwrap_or_else(|| sid.to_string()))
+        schema_override.map(String::from).unwrap_or_else(|| {
+            schemas
+                .get(sid)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| sid.to_string())
+        })
     };
 
     // ── 1. New schemas ───────────────────────────────────────────────────────
@@ -618,7 +674,12 @@ pub fn compute_migration_plan(
         if let Some(old_enum) = old_enums.get(new_enum.id.as_str()) {
             let old_vals: HashSet<&str> = old_enum.values.iter().map(String::as_str).collect();
             let new_vals: HashSet<&str> = new_enum.values.iter().map(String::as_str).collect();
-            for val in new_enum.values.iter().map(String::as_str).filter(|v| !old_vals.contains(v)) {
+            for val in new_enum
+                .values
+                .iter()
+                .map(String::as_str)
+                .filter(|v| !old_vals.contains(v))
+            {
                 steps.push(MigrationStep {
                     step: 0,
                     operation: MigrationOperation::AddEnumValue,
@@ -626,17 +687,27 @@ pub fn compute_migration_plan(
                     table: None,
                     object: format!("{}:{}", new_enum.name, val),
                     object_type: "enum_value".into(),
-                    description: format!("Add value '{}' to enum \"{}\".\"{}\"", val, schema, new_enum.name),
+                    description: format!(
+                        "Add value '{}' to enum \"{}\".\"{}\"",
+                        val, schema, new_enum.name
+                    ),
                     ddl: Some(format!(
                         "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}'",
-                        quote(&schema), quote(&new_enum.name), val.replace('\'', "''")
+                        quote(&schema),
+                        quote(&new_enum.name),
+                        val.replace('\'', "''")
                     )),
                     safety: MigrationSafety::Safe,
                     risk: MigrationRisk::None,
                     risk_detail: None,
                 });
             }
-            for val in old_enum.values.iter().map(String::as_str).filter(|v| !new_vals.contains(v)) {
+            for val in old_enum
+                .values
+                .iter()
+                .map(String::as_str)
+                .filter(|v| !new_vals.contains(v))
+            {
                 steps.push(MigrationStep {
                     step: 0,
                     operation: MigrationOperation::RemoveEnumValue,
@@ -655,7 +726,11 @@ pub fn compute_migration_plan(
                 });
             }
         } else {
-            let values: Vec<String> = new_enum.values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+            let values: Vec<String> = new_enum
+                .values
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect();
             steps.push(MigrationStep {
                 step: 0,
                 operation: MigrationOperation::CreateEnum,
@@ -692,13 +767,18 @@ pub fn compute_migration_plan(
     }
 
     // ── 3. New and removed tables ────────────────────────────────────────────
-    let added_table_ids: HashSet<&str> = new.tables.iter()
+    let added_table_ids: HashSet<&str> = new
+        .tables
+        .iter()
         .filter(|t| !old_tables.contains_key(t.id.as_str()))
         .map(|t| t.id.as_str())
         .collect();
 
-    let cols_by_table: HashMap<&str, Vec<&ColumnConfig>> = new.columns.iter()
-        .fold(HashMap::new(), |mut m, c| { m.entry(c.table_id.as_str()).or_default().push(c); m });
+    let cols_by_table: HashMap<&str, Vec<&ColumnConfig>> =
+        new.columns.iter().fold(HashMap::new(), |mut m, c| {
+            m.entry(c.table_id.as_str()).or_default().push(c);
+            m
+        });
 
     for new_table in &new.tables {
         if !added_table_ids.contains(new_table.id.as_str()) {
@@ -708,12 +788,17 @@ pub fn compute_migration_plan(
         let schema = schema_name_for(sid, &new_schemas);
         let full = format!("{}.{}", quote(&schema), quote(&new_table.name));
 
-        let cols = cols_by_table.get(new_table.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        let cols = cols_by_table
+            .get(new_table.id.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
             let typ = type_str(&c.type_, &empty);
             let mut def = format!("{} {}", quote(&c.name), typ);
-            if !c.nullable { def.push_str(" NOT NULL"); }
+            if !c.nullable {
+                def.push_str(" NOT NULL");
+            }
             if let Some(ref d) = c.default {
                 def.push_str(" DEFAULT ");
                 match d {
@@ -724,16 +809,35 @@ pub fn compute_migration_plan(
             col_defs.push(def);
         }
         let cfg_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
-        for (name, suf) in [("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"), ("archived_at", "TIMESTAMPTZ"), ("created_by", "TEXT"), ("updated_by", "TEXT")] {
-            if !cfg_col_names.contains(name) { col_defs.push(format!("{} {}", quote(name), suf)); }
+        for (name, suf) in [
+            ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            ("archived_at", "TIMESTAMPTZ"),
+            ("created_by", "TEXT"),
+            ("updated_by", "TEXT"),
+        ] {
+            if !cfg_col_names.contains(name) {
+                col_defs.push(format!("{} {}", quote(name), suf));
+            }
         }
         let pk_cols = match &new_table.primary_key {
             PrimaryKeyConfig::Single(s) => vec![quote(s)],
             PrimaryKeyConfig::Composite(v) => v.iter().map(|s| quote(s)).collect(),
         };
         col_defs.push(format!("PRIMARY KEY ({})", pk_cols.join(", ")));
-        for u in &new_table.unique { col_defs.push(format!("UNIQUE ({})", u.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", "))); }
-        for ch in &new_table.check { col_defs.push(format!("CONSTRAINT {} CHECK ({})", quote(&ch.name), ch.expression)); }
+        for u in &new_table.unique {
+            col_defs.push(format!(
+                "UNIQUE ({})",
+                u.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for ch in &new_table.check {
+            col_defs.push(format!(
+                "CONSTRAINT {} CHECK ({})",
+                quote(&ch.name),
+                ch.expression
+            ));
+        }
 
         steps.push(MigrationStep {
             step: 0,
@@ -743,7 +847,11 @@ pub fn compute_migration_plan(
             object: new_table.name.clone(),
             object_type: "table".into(),
             description: format!("Create table \"{}\".\"{}\"", schema, new_table.name),
-            ddl: Some(format!("CREATE TABLE IF NOT EXISTS {} (\n  {}\n)", full, col_defs.join(",\n  "))),
+            ddl: Some(format!(
+                "CREATE TABLE IF NOT EXISTS {} (\n  {}\n)",
+                full,
+                col_defs.join(",\n  ")
+            )),
             safety: MigrationSafety::Safe,
             risk: MigrationRisk::None,
             risk_detail: None,
@@ -757,7 +865,11 @@ pub fn compute_migration_plan(
                 table: Some(format!("{}_audit", new_table.name)),
                 object: format!("{}_audit", new_table.name),
                 object_type: "table".into(),
-                description: format!("Create audit table \"{}\".\"{}\"", schema, format!("{}_audit", new_table.name)),
+                description: format!(
+                    "Create audit table \"{}\".\"{}\"",
+                    schema,
+                    format!("{}_audit", new_table.name)
+                ),
                 ddl: Some(audit_ddl),
                 safety: MigrationSafety::Safe,
                 risk: MigrationRisk::None,
@@ -775,7 +887,10 @@ pub fn compute_migration_plan(
             if !old_table.audit_log && new_table.audit_log {
                 let sid = new_table.schema_id.as_deref().unwrap_or(default_new_sid);
                 let schema = schema_name_for(sid, &new_schemas);
-                let cols = cols_by_table.get(new_table.id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+                let cols = cols_by_table
+                    .get(new_table.id.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols);
                 steps.push(MigrationStep {
                     step: 0,
@@ -784,7 +899,11 @@ pub fn compute_migration_plan(
                     table: Some(format!("{}_audit", new_table.name)),
                     object: format!("{}_audit", new_table.name),
                     object_type: "table".into(),
-                    description: format!("Enable audit log: create \"{}\".\"{}\"", schema, format!("{}_audit", new_table.name)),
+                    description: format!(
+                        "Enable audit log: create \"{}\".\"{}\"",
+                        schema,
+                        format!("{}_audit", new_table.name)
+                    ),
                     ddl: Some(audit_ddl),
                     safety: MigrationSafety::Safe,
                     risk: MigrationRisk::None,
@@ -816,8 +935,13 @@ pub fn compute_migration_plan(
 
     // ── 4. Column changes for existing tables ────────────────────────────────
     for new_col in &new.columns {
-        if added_table_ids.contains(new_col.table_id.as_str()) { continue; }
-        let table = match new_tables.get(new_col.table_id.as_str()) { Some(t) => t, None => continue };
+        if added_table_ids.contains(new_col.table_id.as_str()) {
+            continue;
+        }
+        let table = match new_tables.get(new_col.table_id.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
         let sid = table.schema_id.as_deref().unwrap_or(default_new_sid);
         let schema = schema_name_for(sid, &new_schemas);
         let full = format!("{}.{}", quote(&schema), quote(&table.name));
@@ -849,8 +973,16 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: new_col.name.clone(),
                     object_type: "column".into(),
-                    description: format!("Rename column \"{}\" → \"{}\" on \"{}\".\"{}\"", old_col.name, new_col.name, schema, table.name),
-                    ddl: Some(format!("ALTER TABLE {} RENAME COLUMN {} TO {}", full, quote(&old_col.name), quote(&new_col.name))),
+                    description: format!(
+                        "Rename column \"{}\" → \"{}\" on \"{}\".\"{}\"",
+                        old_col.name, new_col.name, schema, table.name
+                    ),
+                    ddl: Some(format!(
+                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                        full,
+                        quote(&old_col.name),
+                        quote(&new_col.name)
+                    )),
                     safety: MigrationSafety::Safe,
                     risk: MigrationRisk::None,
                     risk_detail: None,
@@ -939,8 +1071,15 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: new_col.name.clone(),
                     object_type: "column".into(),
-                    description: format!("Drop NOT NULL on \"{}\".\"{}\".\"{}\": column becomes nullable", schema, table.name, new_col.name),
-                    ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL", full, quote(&new_col.name))),
+                    description: format!(
+                        "Drop NOT NULL on \"{}\".\"{}\".\"{}\": column becomes nullable",
+                        schema, table.name, new_col.name
+                    ),
+                    ddl: Some(format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL",
+                        full,
+                        quote(&new_col.name)
+                    )),
                     safety: MigrationSafety::Safe,
                     risk: MigrationRisk::None,
                     risk_detail: None,
@@ -961,8 +1100,20 @@ pub fn compute_migration_plan(
                             table: Some(table.name.clone()),
                             object: new_col.name.clone(),
                             object_type: "column".into(),
-                            description: format!("Set DEFAULT {} on \"{}\".\"{}\".\"{}\": was {}", val, schema, table.name, new_col.name, old_def.as_deref().unwrap_or("none")),
-                            ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {}", full, quote(&new_col.name), val)),
+                            description: format!(
+                                "Set DEFAULT {} on \"{}\".\"{}\".\"{}\": was {}",
+                                val,
+                                schema,
+                                table.name,
+                                new_col.name,
+                                old_def.as_deref().unwrap_or("none")
+                            ),
+                            ddl: Some(format!(
+                                "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {}",
+                                full,
+                                quote(&new_col.name),
+                                val
+                            )),
                             safety: MigrationSafety::Safe,
                             risk: MigrationRisk::None,
                             risk_detail: None,
@@ -976,8 +1127,18 @@ pub fn compute_migration_plan(
                             table: Some(table.name.clone()),
                             object: new_col.name.clone(),
                             object_type: "column".into(),
-                            description: format!("Drop DEFAULT on \"{}\".\"{}\".\"{}\": was {}", schema, table.name, new_col.name, old_def.as_deref().unwrap_or("none")),
-                            ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT", full, quote(&new_col.name))),
+                            description: format!(
+                                "Drop DEFAULT on \"{}\".\"{}\".\"{}\": was {}",
+                                schema,
+                                table.name,
+                                new_col.name,
+                                old_def.as_deref().unwrap_or("none")
+                            ),
+                            ddl: Some(format!(
+                                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT",
+                                full,
+                                quote(&new_col.name)
+                            )),
                             safety: MigrationSafety::Safe,
                             risk: MigrationRisk::None,
                             risk_detail: None,
@@ -989,7 +1150,9 @@ pub fn compute_migration_plan(
             // New column: ADD COLUMN
             let new_type = type_str(&new_col.type_, &empty);
             let mut col_def = format!("{} {}", quote(&new_col.name), new_type);
-            if !new_col.nullable { col_def.push_str(" NOT NULL"); }
+            if !new_col.nullable {
+                col_def.push_str(" NOT NULL");
+            }
             if let Some(ref d) = new_col.default {
                 col_def.push_str(" DEFAULT ");
                 match d {
@@ -1004,7 +1167,10 @@ pub fn compute_migration_plan(
                 table: Some(table.name.clone()),
                 object: new_col.name.clone(),
                 object_type: "column".into(),
-                description: format!("Add column \"{}\" {} to \"{}\".\"{}\"", new_col.name, new_type, schema, table.name),
+                description: format!(
+                    "Add column \"{}\" {} to \"{}\".\"{}\"",
+                    new_col.name, new_type, schema, table.name
+                ),
                 ddl: Some(format!("ALTER TABLE {} ADD COLUMN {}", full, col_def)),
                 safety: MigrationSafety::Safe,
                 risk: MigrationRisk::None,
@@ -1015,10 +1181,20 @@ pub fn compute_migration_plan(
 
     // Removed columns (warn only)
     for old_col in &old.columns {
-        if new.columns.iter().any(|c| c.id == old_col.id) { continue; }
-        if !new_tables.contains_key(old_col.table_id.as_str()) { continue; }
-        let table_name = old_tables.get(old_col.table_id.as_str()).map(|t| t.name.as_str()).unwrap_or(&old_col.table_id);
-        let sid = old_tables.get(old_col.table_id.as_str()).and_then(|t| t.schema_id.as_deref()).unwrap_or(default_old_sid);
+        if new.columns.iter().any(|c| c.id == old_col.id) {
+            continue;
+        }
+        if !new_tables.contains_key(old_col.table_id.as_str()) {
+            continue;
+        }
+        let table_name = old_tables
+            .get(old_col.table_id.as_str())
+            .map(|t| t.name.as_str())
+            .unwrap_or(&old_col.table_id);
+        let sid = old_tables
+            .get(old_col.table_id.as_str())
+            .and_then(|t| t.schema_id.as_deref())
+            .unwrap_or(default_old_sid);
         let schema = schema_name_for(sid, &old_schemas);
         steps.push(MigrationStep {
             step: 0,
@@ -1044,11 +1220,17 @@ pub fn compute_migration_plan(
                 step: 0,
                 operation: MigrationOperation::DropIndex,
                 schema: schema.clone(),
-                table: old_tables.get(old_idx.table_id.as_str()).map(|t| t.name.clone()),
+                table: old_tables
+                    .get(old_idx.table_id.as_str())
+                    .map(|t| t.name.clone()),
                 object: old_idx.name.clone(),
                 object_type: "index".into(),
                 description: format!("Drop index \"{}\" in schema \"{}\"", old_idx.name, schema),
-                ddl: Some(format!("DROP INDEX IF EXISTS {}.{}", quote(&schema), quote(&old_idx.name))),
+                ddl: Some(format!(
+                    "DROP INDEX IF EXISTS {}.{}",
+                    quote(&schema),
+                    quote(&old_idx.name)
+                )),
                 safety: MigrationSafety::Safe,
                 risk: MigrationRisk::None,
                 risk_detail: None,
@@ -1056,17 +1238,32 @@ pub fn compute_migration_plan(
         }
     }
     for new_idx in &new.indexes {
-        if old_indexes.contains_key(new_idx.id.as_str()) || added_table_ids.contains(new_idx.table_id.as_str()) { continue; }
+        if old_indexes.contains_key(new_idx.id.as_str())
+            || added_table_ids.contains(new_idx.table_id.as_str())
+        {
+            continue;
+        }
         let sid = new_idx.schema_id.as_deref().unwrap_or(default_new_sid);
-        let schema = match new_schemas.get(sid) { Some(s) => schema_override.unwrap_or(&s.name).to_string(), None => continue };
-        let table = match new_tables.get(new_idx.table_id.as_str()) { Some(t) => t, None => continue };
+        let schema = match new_schemas.get(sid) {
+            Some(s) => schema_override.unwrap_or(&s.name).to_string(),
+            None => continue,
+        };
+        let table = match new_tables.get(new_idx.table_id.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
         let full_table = format!("{}.{}", quote(&schema), quote(&table.name));
         let mut col_parts: Vec<String> = Vec::new();
         for col in &new_idx.columns {
             match col {
                 IndexColumnEntry::Name(n) => col_parts.push(quote(n)),
-                IndexColumnEntry::Spec { name, direction, .. } => {
-                    let dir = direction.as_deref().map(|d| format!(" {}", d.to_uppercase())).unwrap_or_default();
+                IndexColumnEntry::Spec {
+                    name, direction, ..
+                } => {
+                    let dir = direction
+                        .as_deref()
+                        .map(|d| format!(" {}", d.to_uppercase()))
+                        .unwrap_or_default();
                     col_parts.push(format!("{}{}", quote(name), dir));
                 }
                 IndexColumnEntry::Expression { expression } => col_parts.push(expression.clone()),
@@ -1074,8 +1271,24 @@ pub fn compute_migration_plan(
         }
         let method = new_idx.method.as_deref().unwrap_or("btree");
         let unique_kw = if new_idx.unique { "UNIQUE " } else { "" };
-        let include = if new_idx.include.is_empty() { String::new() } else { format!(" INCLUDE ({})", new_idx.include.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", ")) };
-        let where_clause = new_idx.where_.as_ref().map(|w| format!(" WHERE {}", w)).unwrap_or_default();
+        let include = if new_idx.include.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " INCLUDE ({})",
+                new_idx
+                    .include
+                    .iter()
+                    .map(|s| quote(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let where_clause = new_idx
+            .where_
+            .as_ref()
+            .map(|w| format!(" WHERE {}", w))
+            .unwrap_or_default();
         steps.push(MigrationStep {
             step: 0,
             operation: MigrationOperation::CreateIndex,
@@ -1083,8 +1296,23 @@ pub fn compute_migration_plan(
             table: Some(table.name.clone()),
             object: new_idx.name.clone(),
             object_type: "index".into(),
-            description: format!("Create {}index \"{}\" on \"{}\".\"{}\"", if new_idx.unique { "unique " } else { "" }, new_idx.name, schema, table.name),
-            ddl: Some(format!("CREATE {}INDEX IF NOT EXISTS {} ON {} USING {} ({}){}{}", unique_kw, quote(&new_idx.name), full_table, method, col_parts.join(", "), include, where_clause)),
+            description: format!(
+                "Create {}index \"{}\" on \"{}\".\"{}\"",
+                if new_idx.unique { "unique " } else { "" },
+                new_idx.name,
+                schema,
+                table.name
+            ),
+            ddl: Some(format!(
+                "CREATE {}INDEX IF NOT EXISTS {} ON {} USING {} ({}){}{}",
+                unique_kw,
+                quote(&new_idx.name),
+                full_table,
+                method,
+                col_parts.join(", "),
+                include,
+                where_clause
+            )),
             safety: MigrationSafety::Safe,
             risk: MigrationRisk::None,
             risk_detail: None,
@@ -1094,8 +1322,14 @@ pub fn compute_migration_plan(
     // ── 6. Foreign keys ──────────────────────────────────────────────────────
     for old_rel in &old.relationships {
         if !new_rels.contains_key(old_rel.id.as_str()) {
-            let from_schema = old_schemas.get(old_rel.from_schema_id.as_str()).map(|s| s.name.as_str()).unwrap_or(&old_rel.from_schema_id);
-            let from_table = old_tables.get(old_rel.from_table_id.as_str()).map(|t| t.name.as_str()).unwrap_or(&old_rel.from_table_id);
+            let from_schema = old_schemas
+                .get(old_rel.from_schema_id.as_str())
+                .map(|s| s.name.as_str())
+                .unwrap_or(&old_rel.from_schema_id);
+            let from_table = old_tables
+                .get(old_rel.from_table_id.as_str())
+                .map(|t| t.name.as_str())
+                .unwrap_or(&old_rel.from_table_id);
             let constraint = old_rel.name.as_deref().unwrap_or(&old_rel.id);
             let schema_q = quote(schema_override.unwrap_or(from_schema));
             steps.push(MigrationStep {
@@ -1105,8 +1339,18 @@ pub fn compute_migration_plan(
                 table: Some(from_table.to_string()),
                 object: constraint.to_string(),
                 object_type: "foreign_key".into(),
-                description: format!("Drop FK \"{}\" from \"{}\".\"{}\"", constraint, schema_override.unwrap_or(from_schema), from_table),
-                ddl: Some(format!("ALTER TABLE {}.{} DROP CONSTRAINT IF EXISTS {}", schema_q, quote(from_table), quote(constraint))),
+                description: format!(
+                    "Drop FK \"{}\" from \"{}\".\"{}\"",
+                    constraint,
+                    schema_override.unwrap_or(from_schema),
+                    from_table
+                ),
+                ddl: Some(format!(
+                    "ALTER TABLE {}.{} DROP CONSTRAINT IF EXISTS {}",
+                    schema_q,
+                    quote(from_table),
+                    quote(constraint)
+                )),
                 safety: MigrationSafety::Safe,
                 risk: MigrationRisk::None,
                 risk_detail: None,
@@ -1114,15 +1358,50 @@ pub fn compute_migration_plan(
         }
     }
     for new_rel in &new.relationships {
-        if old_rels.contains_key(new_rel.id.as_str()) || added_table_ids.contains(new_rel.from_table_id.as_str()) || added_table_ids.contains(new_rel.to_table_id.as_str()) { continue; }
-        let from_schema = match new_schemas.get(new_rel.from_schema_id.as_str()) { Some(s) => s, None => continue };
-        let from_table = match new_tables.get(new_rel.from_table_id.as_str()) { Some(t) => t, None => continue };
-        let to_schema = match new_schemas.get(new_rel.to_schema_id.as_str()) { Some(s) => s, None => continue };
-        let to_table = match new_tables.get(new_rel.to_table_id.as_str()) { Some(t) => t, None => continue };
-        let from_col = new.columns.iter().find(|c| c.id == new_rel.from_column_id).map(|c| c.name.clone()).unwrap_or_else(|| new_rel.from_column_id.clone());
-        let to_col = new.columns.iter().find(|c| c.id == new_rel.to_column_id).map(|c| c.name.clone()).unwrap_or_else(|| new_rel.to_column_id.clone());
-        let from_q = format!("{}.{}", quote(schema_override.unwrap_or(&from_schema.name)), quote(&from_table.name));
-        let to_q = format!("{}.{}", quote(schema_override.unwrap_or(&to_schema.name)), quote(&to_table.name));
+        if old_rels.contains_key(new_rel.id.as_str())
+            || added_table_ids.contains(new_rel.from_table_id.as_str())
+            || added_table_ids.contains(new_rel.to_table_id.as_str())
+        {
+            continue;
+        }
+        let from_schema = match new_schemas.get(new_rel.from_schema_id.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let from_table = match new_tables.get(new_rel.from_table_id.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let to_schema = match new_schemas.get(new_rel.to_schema_id.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let to_table = match new_tables.get(new_rel.to_table_id.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let from_col = new
+            .columns
+            .iter()
+            .find(|c| c.id == new_rel.from_column_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| new_rel.from_column_id.clone());
+        let to_col = new
+            .columns
+            .iter()
+            .find(|c| c.id == new_rel.to_column_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| new_rel.to_column_id.clone());
+        let from_q = format!(
+            "{}.{}",
+            quote(schema_override.unwrap_or(&from_schema.name)),
+            quote(&from_table.name)
+        );
+        let to_q = format!(
+            "{}.{}",
+            quote(schema_override.unwrap_or(&to_schema.name)),
+            quote(&to_table.name)
+        );
         let constraint = new_rel.name.as_deref().unwrap_or(&new_rel.id);
         let on_update = new_rel.on_update.as_deref().unwrap_or("NO ACTION");
         let on_delete = new_rel.on_delete.as_deref().unwrap_or("NO ACTION");
@@ -1175,16 +1454,33 @@ pub async fn execute_migration_plan(
 
         match step.safety {
             MigrationSafety::WarnOnly => {
-                let msg = step.risk_detail.clone().unwrap_or_else(|| step.description.clone());
+                let msg = step
+                    .risk_detail
+                    .clone()
+                    .unwrap_or_else(|| step.description.clone());
                 tracing::warn!(step = step.step, %op, "migration plan warning (no DDL)");
                 warnings.push(format!("[Step {}] {}", step.step, msg));
                 let _ = crate::store::insert_migration_audit(
-                    config_pool, migration_plan_id, package_id, tenant_id,
-                    from_version, to_version, step.step as i32, &op,
-                    &step.schema, step.table.as_deref(), &step.object, &step.object_type,
-                    &step.description, step.ddl.as_deref(), &safety_str, &risk_str,
-                    "skipped", None,
-                ).await;
+                    config_pool,
+                    migration_plan_id,
+                    package_id,
+                    tenant_id,
+                    from_version,
+                    to_version,
+                    step.step as i32,
+                    &op,
+                    &step.schema,
+                    step.table.as_deref(),
+                    &step.object,
+                    &step.object_type,
+                    &step.description,
+                    step.ddl.as_deref(),
+                    &safety_str,
+                    &risk_str,
+                    "skipped",
+                    None,
+                )
+                .await;
                 warned += 1;
             }
             MigrationSafety::Safe | MigrationSafety::BestEffort => {
@@ -1193,36 +1489,81 @@ pub async fn execute_migration_plan(
                     match sqlx::query(sql).execute(migration_pool).await {
                         Ok(_) => {
                             let _ = crate::store::insert_migration_audit(
-                                config_pool, migration_plan_id, package_id, tenant_id,
-                                from_version, to_version, step.step as i32, &op,
-                                &step.schema, step.table.as_deref(), &step.object, &step.object_type,
-                                &step.description, step.ddl.as_deref(), &safety_str, &risk_str,
-                                "applied", None,
-                            ).await;
+                                config_pool,
+                                migration_plan_id,
+                                package_id,
+                                tenant_id,
+                                from_version,
+                                to_version,
+                                step.step as i32,
+                                &op,
+                                &step.schema,
+                                step.table.as_deref(),
+                                &step.object,
+                                &step.object_type,
+                                &step.description,
+                                step.ddl.as_deref(),
+                                &safety_str,
+                                &risk_str,
+                                "applied",
+                                None,
+                            )
+                            .await;
                             applied += 1;
                         }
                         Err(e) => {
                             let err_str = e.to_string();
                             if matches!(step.safety, MigrationSafety::BestEffort) {
                                 tracing::warn!(step = step.step, %op, error = %e, "migration step failed (best-effort, continuing)");
-                                let msg = format!("[Step {}] {} — Error: {}", step.step, step.description, err_str);
+                                let msg = format!(
+                                    "[Step {}] {} — Error: {}",
+                                    step.step, step.description, err_str
+                                );
                                 warnings.push(msg);
                                 let _ = crate::store::insert_migration_audit(
-                                    config_pool, migration_plan_id, package_id, tenant_id,
-                                    from_version, to_version, step.step as i32, &op,
-                                    &step.schema, step.table.as_deref(), &step.object, &step.object_type,
-                                    &step.description, step.ddl.as_deref(), &safety_str, &risk_str,
-                                    "warned", Some(&err_str),
-                                ).await;
+                                    config_pool,
+                                    migration_plan_id,
+                                    package_id,
+                                    tenant_id,
+                                    from_version,
+                                    to_version,
+                                    step.step as i32,
+                                    &op,
+                                    &step.schema,
+                                    step.table.as_deref(),
+                                    &step.object,
+                                    &step.object_type,
+                                    &step.description,
+                                    step.ddl.as_deref(),
+                                    &safety_str,
+                                    &risk_str,
+                                    "warned",
+                                    Some(&err_str),
+                                )
+                                .await;
                                 warned += 1;
                             } else {
                                 let _ = crate::store::insert_migration_audit(
-                                    config_pool, migration_plan_id, package_id, tenant_id,
-                                    from_version, to_version, step.step as i32, &op,
-                                    &step.schema, step.table.as_deref(), &step.object, &step.object_type,
-                                    &step.description, step.ddl.as_deref(), &safety_str, &risk_str,
-                                    "failed", Some(&err_str),
-                                ).await;
+                                    config_pool,
+                                    migration_plan_id,
+                                    package_id,
+                                    tenant_id,
+                                    from_version,
+                                    to_version,
+                                    step.step as i32,
+                                    &op,
+                                    &step.schema,
+                                    step.table.as_deref(),
+                                    &step.object,
+                                    &step.object_type,
+                                    &step.description,
+                                    step.ddl.as_deref(),
+                                    &safety_str,
+                                    &risk_str,
+                                    "failed",
+                                    Some(&err_str),
+                                )
+                                .await;
                                 return Err(AppError::Db(e));
                             }
                         }
@@ -1232,7 +1573,11 @@ pub async fn execute_migration_plan(
         }
     }
 
-    Ok(MigrationExecutionResult { applied, warned, warnings })
+    Ok(MigrationExecutionResult {
+        applied,
+        warned,
+        warnings,
+    })
 }
 
 /// Build CREATE TABLE DDL for the `{table}_audit` companion table.
@@ -1244,9 +1589,15 @@ fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnCo
     let audit_full = format!("{}.{}", quote(schema_name), quote(&audit_name));
 
     let mut col_defs: Vec<String> = Vec::new();
-    col_defs.push(format!("{} UUID NOT NULL DEFAULT gen_random_uuid()", quote("audit_id")));
+    col_defs.push(format!(
+        "{} UUID NOT NULL DEFAULT gen_random_uuid()",
+        quote("audit_id")
+    ));
     col_defs.push(format!("{} TEXT NOT NULL", quote("audit_action")));
-    col_defs.push(format!("{} TIMESTAMPTZ NOT NULL DEFAULT NOW()", quote("audit_at")));
+    col_defs.push(format!(
+        "{} TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        quote("audit_at")
+    ));
     col_defs.push(format!("{} TEXT", quote("audit_by")));
     col_defs.push(format!("{} JSONB", quote("changed_fields")));
 
@@ -1268,7 +1619,11 @@ fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnCo
     }
     col_defs.push(format!("PRIMARY KEY ({})", quote("audit_id")));
 
-    format!("CREATE TABLE IF NOT EXISTS {} (\n  {}\n)", audit_full, col_defs.join(",\n  "))
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (\n  {}\n)",
+        audit_full,
+        col_defs.join(",\n  ")
+    )
 }
 
 fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {
@@ -1287,7 +1642,12 @@ fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>
         ColumnTypeConfig::Parameterized { name, params } => {
             let p = params
                 .as_ref()
-                .map(|v| v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "))
+                .map(|v| {
+                    v.iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
                 .unwrap_or_default();
             if p.is_empty() {
                 name.clone()

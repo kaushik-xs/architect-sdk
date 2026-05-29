@@ -1,10 +1,14 @@
 //! Config ingestion routes: POST and GET per config kind, plus package install/uninstall.
 
 use crate::handlers::config::{
-    get_api_entities, get_columns, get_enums, get_indexes, get_kv_stores, get_relationships, get_schemas, get_tables,
-    post_api_entities, post_columns, post_enums, post_indexes, post_kv_stores, post_relationships, post_schemas, post_tables,
+    get_api_entities, get_columns, get_enums, get_indexes, get_kv_stores, get_relationships,
+    get_schemas, get_tables, post_api_entities, post_columns, post_enums, post_indexes,
+    post_kv_stores, post_relationships, post_schemas, post_tables,
 };
-use crate::handlers::package::{apply_migration_handler, bootstrap_tenant_handler, get_package_handler, install_package, list_packages_handler, preview_migration_handler, uninstall_package};
+use crate::handlers::package::{
+    apply_migration_handler, bootstrap_tenant_handler, get_package_handler, install_package,
+    list_packages_handler, preview_migration_handler, uninstall_package,
+};
 use crate::state::AppState;
 use axum::{routing::delete, routing::get, routing::post, Router};
 
@@ -14,16 +18,31 @@ pub fn config_routes(state: AppState) -> Router {
         .route("/config/packages/:package_id", get(get_package_handler))
         .route("/config/package", post(install_package))
         .route("/config/package/:package_id", delete(uninstall_package))
-        .route("/config/package/migration/preview", post(preview_migration_handler))
-        .route("/config/package/migration/apply/:migration_id", post(apply_migration_handler))
-        .route("/config/package/:package_id/bootstrap", post(bootstrap_tenant_handler))
+        .route(
+            "/config/package/migration/preview",
+            post(preview_migration_handler),
+        )
+        .route(
+            "/config/package/migration/apply/:migration_id",
+            post(apply_migration_handler),
+        )
+        .route(
+            "/config/package/:package_id/bootstrap",
+            post(bootstrap_tenant_handler),
+        )
         .route("/config/schemas", post(post_schemas).get(get_schemas))
         .route("/config/enums", post(post_enums).get(get_enums))
         .route("/config/tables", post(post_tables).get(get_tables))
         .route("/config/columns", post(post_columns).get(get_columns))
         .route("/config/indexes", post(post_indexes).get(get_indexes))
-        .route("/config/relationships", post(post_relationships).get(get_relationships))
-        .route("/config/api_entities", post(post_api_entities).get(get_api_entities))
+        .route(
+            "/config/relationships",
+            post(post_relationships).get(get_relationships),
+        )
+        .route(
+            "/config/api_entities",
+            post(post_api_entities).get(get_api_entities),
+        )
         .route("/config/kv_stores", post(post_kv_stores).get(get_kv_stores))
         .with_state(state)
 }

@@ -10,7 +10,9 @@ pub fn default_schema_id(config: &FullConfig) -> Result<&str, ConfigError> {
         .schemas
         .first()
         .map(|s| s.id.as_str())
-        .ok_or_else(|| ConfigError::Validation("at least one schema required (set manifest.schema)".into()))
+        .ok_or_else(|| {
+            ConfigError::Validation("at least one schema required (set manifest.schema)".into())
+        })
 }
 
 pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {

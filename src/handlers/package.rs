@@ -1,16 +1,20 @@
 //! Package install/uninstall handlers. Install: zip upload, extract manifest + configs, apply configs, store manifest, reload model. Uninstall: revert migrations, delete _sys_* rows and package record. X-Tenant-ID is required.
 //! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in ALL registered tenant databases (broadcast). Bootstrap endpoint handles new Database-strategy tenants added after install.
 
-use crate::config::{FullConfig, load_from_pool, resolve};
+use crate::config::{load_from_pool, resolve, FullConfig};
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::{reload_model, replace_config};
 use crate::handlers::entity::{get_or_create_tenant_pool, resolve_tenant_context};
-use crate::migration::{apply_migrations, compute_migration_plan, execute_migration_plan, revert_migrations, MigrationPlan};
+use crate::migration::{
+    apply_migrations, compute_migration_plan, execute_migration_plan, revert_migrations,
+    MigrationPlan,
+};
 use crate::state::AppState;
 use crate::store::{
     count_package_kind, delete_package_and_config, get_migration_plan, get_package,
-    list_package_ids, list_packages, mark_migration_plan_applied, save_migration_plan, upsert_package,
+    list_package_ids, list_packages, mark_migration_plan_applied, save_migration_plan,
+    upsert_package,
 };
 use crate::tenant::TenantStrategy;
 use axum::extract::{Multipart, Path, State};
@@ -107,7 +111,10 @@ fn inject_relationship_schema_ids(body: &mut [Value], schema_id: &str) {
     for rec in body.iter_mut() {
         if let Some(obj) = rec.as_object_mut() {
             if !obj.contains_key("from_schema_id") {
-                obj.insert("from_schema_id".into(), Value::String(schema_id.to_string()));
+                obj.insert(
+                    "from_schema_id".into(),
+                    Value::String(schema_id.to_string()),
+                );
             }
             if !obj.contains_key("to_schema_id") {
                 obj.insert("to_schema_id".into(), Value::String(schema_id.to_string()));
@@ -120,9 +127,12 @@ fn read_zip_entry_to_string<R: std::io::Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
 ) -> Result<String, AppError> {
-    let mut f = archive.by_name(name).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let mut f = archive
+        .by_name(name)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let mut s = String::new();
-    std::io::Read::read_to_string(&mut f, &mut s).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    std::io::Read::read_to_string(&mut f, &mut s)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(s)
 }
 
@@ -178,10 +188,17 @@ async fn apply_ddl_to_pool(
         Some(p) => {
             let migration_id = Uuid::new_v4().to_string();
             match execute_migration_plan(
-                migration_pool, config_pool, p,
-                &migration_id, package_id, target,
-                from_version, to_version,
-            ).await {
+                migration_pool,
+                config_pool,
+                p,
+                &migration_id,
+                package_id,
+                target,
+                from_version,
+                to_version,
+            )
+            .await
+            {
                 Ok(result) => TenantMigrationOutcome {
                     target: target.to_string(),
                     strategy: strategy.to_string(),
@@ -206,27 +223,25 @@ async fn apply_ddl_to_pool(
             }
         }
         // Fresh install path: apply the full schema.
-        None => {
-            match apply_migrations(migration_pool, config, None, rls_tenant_column).await {
-                Ok(()) => TenantMigrationOutcome {
+        None => match apply_migrations(migration_pool, config, None, rls_tenant_column).await {
+            Ok(()) => TenantMigrationOutcome {
+                target: target.to_string(),
+                strategy: strategy.to_string(),
+                status: "applied".to_string(),
+                warnings: vec![],
+                error: None,
+            },
+            Err(e) => {
+                tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (fresh install)");
+                TenantMigrationOutcome {
                     target: target.to_string(),
                     strategy: strategy.to_string(),
-                    status: "applied".to_string(),
+                    status: "failed".to_string(),
                     warnings: vec![],
-                    error: None,
-                },
-                Err(e) => {
-                    tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (fresh install)");
-                    TenantMigrationOutcome {
-                        target: target.to_string(),
-                        strategy: strategy.to_string(),
-                        status: "failed".to_string(),
-                        warnings: vec![],
-                        error: Some(e.to_string()),
-                    }
+                    error: Some(e.to_string()),
                 }
             }
-        }
+        },
     }
 }
 
@@ -254,21 +269,19 @@ async fn broadcast_ddl(
     // `_rls_tenant_column` is intentionally ignored by compute_migration_plan, so
     // the same plan is valid for both RLS and Database targets.
     let plan: Option<MigrationPlan> = match old_config {
-        Some(old) => {
-            match compute_migration_plan(old, config, None, None) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::error!(error = %e, "could not compute migration plan for broadcast");
-                    return vec![TenantMigrationOutcome {
-                        target: "all".to_string(),
-                        strategy: "n/a".to_string(),
-                        status: "failed".to_string(),
-                        warnings: vec![],
-                        error: Some(format!("migration plan error: {}", e)),
-                    }];
-                }
+        Some(old) => match compute_migration_plan(old, config, None, None) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!(error = %e, "could not compute migration plan for broadcast");
+                return vec![TenantMigrationOutcome {
+                    target: "all".to_string(),
+                    strategy: "n/a".to_string(),
+                    status: "failed".to_string(),
+                    warnings: vec![],
+                    error: Some(format!("migration plan error: {}", e)),
+                }];
             }
-        }
+        },
         None => None,
     };
 
@@ -285,7 +298,8 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
-        ).await;
+        )
+        .await;
         outcomes.push(outcome);
     }
 
@@ -321,7 +335,8 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
-        ).await;
+        )
+        .await;
         outcomes.push(outcome);
     }
 
@@ -352,7 +367,8 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             None,
-        ).await;
+        )
+        .await;
         outcomes.push(outcome);
     }
 
@@ -380,12 +396,17 @@ pub async fn install_package(
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" || name == "package" {
-            let data = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
             zip_bytes = Some(data.to_vec());
             break;
         }
     }
-    let zip_bytes = zip_bytes.ok_or_else(|| AppError::BadRequest("missing 'file' or 'package' field in multipart body".into()))?;
+    let zip_bytes = zip_bytes.ok_or_else(|| {
+        AppError::BadRequest("missing 'file' or 'package' field in multipart body".into())
+    })?;
 
     let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
         .map_err(|e| AppError::BadRequest(format!("invalid zip: {}", e)))?;
@@ -397,13 +418,19 @@ pub async fn install_package(
         .ok_or_else(|| AppError::BadRequest("zip must contain manifest.json at root".into()))?;
 
     let manifest_value: Value = {
-        let mut file = archive.by_name(&manifest_name).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let mut file = archive
+            .by_name(&manifest_name)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
         let mut buf = String::new();
-        std::io::Read::read_to_string(&mut file, &mut buf).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        serde_json::from_str(&buf).map_err(|e| AppError::BadRequest(format!("invalid manifest.json: {}", e)))?
+        std::io::Read::read_to_string(&mut file, &mut buf)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        serde_json::from_str(&buf)
+            .map_err(|e| AppError::BadRequest(format!("invalid manifest.json: {}", e)))?
     };
 
-    let manifest_obj = manifest_value.as_object().ok_or_else(|| AppError::BadRequest("manifest.json must be an object".into()))?;
+    let manifest_obj = manifest_value
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("manifest.json must be an object".into()))?;
     let id = manifest_obj
         .get("id")
         .and_then(Value::as_str)
@@ -419,7 +446,11 @@ pub async fn install_package(
     let schema_name = manifest_obj
         .get("schema")
         .and_then(Value::as_str)
-        .ok_or_else(|| AppError::BadRequest("manifest must have 'schema' (string) - the schema name for all configs".into()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "manifest must have 'schema' (string) - the schema name for all configs".into(),
+            )
+        })?;
 
     let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
     let config_pool = ctx.config_pool();
@@ -445,7 +476,11 @@ pub async fn install_package(
     };
 
     let old_config = if is_upgrade {
-        Some(load_from_pool(config_pool, id).await.map_err(AppError::Config)?)
+        Some(
+            load_from_pool(config_pool, id)
+                .await
+                .map_err(AppError::Config)?,
+        )
     } else {
         None
     };
@@ -476,7 +511,9 @@ pub async fn install_package(
 
     upsert_package(config_pool, id, &manifest_value).await?;
 
-    let config = load_from_pool(config_pool, id).await.map_err(AppError::Config)?;
+    let config = load_from_pool(config_pool, id)
+        .await
+        .map_err(AppError::Config)?;
 
     // Broadcast DDL to every registered tenant database.
     // For a fresh install old_config is None (apply_migrations). For an upgrade it is Some (compute_migration_plan + execute).
@@ -486,9 +523,12 @@ pub async fn install_package(
         &config,
         old_config.as_ref(),
         id,
-        old_config.as_ref().and_then(|_| manifest_value.get("version").and_then(Value::as_str)),
+        old_config
+            .as_ref()
+            .and_then(|_| manifest_value.get("version").and_then(Value::as_str)),
         incoming_version,
-    ).await;
+    )
+    .await;
 
     let migration_warnings: Vec<String> = tenant_outcomes
         .iter()
@@ -496,11 +536,19 @@ pub async fn install_package(
         .collect();
 
     // Rebuild the in-memory ResolvedModel once and populate every tenant cache slot.
-    let new_model = resolve(&config).map_err(AppError::Config)?.with_package_id(id);
+    let new_model = resolve(&config)
+        .map_err(AppError::Config)?
+        .with_package_id(id);
     {
-        let mut model_guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        let mut model_guard = state
+            .model
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
         *model_guard = new_model.clone();
-        let mut pkg_guard = state.package_models.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        let mut pkg_guard = state
+            .package_models
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
         // Shared key used by all RLS tenants.
         pkg_guard.insert(id.to_string(), new_model.clone());
         // Per-tenant keys used by each Database-strategy tenant.
@@ -557,10 +605,15 @@ pub async fn uninstall_package(
 
     let installed = list_package_ids(config_pool).await?;
     if !installed.contains(&package_id) {
-        return Err(AppError::NotFound(format!("package not found: {}", package_id)));
+        return Err(AppError::NotFound(format!(
+            "package not found: {}",
+            package_id
+        )));
     }
 
-    let config = load_from_pool(config_pool, &package_id).await.map_err(AppError::Config)?;
+    let config = load_from_pool(config_pool, &package_id)
+        .await
+        .map_err(AppError::Config)?;
     revert_migrations(migration_pool, &config, schema_override).await?;
     delete_package_and_config(config_pool, &package_id).await?;
 
@@ -591,7 +644,10 @@ pub async fn uninstall_package(
 }
 
 /// Build the stats + full config payload for a package by fetching all 8 config kinds in parallel.
-async fn package_detail_data(pool: &sqlx::PgPool, package_id: &str) -> Result<Value, crate::error::AppError> {
+async fn package_detail_data(
+    pool: &sqlx::PgPool,
+    package_id: &str,
+) -> Result<Value, crate::error::AppError> {
     use crate::handlers::config::get_config;
 
     let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores) = tokio::try_join!(
@@ -646,9 +702,21 @@ pub async fn list_packages_handler(
             count_package_kind(&state.pool, "kv_stores", &pkg.id),
         )?;
 
-        let name = pkg.payload.get("name").and_then(Value::as_str).map(String::from);
-        let version = pkg.payload.get("version").and_then(Value::as_str).map(String::from);
-        let schema = pkg.payload.get("schema").and_then(Value::as_str).map(String::from);
+        let name = pkg
+            .payload
+            .get("name")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let version = pkg
+            .payload
+            .get("version")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let schema = pkg
+            .payload
+            .get("schema")
+            .and_then(Value::as_str)
+            .map(String::from);
 
         items.push(json!({
             "id": pkg.id,
@@ -692,11 +760,25 @@ pub async fn get_package_handler(
 ) -> Result<impl axum::response::IntoResponse, crate::error::AppError> {
     let pkg = get_package(&state.pool, &package_id)
         .await?
-        .ok_or_else(|| crate::error::AppError::NotFound(format!("package not found: {}", package_id)))?;
+        .ok_or_else(|| {
+            crate::error::AppError::NotFound(format!("package not found: {}", package_id))
+        })?;
 
-    let name = pkg.payload.get("name").and_then(Value::as_str).map(String::from);
-    let version = pkg.payload.get("version").and_then(Value::as_str).map(String::from);
-    let schema = pkg.payload.get("schema").and_then(Value::as_str).map(String::from);
+    let name = pkg
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let version = pkg
+        .payload
+        .get("version")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let schema = pkg
+        .payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(String::from);
 
     let mut detail = package_detail_data(&state.pool, &package_id).await?;
     let obj = detail.as_object_mut().unwrap();
@@ -737,12 +819,16 @@ pub async fn preview_migration_handler(
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" || name == "package" {
-            let data = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?;
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
             zip_bytes_raw = Some(data.to_vec());
             break;
         }
     }
-    let zip_bytes = zip_bytes_raw.ok_or_else(|| AppError::BadRequest("missing 'file' or 'package' field".into()))?;
+    let zip_bytes = zip_bytes_raw
+        .ok_or_else(|| AppError::BadRequest("missing 'file' or 'package' field".into()))?;
 
     let mut archive = ZipArchive::new(Cursor::new(zip_bytes.clone()))
         .map_err(|e| AppError::BadRequest(format!("invalid zip: {}", e)))?;
@@ -754,36 +840,68 @@ pub async fn preview_migration_handler(
         .ok_or_else(|| AppError::BadRequest("zip must contain manifest.json".into()))?;
 
     let manifest_value: Value = {
-        let mut file = archive.by_name(&manifest_name).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let mut file = archive
+            .by_name(&manifest_name)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
         let mut buf = String::new();
-        std::io::Read::read_to_string(&mut file, &mut buf).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        serde_json::from_str(&buf).map_err(|e| AppError::BadRequest(format!("invalid manifest.json: {}", e)))?
+        std::io::Read::read_to_string(&mut file, &mut buf)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        serde_json::from_str(&buf)
+            .map_err(|e| AppError::BadRequest(format!("invalid manifest.json: {}", e)))?
     };
-    let manifest_obj = manifest_value.as_object().ok_or_else(|| AppError::BadRequest("manifest.json must be an object".into()))?;
+    let manifest_obj = manifest_value
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("manifest.json must be an object".into()))?;
 
-    let id = manifest_obj.get("id").and_then(Value::as_str)
+    let id = manifest_obj
+        .get("id")
+        .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest must have 'id'".into()))?;
-    let incoming_version = manifest_obj.get("version").and_then(Value::as_str).unwrap_or("");
-    let schema_name = manifest_obj.get("schema").and_then(Value::as_str)
+    let incoming_version = manifest_obj
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema_name = manifest_obj
+        .get("schema")
+        .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest must have 'schema'".into()))?;
 
-    let existing = get_package(&state.pool, id).await?
-        .ok_or_else(|| AppError::NotFound(format!("package '{}' is not installed — preview is only for upgrades", id)))?;
+    let existing = get_package(&state.pool, id).await?.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "package '{}' is not installed — preview is only for upgrades",
+            id
+        ))
+    })?;
 
     if existing.semantic_version.as_deref() == Some(incoming_version) {
-        return Err(AppError::Conflict(format!("package '{}' version '{}' is already installed", id, incoming_version)));
+        return Err(AppError::Conflict(format!(
+            "package '{}' version '{}' is already installed",
+            id, incoming_version
+        )));
     }
 
     let from_version = existing.semantic_version.clone();
     let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
     let config_pool = ctx.config_pool();
 
-    let old_config = load_from_pool(config_pool, id).await.map_err(AppError::Config)?;
+    let old_config = load_from_pool(config_pool, id)
+        .await
+        .map_err(AppError::Config)?;
 
     // Build new FullConfig from the zip (same logic as install_package, without writing to DB)
     let schemas_body = vec![serde_json::json!({ "id": DEFAULT_SCHEMA_ID, "name": schema_name })];
-    let config_kinds = ["schemas", "enums", "tables", "columns", "indexes", "relationships", "api_entities", "kv_stores"];
-    let mut all_values: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    let config_kinds = [
+        "schemas",
+        "enums",
+        "tables",
+        "columns",
+        "indexes",
+        "relationships",
+        "api_entities",
+        "kv_stores",
+    ];
+    let mut all_values: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
     for kind in &config_kinds {
         let body: Vec<Value> = if *kind == "schemas" {
             serde_json::from_value(Value::Array(schemas_body.clone())).unwrap_or_default()
@@ -802,18 +920,29 @@ pub async fn preview_migration_handler(
     // Deserialize into FullConfig manually using the same logic as load_from_pool
     let new_config = build_full_config_from_values(&all_values)?;
 
-    let plan = compute_migration_plan(&old_config, &new_config, ctx.schema_override(), ctx.rls_tenant_column())
-        .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
+    let plan = compute_migration_plan(
+        &old_config,
+        &new_config,
+        ctx.schema_override(),
+        ctx.rls_tenant_column(),
+    )
+    .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
 
     let summary = plan.summary();
     let plan_json = serde_json::to_value(&plan).map_err(|e| AppError::BadRequest(e.to_string()))?;
     let migration_id = Uuid::new_v4().to_string();
 
     save_migration_plan(
-        config_pool, &migration_id, id, tenant_id,
-        from_version.as_deref(), incoming_version,
-        &plan_json, &zip_bytes,
-    ).await?;
+        config_pool,
+        &migration_id,
+        id,
+        tenant_id,
+        from_version.as_deref(),
+        incoming_version,
+        &plan_json,
+        &zip_bytes,
+    )
+    .await?;
 
     Ok((
         axum::http::StatusCode::OK,
@@ -856,23 +985,38 @@ pub async fn apply_migration_handler(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
 
-    let row = get_migration_plan(&state.pool, &migration_id).await?
-        .ok_or_else(|| AppError::NotFound(format!("migration plan '{}' not found", migration_id)))?;
+    let row = get_migration_plan(&state.pool, &migration_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("migration plan '{}' not found", migration_id))
+        })?;
 
     if row.status == "applied" {
-        return Err(AppError::Conflict(format!("migration plan '{}' has already been applied", migration_id)));
+        return Err(AppError::Conflict(format!(
+            "migration plan '{}' has already been applied",
+            migration_id
+        )));
     }
     if row.status != "pending" {
-        return Err(AppError::BadRequest(format!("migration plan '{}' has status '{}' and cannot be applied", migration_id, row.status)));
+        return Err(AppError::BadRequest(format!(
+            "migration plan '{}' has status '{}' and cannot be applied",
+            migration_id, row.status
+        )));
     }
 
     let now = chrono::Utc::now();
     if now > row.expires_at {
-        return Err(AppError::BadRequest(format!("migration plan '{}' expired at {} — re-run preview to generate a new plan", migration_id, row.expires_at)));
+        return Err(AppError::BadRequest(format!(
+            "migration plan '{}' expired at {} — re-run preview to generate a new plan",
+            migration_id, row.expires_at
+        )));
     }
 
     if row.tenant_id != tenant_id {
-        return Err(AppError::BadRequest(format!("migration plan '{}' was created for tenant '{}', not '{}'", migration_id, row.tenant_id, tenant_id)));
+        return Err(AppError::BadRequest(format!(
+            "migration plan '{}' was created for tenant '{}', not '{}'",
+            migration_id, row.tenant_id, tenant_id
+        )));
     }
 
     let plan: MigrationPlan = serde_json::from_value(row.plan_json.clone())
@@ -894,12 +1038,18 @@ pub async fn apply_migration_handler(
         .ok_or_else(|| AppError::BadRequest("stored zip missing manifest.json".into()))?;
 
     let manifest_value: Value = {
-        let mut file = archive.by_name(&manifest_name).map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let mut file = archive
+            .by_name(&manifest_name)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
         let mut buf = String::new();
-        std::io::Read::read_to_string(&mut file, &mut buf).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        serde_json::from_str(&buf).map_err(|e| AppError::BadRequest(format!("invalid manifest: {}", e)))?
+        std::io::Read::read_to_string(&mut file, &mut buf)
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        serde_json::from_str(&buf)
+            .map_err(|e| AppError::BadRequest(format!("invalid manifest: {}", e)))?
     };
-    let schema_name = manifest_value.get("schema").and_then(Value::as_str)
+    let schema_name = manifest_value
+        .get("schema")
+        .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest missing 'schema'".into()))?;
 
     let schemas_body = vec![serde_json::json!({ "id": DEFAULT_SCHEMA_ID, "name": schema_name })];
@@ -924,23 +1074,40 @@ pub async fn apply_migration_handler(
     // Atomically mark plan as applied (prevents double-apply under concurrent requests)
     let claimed = mark_migration_plan_applied(config_pool, &migration_id).await?;
     if !claimed {
-        return Err(AppError::Conflict(format!("migration plan '{}' was applied by a concurrent request", migration_id)));
+        return Err(AppError::Conflict(format!(
+            "migration plan '{}' was applied by a concurrent request",
+            migration_id
+        )));
     }
 
     // Execute the DDL plan with audit
     let result = execute_migration_plan(
-        migration_pool, config_pool, &plan,
-        &migration_id, &row.package_id, tenant_id,
-        row.from_version.as_deref(), &row.to_version,
-    ).await?;
+        migration_pool,
+        config_pool,
+        &plan,
+        &migration_id,
+        &row.package_id,
+        tenant_id,
+        row.from_version.as_deref(),
+        &row.to_version,
+    )
+    .await?;
 
     // Reload in-memory model
-    let new_config = load_from_pool(config_pool, &row.package_id).await.map_err(AppError::Config)?;
-    let new_model = resolve(&new_config).map_err(AppError::Config)?.with_package_id(&row.package_id);
+    let new_config = load_from_pool(config_pool, &row.package_id)
+        .await
+        .map_err(AppError::Config)?;
+    let new_model = resolve(&new_config)
+        .map_err(AppError::Config)?
+        .with_package_id(&row.package_id);
     {
-        let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        let mut guard = state
+            .model
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
         *guard = new_model.clone();
-        state.package_models
+        state
+            .package_models
             .write()
             .map_err(|_| AppError::BadRequest("state lock".into()))?
             .insert(package_cache_key, new_model);
@@ -998,10 +1165,9 @@ pub async fn bootstrap_tenant_handler(
         ));
     }
 
-    let database_url = entry
-        .database_url
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest(format!("tenant {}: missing database_url", tenant_id)))?;
+    let database_url = entry.database_url.as_deref().ok_or_else(|| {
+        AppError::BadRequest(format!("tenant {}: missing database_url", tenant_id))
+    })?;
 
     // Package must already be installed in _sys_*.
     let _ = get_package(&state.pool, &package_id)
@@ -1018,7 +1184,9 @@ pub async fn bootstrap_tenant_handler(
     apply_migrations(&pool, &config, None, None).await?;
 
     // Populate the model cache for this tenant so entity routes resolve without a reload.
-    let model = crate::config::resolve(&config).map_err(AppError::Config)?.with_package_id(&package_id);
+    let model = crate::config::resolve(&config)
+        .map_err(AppError::Config)?
+        .with_package_id(&package_id);
     {
         state
             .package_models
@@ -1046,10 +1214,16 @@ pub async fn bootstrap_tenant_handler(
 fn build_full_config_from_values(
     values: &std::collections::HashMap<String, Vec<Value>>,
 ) -> Result<crate::config::FullConfig, AppError> {
-    fn parse_kind<T: serde::de::DeserializeOwned>(values: &std::collections::HashMap<String, Vec<Value>>, key: &str) -> Result<Vec<T>, AppError> {
+    fn parse_kind<T: serde::de::DeserializeOwned>(
+        values: &std::collections::HashMap<String, Vec<Value>>,
+        key: &str,
+    ) -> Result<Vec<T>, AppError> {
         let arr = values.get(key).cloned().unwrap_or_default();
         arr.into_iter()
-            .map(|v| serde_json::from_value(v).map_err(|e| AppError::BadRequest(format!("{} parse error: {}", key, e))))
+            .map(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| AppError::BadRequest(format!("{} parse error: {}", key, e)))
+            })
             .collect()
     }
 

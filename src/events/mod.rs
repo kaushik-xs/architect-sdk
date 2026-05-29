@@ -64,7 +64,11 @@ impl DecisionHubClient {
 /// `pre_update_row` is the row fetched from DB *before* the update — only supplied for the
 /// "update" lifecycle when the entity has `changed_to` conditions. When present, `changed_to`
 /// requires a genuine transition: the field must have been a different value before the update.
-fn evaluate_condition(condition: &EventCondition, row: &Value, pre_update_row: Option<&Value>) -> bool {
+fn evaluate_condition(
+    condition: &EventCondition,
+    row: &Value,
+    pre_update_row: Option<&Value>,
+) -> bool {
     let new_val = row.get(&condition.field);
     if let Some(target) = &condition.changed_to {
         let now_matches = new_val == Some(target);
@@ -146,7 +150,15 @@ pub fn spawn_events(
     let triggers: Vec<EntityEventTrigger> = entity
         .events
         .iter()
-        .filter(|t| trigger_matches(t, lifecycle, &raw_row, entity.archive_field.as_deref(), pre_update_row.as_ref()))
+        .filter(|t| {
+            trigger_matches(
+                t,
+                lifecycle,
+                &raw_row,
+                entity.archive_field.as_deref(),
+                pre_update_row.as_ref(),
+            )
+        })
         .cloned()
         .collect();
 

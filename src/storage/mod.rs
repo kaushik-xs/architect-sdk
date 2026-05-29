@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
-
 #[cfg(feature = "storage-azure")]
 pub mod azure;
 #[cfg(feature = "storage-gcs")]
@@ -93,10 +92,9 @@ impl StorageProvider for S3Provider {
     }
 
     async fn presign_url(&self, path: &str, expires_secs: u64) -> Result<PresignResult, AppError> {
-        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(
-            Duration::from_secs(expires_secs),
-        )
-        .map_err(|e| AppError::Storage(e.to_string()))?;
+        let cfg =
+            aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(expires_secs))
+                .map_err(|e| AppError::Storage(e.to_string()))?;
 
         let presigned = self
             .client
@@ -207,7 +205,11 @@ pub fn validate_asset_field(
     rule: &crate::config::ValidationRule,
 ) -> Result<(), AppError> {
     if let Some(ref allowed) = rule.allowed_mime_types {
-        let ct = content_type.split(';').next().unwrap_or(content_type).trim();
+        let ct = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim();
         if !allowed.iter().any(|m| m.eq_ignore_ascii_case(ct)) {
             return Err(AppError::Validation(format!(
                 "{}: mime type '{}' is not allowed; accepted: {}",

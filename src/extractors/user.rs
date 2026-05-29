@@ -1,10 +1,7 @@
 //! Extract user id from request (X-User-ID header).
 
 use async_trait::async_trait;
-use axum::{
-    extract::FromRequestParts,
-    http::request::Parts,
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 
 pub const USER_ID_HEADER: &str = "X-User-ID";
 

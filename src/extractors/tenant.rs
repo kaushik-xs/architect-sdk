@@ -1,10 +1,7 @@
 //! Extract tenant id from request (e.g. X-Tenant-ID header).
 
 use async_trait::async_trait;
-use axum::{
-    extract::FromRequestParts,
-    http::request::Parts,
-};
+use axum::{extract::FromRequestParts, http::request::Parts};
 
 /// Header name for tenant id. Default: `X-Tenant-ID`.
 pub const TENANT_ID_HEADER: &str = "X-Tenant-ID";

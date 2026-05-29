@@ -5,7 +5,9 @@ use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::migration::apply_migrations;
 use crate::state::AppState;
-use crate::store::{qualified_sys_table, replace_config_rows, sys_table_for_kind, DEFAULT_PACKAGE_ID};
+use crate::store::{
+    qualified_sys_table, replace_config_rows, sys_table_for_kind, DEFAULT_PACKAGE_ID,
+};
 use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
@@ -33,12 +35,15 @@ pub(crate) async fn replace_config(
     run_migrations: bool,
     package_id: &str,
 ) -> Result<(Vec<Value>, u64), AppError> {
-    let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
+    let table = sys_table_for_kind(kind)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let mut tx = pool.begin().await?;
     let (count, _version) = replace_config_rows(&mut tx, table, package_id, &body).await?;
     tx.commit().await?;
     if run_migrations && count > 0 {
-        let config = load_from_pool(pool, package_id).await.map_err(AppError::Config)?;
+        let config = load_from_pool(pool, package_id)
+            .await
+            .map_err(AppError::Config)?;
         apply_migrations(pool, &config, None, None).await?;
     }
     Ok((body, count))
@@ -46,17 +51,32 @@ pub(crate) async fn replace_config(
 
 /// Reload in-memory model from DB so new/updated entities are available without restart. Loads config for DEFAULT_PACKAGE_ID.
 pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
-    let config = load_from_pool(&state.pool, DEFAULT_PACKAGE_ID).await.map_err(AppError::Config)?;
-    let new_model = resolve(&config).map_err(AppError::Config)?.with_package_id(DEFAULT_PACKAGE_ID);
-    let mut guard = state.model.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
+    let config = load_from_pool(&state.pool, DEFAULT_PACKAGE_ID)
+        .await
+        .map_err(AppError::Config)?;
+    let new_model = resolve(&config)
+        .map_err(AppError::Config)?
+        .with_package_id(DEFAULT_PACKAGE_ID);
+    let mut guard = state
+        .model
+        .write()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?;
     *guard = new_model;
     Ok(())
 }
 
-pub(crate) async fn get_config(pool: &PgPool, kind: &str, package_id: &str) -> Result<Vec<Value>, AppError> {
-    let table = sys_table_for_kind(kind).ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
+pub(crate) async fn get_config(
+    pool: &PgPool,
+    kind: &str,
+    package_id: &str,
+) -> Result<Vec<Value>, AppError> {
+    let table = sys_table_for_kind(kind)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let q_table = qualified_sys_table(table);
-    let sql = format!("SELECT payload FROM {} WHERE package_id = $1 ORDER BY id", q_table);
+    let sql = format!(
+        "SELECT payload FROM {} WHERE package_id = $1 ORDER BY id",
+        q_table
+    );
     tracing::debug!(sql = %sql, package_id = %package_id, "query");
     let rows = sqlx::query_scalar::<_, Value>(&sql)
         .bind(package_id)
@@ -73,7 +93,8 @@ macro_rules! config_handler {
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
             require_tenant(&state, &tenant_id_opt)?;
-            let (out, num_written) = replace_config(&state.pool, $kind, body, true, DEFAULT_PACKAGE_ID).await?;
+            let (out, num_written) =
+                replace_config(&state.pool, $kind, body, true, DEFAULT_PACKAGE_ID).await?;
             if num_written > 0 {
                 reload_model(&state).await?;
             }
