@@ -71,9 +71,9 @@ pub fn cast_name(t: &CanonicalType) -> Option<String> {
         CanonicalType::Array(inner) => {
             return cast_name(inner).map(|c| format!("{}[]", c));
         }
-        // Schema-qualified custom types need a ::text cast so string params bind cleanly.
+        // Schema-qualified custom types (enums like schema.my_enum) cast directly to the type name.
         CanonicalType::Custom(s) if s.contains('.') => {
-            return Some(format!("{}[]", s).replace("[][]", "[]")); // schema.type — text binding
+            return Some(s.clone());
         }
         CanonicalType::Custom(_) => return None,
         // Text, numeric, serial types bind fine without an explicit cast.
