@@ -121,7 +121,8 @@ pub fn db_error_message(e: &AppError, field: Option<&str>) -> String {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         if let AppError::BulkValidation(ref errors) = self {
-            let affected: std::collections::HashSet<usize> = errors.iter().map(|e| e.index).collect();
+            let affected: std::collections::HashSet<usize> =
+                errors.iter().map(|e| e.index).collect();
             let body = ErrorBody {
                 error: ErrorDetail {
                     code: "bulk_validation_error".to_string(),

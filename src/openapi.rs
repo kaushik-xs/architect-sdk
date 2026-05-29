@@ -4,14 +4,12 @@
 //! paths are generated dynamically by listing _sys_packages and loading each package's config.
 
 use crate::case::to_camel_case;
-use crate::config::{
-    load_from_pool, resolve, KvStoreConfig, ResolvedEntity, ResolvedModel,
-};
+use crate::config::{load_from_pool, resolve, KvStoreConfig, ResolvedEntity, ResolvedModel};
 use crate::state::AppState;
 use crate::store::list_package_ids;
-use std::collections::HashMap;
 use axum::extract::State;
 use axum::Json;
+use std::collections::HashMap;
 use utoipa::openapi::path::{
     HttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn,
     PathItemBuilder, PathsBuilder,
@@ -45,7 +43,9 @@ fn json_object_schema() -> Schema {
     Schema::Object(
         ObjectBuilder::new()
             .schema_type(SchemaType::new(Type::Object))
-            .description(Some("JSON object; keys may be in camelCase (e.g. entity fields)."))
+            .description(Some(
+                "JSON object; keys may be in camelCase (e.g. entity fields).",
+            ))
             .into(),
     )
 }
@@ -89,7 +89,12 @@ fn column_schema_from_pg_type(pg_type: Option<&str>) -> Schema {
                 .into(),
         );
     }
-    if t.contains("numeric") || t.contains("decimal") || t.contains("real") || t.contains("double") || t.contains("float") {
+    if t.contains("numeric")
+        || t.contains("decimal")
+        || t.contains("real")
+        || t.contains("double")
+        || t.contains("float")
+    {
         return Schema::Object(
             utoipa::openapi::schema::ObjectBuilder::new()
                 .schema_type(SchemaType::new(Type::Number))
@@ -181,7 +186,11 @@ fn package_id_param() -> Parameter {
         .build()
 }
 
-fn list_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn list_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -213,7 +222,9 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
             .name("include")
             .parameter_in(ParameterIn::Query)
             .required(Required::False)
-            .description(Some("Comma-separated related entity path segments to include"))
+            .description(Some(
+                "Comma-separated related entity path segments to include",
+            ))
             .schema(Some(RefOr::T(Schema::Object(
                 utoipa::openapi::schema::ObjectBuilder::new()
                     .schema_type(SchemaType::new(Type::String))
@@ -232,10 +243,7 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
                 .name(camel)
                 .parameter_in(ParameterIn::Query)
                 .required(Required::False)
-                .description(Some(format!(
-                    "Filter by {} (from _sys_columns)",
-                    col.name
-                )))
+                .description(Some(format!("Filter by {} (from _sys_columns)", col.name)))
                 .schema(Some(RefOr::T(schema)))
                 .build(),
         );
@@ -252,7 +260,11 @@ fn list_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
         .build()
 }
 
-fn create_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn create_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -283,7 +295,11 @@ fn create_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id
         .build()
 }
 
-fn read_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn read_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -292,7 +308,9 @@ fn read_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
         .name("id")
         .parameter_in(ParameterIn::Path)
         .required(Required::True)
-        .description(Some("Entity ID (UUID, integer, or text depending on table PK)"))
+        .description(Some(
+            "Entity ID (UUID, integer, or text depending on table PK)",
+        ))
         .schema(Some(RefOr::T(Schema::Object(
             utoipa::openapi::schema::ObjectBuilder::new()
                 .schema_type(SchemaType::new(Type::String))
@@ -303,7 +321,9 @@ fn read_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
         .name("include")
         .parameter_in(ParameterIn::Query)
         .required(Required::False)
-        .description(Some("Comma-separated related entity path segments to include"))
+        .description(Some(
+            "Comma-separated related entity path segments to include",
+        ))
         .schema(Some(RefOr::T(Schema::Object(
             utoipa::openapi::schema::ObjectBuilder::new()
                 .schema_type(SchemaType::new(Type::String))
@@ -321,7 +341,11 @@ fn read_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_p
         .build()
 }
 
-fn update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn update_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -350,7 +374,10 @@ fn update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id
         .build();
     OperationBuilder::new()
         .summary(Some(format!("Update {} by id", entity.path_segment)))
-        .description(Some(format!("Update a single {} by id.", entity.path_segment)))
+        .description(Some(format!(
+            "Update a single {} by id.",
+            entity.path_segment
+        )))
         .operation_id(Some(format!("update_{}{}", entity.path_segment, op_suffix)))
         .parameters(Some(params))
         .request_body(Some(body))
@@ -358,7 +385,11 @@ fn update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id
         .build()
 }
 
-fn delete_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn delete_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -377,7 +408,10 @@ fn delete_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id
     params.push(id_param);
     OperationBuilder::new()
         .summary(Some(format!("Delete {} by id", entity.path_segment)))
-        .description(Some(format!("Delete a single {} by id.", entity.path_segment)))
+        .description(Some(format!(
+            "Delete a single {} by id.",
+            entity.path_segment
+        )))
         .operation_id(Some(format!("delete_{}{}", entity.path_segment, op_suffix)))
         .parameters(Some(params))
         .responses(
@@ -390,7 +424,11 @@ fn delete_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id
         .build()
 }
 
-fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn bulk_create_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -414,7 +452,10 @@ fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str, include_packa
     OperationBuilder::new()
         .summary(Some(format!("Bulk create {}", entity.path_segment)))
         .description(Some(format!("Create multiple {}.", entity.path_segment)))
-        .operation_id(Some(format!("bulk_create_{}{}", entity.path_segment, op_suffix)))
+        .operation_id(Some(format!(
+            "bulk_create_{}{}",
+            entity.path_segment, op_suffix
+        )))
         .parameters(Some(params))
         .request_body(Some(body))
         .responses(
@@ -426,7 +467,11 @@ fn bulk_create_operation(entity: &ResolvedEntity, op_suffix: &str, include_packa
         .build()
 }
 
-fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str, include_package_id_param: bool) -> Operation {
+fn bulk_update_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
     let mut params = vec![x_tenant_id_header()];
     if include_package_id_param {
         params.push(package_id_param());
@@ -450,7 +495,10 @@ fn bulk_update_operation(entity: &ResolvedEntity, op_suffix: &str, include_packa
     OperationBuilder::new()
         .summary(Some(format!("Bulk update {}", entity.path_segment)))
         .description(Some(format!("Update multiple {}.", entity.path_segment)))
-        .operation_id(Some(format!("bulk_update_{}{}", entity.path_segment, op_suffix)))
+        .operation_id(Some(format!(
+            "bulk_update_{}{}",
+            entity.path_segment, op_suffix
+        )))
         .parameters(Some(params))
         .request_body(Some(body))
         .responses(default_responses().build())
@@ -610,7 +658,9 @@ fn kv_key_operations() -> (Operation, Operation, Operation) {
 
     let put_op = OperationBuilder::new()
         .summary(Some("Set KV value (upsert)"))
-        .description(Some("Set or overwrite value for key. Body is arbitrary JSON."))
+        .description(Some(
+            "Set or overwrite value for key. Body is arbitrary JSON.",
+        ))
         .operation_id(Some("kv_put"))
         .parameters(Some(vec![
             x_tenant_id_header(),
@@ -621,7 +671,10 @@ fn kv_key_operations() -> (Operation, Operation, Operation) {
         .request_body(Some(
             RequestBodyBuilder::new()
                 .description(Some("JSON value (string, number, object, or array)"))
-                .content("application/json", Content::new(Some(RefOr::T(json_object_schema()))))
+                .content(
+                    "application/json",
+                    Content::new(Some(RefOr::T(json_object_schema()))),
+                )
                 .required(Some(Required::True))
                 .build(),
         ))
@@ -667,8 +720,7 @@ fn add_kv_paths(
         let list_path = format!("{}/package/{}/kv/{{namespace}}", base, package_id);
         let key_path = format!("{}/package/{}/kv/{{namespace}}/{{key}}", base, package_id);
 
-        let list_item = PathItemBuilder::new()
-            .operation(HttpMethod::Get, kv_list_keys_operation());
+        let list_item = PathItemBuilder::new().operation(HttpMethod::Get, kv_list_keys_operation());
         builder = builder.path(list_path, list_item.build());
 
         let (get_op, put_op, delete_op) = kv_key_operations();
@@ -759,7 +811,10 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         let path = format!("{}/config/{}", base, kind);
         let get_op = OperationBuilder::new()
             .summary(Some(format!("Get {}", kind)))
-            .description(Some(format!("Get {} (from _sys_{}). {}", description, kind, "X-Tenant-ID required.")))
+            .description(Some(format!(
+                "Get {} (from _sys_{}). {}",
+                description, kind, "X-Tenant-ID required."
+            )))
             .operation_id(Some(format!("config_get_{}", kind)))
             .parameters(Some(vec![x_tenant_id_header()]))
             .responses(default_responses().build())
@@ -778,7 +833,10 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
             .build();
         let post_op = OperationBuilder::new()
             .summary(Some(format!("Replace {}", kind)))
-            .description(Some(format!("Replace {} for the default package. Runs migrations when rows change.", kind)))
+            .description(Some(format!(
+                "Replace {} for the default package. Runs migrations when rows change.",
+                kind
+            )))
             .operation_id(Some(format!("config_post_{}", kind)))
             .parameters(Some(vec![x_tenant_id_header()]))
             .request_body(Some(post_body))

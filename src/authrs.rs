@@ -32,7 +32,11 @@ impl AuthrsClient {
             .build()
             .ok()?;
         tracing::info!(url = %base_url, service = %service_name, "authrs permission checks enabled");
-        Some(Arc::new(Self { base_url, service_name, client }))
+        Some(Arc::new(Self {
+            base_url,
+            service_name,
+            client,
+        }))
     }
 
     async fn check(
@@ -103,8 +107,8 @@ pub async fn check_entity_permission_opt(
         None => return Ok(()),
     };
 
-    let user_id = user_id
-        .ok_or_else(|| AppError::Unauthorized("X-User-ID header is required".into()))?;
+    let user_id =
+        user_id.ok_or_else(|| AppError::Unauthorized("X-User-ID header is required".into()))?;
     let tenant_id = tenant_id.unwrap_or("");
 
     let action = format!("{}{}", http_verb, pascal_case(&entity.table_name));

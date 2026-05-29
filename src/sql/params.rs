@@ -53,7 +53,7 @@ impl<'q> Encode<'q, Postgres> for PgBindValue {
         // Booleans: "true"/"false" + $n::boolean. JSON objects/arrays: serde_json::to_string
         // + $n::jsonb (or ::json) so jsonb columns accept TEXT-shaped params.
         Ok(match self {
-            PgBindValue::Null => <Option::<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
+            PgBindValue::Null => <Option<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
             PgBindValue::Bool(b) => {
                 let s: &str = if *b { "true" } else { "false" };
                 <&str as Encode<Postgres>>::encode_by_ref(&s, buf)?
@@ -77,9 +77,8 @@ impl<'q> Encode<'q, Postgres> for PgBindValue {
                 <&str as Encode<Postgres>>::encode_by_ref(&u_str.as_str(), buf)?
             }
             PgBindValue::Json(v) => {
-                let s = serde_json::to_string(v).map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                })?;
+                let s = serde_json::to_string(v)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
             }
         })

@@ -54,7 +54,11 @@ fn select_column_list(entity: &ResolvedEntity) -> String {
         .map(|c| {
             let q = quoted(&c.name);
             let pg_type = c.pg_type.as_deref().unwrap_or("");
-            if pg_type.contains('.') || pg_type == "numeric" || pg_type == "time" || pg_type == "timetz" {
+            if pg_type.contains('.')
+                || pg_type == "numeric"
+                || pg_type == "time"
+                || pg_type == "timetz"
+            {
                 format!("{}::text", q)
             } else {
                 q
@@ -133,14 +137,17 @@ fn pg_type_category(pg_type: &str) -> &'static str {
     match base.as_str() {
         "text" | "varchar" | "char" | "bpchar" | "citext" | "name" | "character varying"
         | "character" => "text",
-        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial"
-        | "bigserial" | "smallserial" => "int",
-        "float4" | "float8" | "numeric" | "decimal" | "real" | "money"
-        | "double precision" => "float",
+        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial" | "bigserial"
+        | "smallserial" => "int",
+        "float4" | "float8" | "numeric" | "decimal" | "real" | "money" | "double precision" => {
+            "float"
+        }
         "bool" | "boolean" => "bool",
         "uuid" => "uuid",
         "date" => "date",
-        "timestamp" | "timestamptz" | "timestamp with time zone"
+        "timestamp"
+        | "timestamptz"
+        | "timestamp with time zone"
         | "timestamp without time zone" => "timestamp",
         "time" | "timetz" | "time with time zone" | "time without time zone" => "time",
         _ => "other",
@@ -151,14 +158,29 @@ fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
     match category {
         "text" => matches!(
             op,
-            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::In | RsqlOp::Out | RsqlOp::Like
-                | RsqlOp::Ilike | RsqlOp::Contains | RsqlOp::Starts | RsqlOp::Ends
+            RsqlOp::Eq
+                | RsqlOp::Neq
+                | RsqlOp::In
+                | RsqlOp::Out
+                | RsqlOp::Like
+                | RsqlOp::Ilike
+                | RsqlOp::Contains
+                | RsqlOp::Starts
+                | RsqlOp::Ends
                 | RsqlOp::Null(_)
         ),
         "int" | "float" => matches!(
             op,
-            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le
-                | RsqlOp::Between | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
+            RsqlOp::Eq
+                | RsqlOp::Neq
+                | RsqlOp::Gt
+                | RsqlOp::Ge
+                | RsqlOp::Lt
+                | RsqlOp::Le
+                | RsqlOp::Between
+                | RsqlOp::In
+                | RsqlOp::Out
+                | RsqlOp::Null(_)
         ),
         "bool" => matches!(op, RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Null(_)),
         "uuid" => matches!(
@@ -167,8 +189,16 @@ fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
         ),
         "date" | "timestamp" | "time" => matches!(
             op,
-            RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le
-                | RsqlOp::Between | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
+            RsqlOp::Eq
+                | RsqlOp::Neq
+                | RsqlOp::Gt
+                | RsqlOp::Ge
+                | RsqlOp::Lt
+                | RsqlOp::Le
+                | RsqlOp::Between
+                | RsqlOp::In
+                | RsqlOp::Out
+                | RsqlOp::Null(_)
         ),
         _ => true, // unknown / custom types: allow everything
     }
@@ -222,12 +252,12 @@ fn build_leaf_sql(
             let n = q.push_param(Value::String(v));
             let ph = make_placeholder(n, cast);
             let cmp = match op {
-                RsqlOp::Eq  => "=",
+                RsqlOp::Eq => "=",
                 RsqlOp::Neq => "!=",
-                RsqlOp::Gt  => ">",
-                RsqlOp::Ge  => ">=",
-                RsqlOp::Lt  => "<",
-                RsqlOp::Le  => "<=",
+                RsqlOp::Gt => ">",
+                RsqlOp::Ge => ">=",
+                RsqlOp::Lt => "<",
+                RsqlOp::Le => "<=",
                 _ => unreachable!(),
             };
             Ok(format!("{} {} {}", qcol, cmp, ph))
@@ -331,14 +361,32 @@ pub fn rsql_to_sql(
         FilterNode::And(children) => {
             let parts: Result<Vec<_>, _> = children
                 .iter()
-                .map(|c| rsql_to_sql(c, entity, q, col_qualifier, filter_includes, schema_override))
+                .map(|c| {
+                    rsql_to_sql(
+                        c,
+                        entity,
+                        q,
+                        col_qualifier,
+                        filter_includes,
+                        schema_override,
+                    )
+                })
                 .collect();
             Ok(format!("({})", parts?.join(" AND ")))
         }
         FilterNode::Or(children) => {
             let parts: Result<Vec<_>, _> = children
                 .iter()
-                .map(|c| rsql_to_sql(c, entity, q, col_qualifier, filter_includes, schema_override))
+                .map(|c| {
+                    rsql_to_sql(
+                        c,
+                        entity,
+                        q,
+                        col_qualifier,
+                        filter_includes,
+                        schema_override,
+                    )
+                })
                 .collect();
             Ok(format!("({})", parts?.join(" OR ")))
         }
@@ -361,17 +409,21 @@ pub fn rsql_to_sql(
                     .columns
                     .iter()
                     .find(|c| c.name == sub_field)
-                    .ok_or_else(|| AppError::Validation(format!(
-                        "unknown filter field '{}' on related entity '{}'",
-                        sub_field, include_name
-                    )))?;
+                    .ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "unknown filter field '{}' on related entity '{}'",
+                            sub_field, include_name
+                        ))
+                    })?;
 
                 let rel_schema = schema_override.unwrap_or(inc.related.schema_name.as_str());
                 let rel_table = qualified_table(rel_schema, &inc.related.table_name);
 
                 // FK join condition: related.their_key = main.our_key
                 let join_cond = match col_qualifier {
-                    Some(pfx) => format!("{} = {}{}", quoted(inc.their_key), pfx, quoted(inc.our_key)),
+                    Some(pfx) => {
+                        format!("{} = {}{}", quoted(inc.their_key), pfx, quoted(inc.our_key))
+                    }
                     None => format!("{} = {}", quoted(inc.their_key), quoted(inc.our_key)),
                 };
 
@@ -426,7 +478,11 @@ fn build_order_by(
                 Some(pfx) => format!("{}{}", pfx, quoted(&s.field)),
                 None => quoted(&s.field),
             };
-            if s.desc { format!("{} DESC", qcol) } else { format!("{} ASC", qcol) }
+            if s.desc {
+                format!("{} DESC", qcol)
+            } else {
+                format!("{} ASC", qcol)
+            }
         })
         .collect();
 
@@ -448,7 +504,13 @@ pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> Q
     let pk = &entity.pk_columns[0];
     let cols = select_column_list(entity);
     let ph = pk_placeholder(entity, 1);
-    q.sql = format!("SELECT {} FROM {} WHERE {} = {}", cols, table, quoted(pk), ph);
+    q.sql = format!(
+        "SELECT {} FROM {} WHERE {} = {}",
+        cols,
+        table,
+        quoted(pk),
+        ph
+    );
     q
 }
 
@@ -477,7 +539,11 @@ pub fn select_list_with_includes(
         .map(|c| {
             let q = quoted(&c.name);
             let pg_type = c.pg_type.as_deref().unwrap_or("");
-            let expr = if pg_type.contains('.') || pg_type == "numeric" || pg_type == "time" || pg_type == "timetz" {
+            let expr = if pg_type.contains('.')
+                || pg_type == "numeric"
+                || pg_type == "time"
+                || pg_type == "timetz"
+            {
                 format!("{}.{}::text", MAIN_ALIAS, q)
             } else {
                 format!("{}.{}", MAIN_ALIAS, q)
@@ -491,7 +557,13 @@ pub fn select_list_with_includes(
         let rel_schema = resolve_schema(inc.related, schema_override);
         let rel_table = qualified_table(rel_schema, &inc.related.table_name);
         let rel_cols = select_column_list(inc.related);
-        let sub_from = format!("{} WHERE {} = {}.{}", rel_table, quoted(inc.their_key), MAIN_ALIAS, quoted(inc.our_key));
+        let sub_from = format!(
+            "{} WHERE {} = {}.{}",
+            rel_table,
+            quoted(inc.their_key),
+            MAIN_ALIAS,
+            quoted(inc.our_key)
+        );
         let subquery = match inc.direction {
             IncludeDirection::ToOne => format!(
                 "(SELECT row_to_json(sub) FROM (SELECT {} FROM {}) sub)",
@@ -507,13 +579,22 @@ pub fn select_list_with_includes(
 
     let where_clause = match filter {
         Some(node) => {
-            let frag = rsql_to_sql(node, entity, &mut q, Some(&main_qualifier), filter_includes, schema_override)?;
+            let frag = rsql_to_sql(
+                node,
+                entity,
+                &mut q,
+                Some(&main_qualifier),
+                filter_includes,
+                schema_override,
+            )?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
     };
     let order_clause = build_order_by(sort, entity, Some(&main_qualifier));
-    let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
+    let limit_clause = limit
+        .map(|n| format!(" LIMIT {}", n.min(1000)))
+        .unwrap_or_default();
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
 
     q.sql = format!(
@@ -554,17 +635,14 @@ pub fn select_list(
         None => String::new(),
     };
     let order_clause = build_order_by(sort, entity, None);
-    let limit_clause = limit.map(|n| format!(" LIMIT {}", n.min(1000))).unwrap_or_default();
+    let limit_clause = limit
+        .map(|n| format!(" LIMIT {}", n.min(1000)))
+        .unwrap_or_default();
     let offset_clause = offset.map(|n| format!(" OFFSET {}", n)).unwrap_or_default();
     let cols = select_column_list(entity);
     q.sql = format!(
         "SELECT {} FROM {}{}{}{}{}",
-        cols,
-        table,
-        where_clause,
-        order_clause,
-        limit_clause,
-        offset_clause
+        cols, table, where_clause, order_clause, limit_clause, offset_clause
     );
     Ok(q)
 }
@@ -690,7 +768,11 @@ pub fn update(
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let col_by_name: std::collections::HashMap<_, _> = entity.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let col_by_name: std::collections::HashMap<_, _> = entity
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let mut sets = Vec::new();
     for (k, v) in body {
         if *k == *pk {
@@ -703,7 +785,9 @@ pub fn update(
         if entity.archive_field.as_deref().is_some_and(|af| k == af) {
             continue;
         }
-        let Some(c) = col_by_name.get(k.as_str()) else { continue };
+        let Some(c) = col_by_name.get(k.as_str()) else {
+            continue;
+        };
         let v = coerce_json_value_for_pg_array(v.clone(), c.pg_type.as_deref());
         let param_num = q.push_param(v);
         let rhs = c
@@ -723,7 +807,13 @@ pub fn update(
     if sets.is_empty() {
         let cols = select_column_list(entity);
         let ph = pk_placeholder(entity, 1);
-        q.sql = format!("SELECT {} FROM {} WHERE {} = {}", cols, table, quoted(pk), ph);
+        q.sql = format!(
+            "SELECT {} FROM {} WHERE {} = {}",
+            cols,
+            table,
+            quoted(pk),
+            ph
+        );
         q.params.push(id.clone());
         return q;
     }
@@ -752,13 +842,23 @@ pub fn delete(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBu
     let returning = select_column_list(entity);
     let ph = pk_placeholder(entity, 1);
     q.params.push(Value::Null);
-    q.sql = format!("DELETE FROM {} WHERE {} = {} RETURNING {}", table, quoted(pk), ph, returning);
+    q.sql = format!(
+        "DELETE FROM {} WHERE {} = {} RETURNING {}",
+        table,
+        quoted(pk),
+        ph,
+        returning
+    );
     q
 }
 
 /// UPDATE by id: clear archive_field (set to NULL) where it is currently NOT NULL.
 /// Returns the updated row or None (record not found or not archived).
-pub fn unarchive(entity: &ResolvedEntity, archive_field: &str, schema_override: Option<&str>) -> QueryBuf {
+pub fn unarchive(
+    entity: &ResolvedEntity,
+    archive_field: &str,
+    schema_override: Option<&str>,
+) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
@@ -780,7 +880,11 @@ pub fn unarchive(entity: &ResolvedEntity, archive_field: &str, schema_override: 
 
 /// UPDATE by id: stamp archive_field with NOW() where it is currently NULL.
 /// Returns the updated row or None (record not found or already archived).
-pub fn archive(entity: &ResolvedEntity, archive_field: &str, schema_override: Option<&str>) -> QueryBuf {
+pub fn archive(
+    entity: &ResolvedEntity,
+    archive_field: &str,
+    schema_override: Option<&str>,
+) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);

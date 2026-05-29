@@ -65,7 +65,10 @@ impl TenantRegistry {
             .iter()
             .filter_map(|(id, entry)| {
                 if matches!(entry.strategy, TenantStrategy::Database) {
-                    entry.database_url.as_ref().map(|url| (id.clone(), url.clone()))
+                    entry
+                        .database_url
+                        .as_ref()
+                        .map(|url| (id.clone(), url.clone()))
                 } else {
                     None
                 }
@@ -88,7 +91,10 @@ impl TenantRegistry {
             .iter()
             .filter_map(|(id, entry)| {
                 if matches!(entry.strategy, TenantStrategy::Rls) {
-                    entry.database_url.as_ref().map(|url| (id.clone(), url.clone()))
+                    entry
+                        .database_url
+                        .as_ref()
+                        .map(|url| (id.clone(), url.clone()))
                 } else {
                     None
                 }
@@ -111,12 +117,20 @@ pub async fn load_registry_from_pool(pool: &PgPool) -> Result<TenantRegistry, Ap
     let mut by_id = HashMap::new();
     for (id, strategy_str, database_url) in rows {
         if strategy_str.eq_ignore_ascii_case("schema") {
-            tracing::warn!("tenant {}: strategy 'schema' is no longer supported, skipping", id);
+            tracing::warn!(
+                "tenant {}: strategy 'schema' is no longer supported, skipping",
+                id
+            );
             continue;
         }
         let strategy: TenantStrategy = strategy_str.parse().map_err(|e: AppError| e)?;
-        if matches!(&strategy, TenantStrategy::Database) && database_url.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-            tracing::warn!("tenant {}: strategy database requires database_url, skipping", id);
+        if matches!(&strategy, TenantStrategy::Database)
+            && database_url.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+        {
+            tracing::warn!(
+                "tenant {}: strategy database requires database_url, skipping",
+                id
+            );
             continue;
         }
         by_id.insert(

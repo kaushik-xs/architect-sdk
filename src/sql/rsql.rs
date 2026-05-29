@@ -109,9 +109,15 @@ pub fn parse_sort(input: &str) -> Vec<SortSpec> {
                 if field.is_empty() {
                     return None;
                 }
-                Some(SortSpec { field: field.to_string(), desc: true })
+                Some(SortSpec {
+                    field: field.to_string(),
+                    desc: true,
+                })
             } else {
-                Some(SortSpec { field: part.to_string(), desc: false })
+                Some(SortSpec {
+                    field: part.to_string(),
+                    desc: false,
+                })
             }
         })
         .collect()
@@ -126,7 +132,10 @@ struct Parser {
 
 impl Parser {
     fn new(input: &str) -> Self {
-        Parser { chars: input.chars().collect(), pos: 0 }
+        Parser {
+            chars: input.chars().collect(),
+            pos: 0,
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -152,7 +161,11 @@ impl Parser {
             self.pos += 1;
             parts.push(self.parse_and()?);
         }
-        if parts.len() == 1 { Ok(parts.remove(0)) } else { Ok(FilterNode::Or(parts)) }
+        if parts.len() == 1 {
+            Ok(parts.remove(0))
+        } else {
+            Ok(FilterNode::Or(parts))
+        }
     }
 
     // and_expr = atom (';' atom)*
@@ -163,7 +176,11 @@ impl Parser {
             self.pos += 1;
             parts.push(self.parse_atom()?);
         }
-        if parts.len() == 1 { Ok(parts.remove(0)) } else { Ok(FilterNode::And(parts)) }
+        if parts.len() == 1 {
+            Ok(parts.remove(0))
+        } else {
+            Ok(FilterNode::And(parts))
+        }
     }
 
     // atom = '(' expression ')' | leaf
@@ -189,15 +206,23 @@ impl Parser {
         if op_name == "null" {
             let raw = self.parse_value()?;
             let is_null = match raw.to_lowercase().as_str() {
-                "true"  => true,
+                "true" => true,
                 "false" => false,
-                other   => return Err(format!("=null= expects true or false, got '{}'", other)),
+                other => return Err(format!("=null= expects true or false, got '{}'", other)),
             };
-            return Ok(FilterNode::Leaf { field, op: RsqlOp::Null(is_null), values: vec![] });
+            return Ok(FilterNode::Leaf {
+                field,
+                op: RsqlOp::Null(is_null),
+                values: vec![],
+            });
         }
 
         let values = self.parse_arguments(&op_raw)?;
-        Ok(FilterNode::Leaf { field, op: op_raw, values })
+        Ok(FilterNode::Leaf {
+            field,
+            op: op_raw,
+            values,
+        })
     }
 
     fn parse_selector(&mut self) -> Result<String, String> {
@@ -225,16 +250,28 @@ impl Parser {
     /// Returns (RsqlOp, op_name_string).
     fn parse_operator(&mut self) -> Result<(RsqlOp, String), String> {
         // Two-char operators: == and !=
-        let two: String = self.chars.get(self.pos..self.pos + 2).map(|s| s.iter().collect()).unwrap_or_default();
-        if two == "==" { self.pos += 2; return Ok((RsqlOp::Eq,  "==".into())); }
-        if two == "!=" { self.pos += 2; return Ok((RsqlOp::Neq, "!=".into())); }
+        let two: String = self
+            .chars
+            .get(self.pos..self.pos + 2)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        if two == "==" {
+            self.pos += 2;
+            return Ok((RsqlOp::Eq, "==".into()));
+        }
+        if two == "!=" {
+            self.pos += 2;
+            return Ok((RsqlOp::Neq, "!=".into()));
+        }
 
         // Named operators: =name=
         if self.peek() == Some('=') {
             self.pos += 1; // skip opening =
             let start = self.pos;
             while let Some(c) = self.peek() {
-                if c == '=' { break; }
+                if c == '=' {
+                    break;
+                }
                 self.pos += 1;
             }
             if self.peek() != Some('=') {
@@ -243,20 +280,25 @@ impl Parser {
             let name: String = self.chars[start..self.pos].iter().collect();
             self.pos += 1; // skip closing =
             let op = match name.as_str() {
-                "gt"       => RsqlOp::Gt,
-                "ge"       => RsqlOp::Ge,
-                "lt"       => RsqlOp::Lt,
-                "le"       => RsqlOp::Le,
-                "in"       => RsqlOp::In,
-                "out"      => RsqlOp::Out,
-                "like"     => RsqlOp::Like,
-                "ilike"    => RsqlOp::Ilike,
+                "gt" => RsqlOp::Gt,
+                "ge" => RsqlOp::Ge,
+                "lt" => RsqlOp::Lt,
+                "le" => RsqlOp::Le,
+                "in" => RsqlOp::In,
+                "out" => RsqlOp::Out,
+                "like" => RsqlOp::Like,
+                "ilike" => RsqlOp::Ilike,
                 "contains" => RsqlOp::Contains,
-                "starts"   => RsqlOp::Starts,
-                "ends"     => RsqlOp::Ends,
-                "between"  => RsqlOp::Between,
-                "null"     => RsqlOp::Null(true), // placeholder; fixed in parse_leaf
-                _ => return Err(format!("unknown operator '={}=' at position {}", name, self.pos)),
+                "starts" => RsqlOp::Starts,
+                "ends" => RsqlOp::Ends,
+                "between" => RsqlOp::Between,
+                "null" => RsqlOp::Null(true), // placeholder; fixed in parse_leaf
+                _ => {
+                    return Err(format!(
+                        "unknown operator '={}=' at position {}",
+                        name, self.pos
+                    ))
+                }
             };
             return Ok((op, name));
         }
@@ -269,15 +311,23 @@ impl Parser {
             RsqlOp::In | RsqlOp::Out | RsqlOp::Between => {
                 // Expect (val1,val2,...)
                 if self.peek() != Some('(') {
-                    return Err(format!("expected '(' after operator at position {}", self.pos));
+                    return Err(format!(
+                        "expected '(' after operator at position {}",
+                        self.pos
+                    ));
                 }
                 self.pos += 1;
                 let mut values = Vec::new();
                 loop {
                     values.push(self.parse_value()?);
                     match self.peek() {
-                        Some(',') => { self.pos += 1; }
-                        Some(')') => { self.pos += 1; break; }
+                        Some(',') => {
+                            self.pos += 1;
+                        }
+                        Some(')') => {
+                            self.pos += 1;
+                            break;
+                        }
                         _ => return Err(format!("expected ',' or ')' at position {}", self.pos)),
                     }
                 }
@@ -294,9 +344,20 @@ impl Parser {
             let mut val = String::new();
             loop {
                 match self.peek() {
-                    None      => return Err(format!("unterminated quoted value at position {}", self.pos)),
-                    Some('"') => { self.pos += 1; break; }
-                    Some(c)   => { val.push(c); self.pos += 1; }
+                    None => {
+                        return Err(format!(
+                            "unterminated quoted value at position {}",
+                            self.pos
+                        ))
+                    }
+                    Some('"') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    Some(c) => {
+                        val.push(c);
+                        self.pos += 1;
+                    }
                 }
             }
             Ok(val)
@@ -304,7 +365,9 @@ impl Parser {
             // Unquoted — read until , ; ( ) or end
             let start = self.pos;
             while let Some(c) = self.peek() {
-                if ",;()".contains(c) { break; }
+                if ",;()".contains(c) {
+                    break;
+                }
                 self.pos += 1;
             }
             Ok(self.chars[start..self.pos].iter().collect())
@@ -343,7 +406,12 @@ mod tests {
         assert!(matches!(node, FilterNode::And(_)));
         if let FilterNode::And(ref parts) = node {
             assert_eq!(parts.len(), 2);
-            if let FilterNode::Leaf { op: RsqlOp::In, values, .. } = &parts[0] {
+            if let FilterNode::Leaf {
+                op: RsqlOp::In,
+                values,
+                ..
+            } = &parts[0]
+            {
                 assert_eq!(values, &["active", "pending"]);
             } else {
                 panic!("expected In leaf");
@@ -354,19 +422,36 @@ mod tests {
     #[test]
     fn test_null_true() {
         let node = parse_rsql("deleted_at=null=true").unwrap();
-        assert!(matches!(node, FilterNode::Leaf { op: RsqlOp::Null(true), .. }));
+        assert!(matches!(
+            node,
+            FilterNode::Leaf {
+                op: RsqlOp::Null(true),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_null_false() {
         let node = parse_rsql("email=null=false").unwrap();
-        assert!(matches!(node, FilterNode::Leaf { op: RsqlOp::Null(false), .. }));
+        assert!(matches!(
+            node,
+            FilterNode::Leaf {
+                op: RsqlOp::Null(false),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_between() {
         let node = parse_rsql("age=between=(18,65)").unwrap();
-        if let FilterNode::Leaf { op: RsqlOp::Between, values, .. } = node {
+        if let FilterNode::Leaf {
+            op: RsqlOp::Between,
+            values,
+            ..
+        } = node
+        {
             assert_eq!(values, &["18", "65"]);
         } else {
             panic!("expected Between leaf");
@@ -410,7 +495,12 @@ mod tests {
     #[test]
     fn test_dotted_field() {
         let node = parse_rsql("transport_unit.bay=contains=bay23").unwrap();
-        if let FilterNode::Leaf { field, op: RsqlOp::Contains, .. } = node {
+        if let FilterNode::Leaf {
+            field,
+            op: RsqlOp::Contains,
+            ..
+        } = node
+        {
             assert_eq!(field, "transport_unit.bay");
         } else {
             panic!("expected Contains leaf with dotted field");

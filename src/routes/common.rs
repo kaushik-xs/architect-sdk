@@ -21,8 +21,14 @@ async fn health() -> Json<HealthBody> {
     Json(HealthBody { status: "ok" })
 }
 
-async fn ready(State(state): State<AppState>) -> Result<Json<ReadyBody>, (axum::http::StatusCode, Json<ReadyBody>)> {
-    if sqlx::query("SELECT 1").fetch_optional(&state.pool).await.is_err() {
+async fn ready(
+    State(state): State<AppState>,
+) -> Result<Json<ReadyBody>, (axum::http::StatusCode, Json<ReadyBody>)> {
+    if sqlx::query("SELECT 1")
+        .fetch_optional(&state.pool)
+        .await
+        .is_err()
+    {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadyBody {

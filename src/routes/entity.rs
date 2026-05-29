@@ -29,16 +29,27 @@ pub fn entity_routes(state: AppState) -> Router {
             "/package/:package_id/kv/:namespace/:key",
             get(kv_get).put(kv_put).delete(kv_delete),
         )
-        .route("/package/:package_id/:path_segment", get(list_package).post(create_package))
+        .route(
+            "/package/:package_id/:path_segment",
+            get(list_package).post(create_package),
+        )
         .route(
             "/package/:package_id/:path_segment/bulk",
             post(bulk_create_package).patch(bulk_update_package),
         )
         .route(
             "/package/:package_id/:path_segment/:id",
-            get(read_package).patch(update_package).delete(delete_package),
+            get(read_package)
+                .patch(update_package)
+                .delete(delete_package),
         )
-        .route("/package/:package_id/:path_segment/:id/archive", post(archive_package))
-        .route("/package/:package_id/:path_segment/:id/unarchive", post(unarchive_package))
+        .route(
+            "/package/:package_id/:path_segment/:id/archive",
+            post(archive_package),
+        )
+        .route(
+            "/package/:package_id/:path_segment/:id/unarchive",
+            post(unarchive_package),
+        )
         .with_state(state)
 }

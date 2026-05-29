@@ -4,14 +4,8 @@
 //! Or from this directory: `cargo run`
 
 use architect_sdk::{
-    common_routes_with_ready,
-    ensure_database_exists,
-    ensure_sys_tables,
-    load_from_pool,
-    load_registry_from_pool,
-    resolve,
-    AppState,
-    DEFAULT_PACKAGE_ID,
+    common_routes_with_ready, ensure_database_exists, ensure_sys_tables, load_from_pool,
+    load_registry_from_pool, resolve, AppState, DEFAULT_PACKAGE_ID,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;

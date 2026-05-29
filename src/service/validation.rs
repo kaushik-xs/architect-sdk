@@ -90,10 +90,14 @@ fn validate_field(col: &str, v: &Value, rule: &ValidationRule) -> Result<(), App
         }
     }
     if let Some(ref pattern) = rule.pattern {
-        let re = Regex::new(pattern).map_err(|_| AppError::Validation(format!("invalid pattern for {}", col)))?;
+        let re = Regex::new(pattern)
+            .map_err(|_| AppError::Validation(format!("invalid pattern for {}", col)))?;
         if let Some(s) = v.as_str() {
             if !re.is_match(s) {
-                return Err(AppError::Validation(format!("{} does not match required pattern", col)));
+                return Err(AppError::Validation(format!(
+                    "{} does not match required pattern",
+                    col
+                )));
             }
         }
     }
@@ -116,14 +120,20 @@ fn validate_field(col: &str, v: &Value, rule: &ValidationRule) -> Result<(), App
     if let Some(min) = rule.minimum {
         if let Some(n) = v.as_f64() {
             if n < min {
-                return Err(AppError::Validation(format!("{} must be at least {}", col, min)));
+                return Err(AppError::Validation(format!(
+                    "{} must be at least {}",
+                    col, min
+                )));
             }
         }
     }
     if let Some(max) = rule.maximum {
         if let Some(n) = v.as_f64() {
             if n > max {
-                return Err(AppError::Validation(format!("{} must be at most {}", col, max)));
+                return Err(AppError::Validation(format!(
+                    "{} must be at most {}",
+                    col, max
+                )));
             }
         }
     }
@@ -143,14 +153,20 @@ fn validate_format(col: &str, v: &Value, format: &str) -> Result<(), AppError> {
         "email" => {
             if let Some(s) = v.as_str() {
                 if !s.contains('@') || s.len() < 3 {
-                    return Err(AppError::Validation(format!("{} must be a valid email", col)));
+                    return Err(AppError::Validation(format!(
+                        "{} must be a valid email",
+                        col
+                    )));
                 }
             }
         }
         "uuid" => {
             if let Some(s) = v.as_str() {
                 if uuid::Uuid::parse_str(s).is_err() {
-                    return Err(AppError::Validation(format!("{} must be a valid UUID", col)));
+                    return Err(AppError::Validation(format!(
+                        "{} must be a valid UUID",
+                        col
+                    )));
                 }
             }
         }

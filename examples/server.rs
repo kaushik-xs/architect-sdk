@@ -2,18 +2,9 @@
 //! If PACKAGE_PATH is set, config is loaded from that directory (must contain manifest.json + config JSONs) and migrations applied; otherwise config is loaded from _sys_* tables (empty until fed via config APIs or package install).
 
 use architect_sdk::{
-    apply_migrations,
-    common_routes_with_ready,
-    config_routes,
-    entity_routes,
-    ensure_database_exists,
-    ensure_sys_tables,
-    load_from_pool,
-    load_registry_from_pool,
-    resolve,
-    AppState,
-    DEFAULT_PACKAGE_ID,
-    FullConfig,
+    apply_migrations, common_routes_with_ready, config_routes, ensure_database_exists,
+    ensure_sys_tables, entity_routes, load_from_pool, load_registry_from_pool, resolve, AppState,
+    FullConfig, DEFAULT_PACKAGE_ID,
 };
 use axum::Router;
 use sqlx::PgPool;
@@ -26,13 +17,12 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("architect_sdk=info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("architect_sdk=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/architect".into());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/architect".into());
     ensure_database_exists(&database_url).await?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -41,7 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_sys_tables(&pool).await?;
 
-    let tenant_registry = load_registry_from_pool(&pool).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    let tenant_registry = load_registry_from_pool(&pool)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
     tracing::info!("loaded tenant registry (X-Tenant-ID required for config and entity APIs)");
 
     let (config, package_id) = match std::env::var("PACKAGE_PATH") {
@@ -52,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => {
             tracing::info!("PACKAGE_PATH not set; loading config from _sys_* tables (use config APIs or POST /api/v1/config/package to insert)");
-            let cfg = load_from_pool(&pool, DEFAULT_PACKAGE_ID).await.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+            let cfg = load_from_pool(&pool, DEFAULT_PACKAGE_ID)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             (cfg, DEFAULT_PACKAGE_ID.to_string())
         }
     };
@@ -79,8 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/api/v1", config_routes(state.clone()))
         .nest("/api/v1", entity_routes(state));
 
-    let app = Router::new()
-        .nest("/", api);
+    let app = Router::new().nest("/", api);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
     tracing::info!("listening on {}", listener.local_addr()?);
@@ -91,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Read all JSON records for a config kind from a package directory.
 /// Tries `{kind}.json` first (flat file), then scans `{kind}/*.json` (subdirectory),
 /// merging all arrays in alphabetical order. Returns an empty vec if neither exists.
-async fn read_kind_from_dir(dir: &Path, kind: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+async fn read_kind_from_dir(
+    dir: &Path,
+    kind: &str,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let flat = dir.join(format!("{}.json", kind));
     if flat.exists() {
         let content = tokio::fs::read_to_string(&flat).await?;
@@ -121,64 +117,123 @@ async fn read_kind_from_dir(dir: &Path, kind: &str) -> Result<Vec<serde_json::Va
     Ok(vec![])
 }
 
-async fn load_config_from_package_path(dir: &str) -> Result<(FullConfig, String), Box<dyn std::error::Error>> {
+async fn load_config_from_package_path(
+    dir: &str,
+) -> Result<(FullConfig, String), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(dir);
     let manifest_path = dir.join("manifest.json");
-    let manifest_json = tokio::fs::read_to_string(&manifest_path).await.map_err(|e| {
-        format!("package path must contain manifest.json: {}", e)
-    })?;
+    let manifest_json = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|e| format!("package path must contain manifest.json: {}", e))?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
-    let manifest_obj = manifest.as_object().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest.json must be an object"))?;
-    let package_id = manifest_obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'id' (string)"))?.to_string();
-    let _name = manifest_obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'name' (string)"))?;
-    let _version = manifest_obj.get("version").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'version' (string)"))?;
-    let schema_name = manifest_obj.get("schema").and_then(|v| v.as_str()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "manifest must have 'schema' (string)"))?;
-    tracing::info!("package manifest: id={:?} name={:?} version={:?} schema={:?}", package_id, _name, _version, schema_name);
+    let manifest_obj = manifest.as_object().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "manifest.json must be an object",
+        )
+    })?;
+    let package_id = manifest_obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest must have 'id' (string)",
+            )
+        })?
+        .to_string();
+    let _name = manifest_obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest must have 'name' (string)",
+            )
+        })?;
+    let _version = manifest_obj
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest must have 'version' (string)",
+            )
+        })?;
+    let schema_name = manifest_obj
+        .get("schema")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest must have 'schema' (string)",
+            )
+        })?;
+    tracing::info!(
+        "package manifest: id={:?} name={:?} version={:?} schema={:?}",
+        package_id,
+        _name,
+        _version,
+        schema_name
+    );
 
     let schemas = vec![serde_json::json!({ "id": "default", "name": schema_name })];
-    let schemas: Vec<architect_sdk::config::SchemaConfig> = serde_json::from_value(serde_json::Value::Array(schemas))?;
+    let schemas: Vec<architect_sdk::config::SchemaConfig> =
+        serde_json::from_value(serde_json::Value::Array(schemas))?;
 
     let mut enums = read_kind_from_dir(&dir, "enums").await?;
     for o in enums.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
-            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
         }
     }
-    let enums: Vec<architect_sdk::config::EnumConfig> = serde_json::from_value(serde_json::Value::Array(enums))?;
+    let enums: Vec<architect_sdk::config::EnumConfig> =
+        serde_json::from_value(serde_json::Value::Array(enums))?;
 
     let mut tables = read_kind_from_dir(&dir, "tables").await?;
     for o in tables.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
-            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
         }
     }
-    let tables: Vec<architect_sdk::config::TableConfig> = serde_json::from_value(serde_json::Value::Array(tables))?;
+    let tables: Vec<architect_sdk::config::TableConfig> =
+        serde_json::from_value(serde_json::Value::Array(tables))?;
 
     let columns_raw = read_kind_from_dir(&dir, "columns").await?;
-    let columns: Vec<architect_sdk::config::ColumnConfig> = serde_json::from_value(serde_json::Value::Array(columns_raw))?;
+    let columns: Vec<architect_sdk::config::ColumnConfig> =
+        serde_json::from_value(serde_json::Value::Array(columns_raw))?;
 
     let mut indexes = read_kind_from_dir(&dir, "indexes").await?;
     for o in indexes.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
-            obj.entry("schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
         }
     }
-    let indexes: Vec<architect_sdk::config::IndexConfig> = serde_json::from_value(serde_json::Value::Array(indexes))?;
+    let indexes: Vec<architect_sdk::config::IndexConfig> =
+        serde_json::from_value(serde_json::Value::Array(indexes))?;
 
     let mut relationships = read_kind_from_dir(&dir, "relationships").await?;
     for o in relationships.iter_mut() {
         if let Some(obj) = o.as_object_mut() {
-            obj.entry("from_schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
-            obj.entry("to_schema_id").or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("from_schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
+            obj.entry("to_schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
         }
     }
-    let relationships: Vec<architect_sdk::config::RelationshipConfig> = serde_json::from_value(serde_json::Value::Array(relationships))?;
+    let relationships: Vec<architect_sdk::config::RelationshipConfig> =
+        serde_json::from_value(serde_json::Value::Array(relationships))?;
 
     let api_entities_raw = read_kind_from_dir(&dir, "api_entities").await?;
-    let api_entities: Vec<architect_sdk::config::ApiEntityConfig> = serde_json::from_value(serde_json::Value::Array(api_entities_raw))?;
+    let api_entities: Vec<architect_sdk::config::ApiEntityConfig> =
+        serde_json::from_value(serde_json::Value::Array(api_entities_raw))?;
 
     let kv_stores_raw = read_kind_from_dir(&dir, "kv_stores").await?;
-    let kv_stores: Vec<architect_sdk::config::KvStoreConfig> = serde_json::from_value(serde_json::Value::Array(kv_stores_raw))?;
+    let kv_stores: Vec<architect_sdk::config::KvStoreConfig> =
+        serde_json::from_value(serde_json::Value::Array(kv_stores_raw))?;
 
     Ok((
         FullConfig {

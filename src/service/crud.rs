@@ -2,7 +2,11 @@
 
 use crate::config::ResolvedEntity;
 use crate::error::AppError;
-use crate::sql::{archive, coerce_json_value_for_pg_array, delete, insert, select_by_column_in, select_by_id, select_list, select_list_with_includes, unarchive, IncludeSelect, update, FilterNode, SortSpec, PgBindValue, QueryBuf};
+use crate::sql::{
+    archive, coerce_json_value_for_pg_array, delete, insert, select_by_column_in, select_by_id,
+    select_list, select_list_with_includes, unarchive, update, FilterNode, IncludeSelect,
+    PgBindValue, QueryBuf, SortSpec,
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -31,7 +35,15 @@ impl CrudService {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list(entity, filter, sort, Some(limit), Some(offset), filter_includes, schema_override)?;
+        let q = select_list(
+            entity,
+            filter,
+            sort,
+            Some(limit),
+            Some(offset),
+            filter_includes,
+            schema_override,
+        )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 
@@ -51,7 +63,16 @@ impl CrudService {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
         let offset = offset.unwrap_or(0);
-        let q = select_list_with_includes(entity, filter, sort, Some(limit), Some(offset), includes, filter_includes, schema_override)?;
+        let q = select_list_with_includes(
+            entity,
+            filter,
+            sort,
+            Some(limit),
+            Some(offset),
+            includes,
+            filter_includes,
+            schema_override,
+        )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
 
@@ -93,11 +114,28 @@ impl CrudService {
         caller_user_id: Option<&str>,
     ) -> Result<Value, AppError> {
         let include_pk = body.contains_key(&entity.pk_columns[0]);
-        let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
-        let row = Self::execute_returning_one_exec(executor, &q).await?
+        let q = insert(
+            entity,
+            body,
+            include_pk,
+            schema_override,
+            rls_tenant_id,
+            caller_user_id,
+        );
+        let row = Self::execute_returning_one_exec(executor, &q)
+            .await?
             .ok_or_else(|| AppError::Db(sqlx::Error::RowNotFound))?;
         if entity.audit_log {
-            Self::insert_audit(executor, entity, "create", &row, None, caller_user_id, schema_override).await?;
+            Self::insert_audit(
+                executor,
+                entity,
+                "create",
+                &row,
+                None,
+                caller_user_id,
+                schema_override,
+            )
+            .await?;
         }
         Ok(row)
     }
@@ -122,7 +160,16 @@ impl CrudService {
         let result = Self::execute_returning_one_exec(executor, &q).await?;
         if entity.audit_log {
             if let Some(ref post_row) = result {
-                Self::insert_audit(executor, entity, "update", post_row, pre_row.as_ref(), caller_user_id, schema_override).await?;
+                Self::insert_audit(
+                    executor,
+                    entity,
+                    "update",
+                    post_row,
+                    pre_row.as_ref(),
+                    caller_user_id,
+                    schema_override,
+                )
+                .await?;
             }
         }
         Ok(result)
@@ -138,10 +185,20 @@ impl CrudService {
         caller_user_id: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = delete(entity, schema_override);
-        let result = Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await?;
+        let result =
+            Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await?;
         if entity.audit_log {
             if let Some(ref deleted_row) = result {
-                Self::insert_audit(executor, entity, "delete", deleted_row, None, caller_user_id, schema_override).await?;
+                Self::insert_audit(
+                    executor,
+                    entity,
+                    "delete",
+                    deleted_row,
+                    None,
+                    caller_user_id,
+                    schema_override,
+                )
+                .await?;
             }
         }
         Ok(result)
@@ -197,8 +254,17 @@ impl CrudService {
                 let mut tx = pool.begin().await?;
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
-                    let row = Self::execute_returning_one_tx(&mut tx, &q).await?.unwrap_or(Value::Null);
+                    let q = insert(
+                        entity,
+                        body,
+                        include_pk,
+                        schema_override,
+                        rls_tenant_id,
+                        caller_user_id,
+                    );
+                    let row = Self::execute_returning_one_tx(&mut tx, &q)
+                        .await?
+                        .unwrap_or(Value::Null);
                     out.push(row);
                 }
                 tx.commit().await?;
@@ -206,8 +272,17 @@ impl CrudService {
             TenantExecutor::Conn(conn) => {
                 for body in items {
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
-                    let row = Self::execute_returning_one_conn(&mut **conn, &q).await?.unwrap_or(Value::Null);
+                    let q = insert(
+                        entity,
+                        body,
+                        include_pk,
+                        schema_override,
+                        rls_tenant_id,
+                        caller_user_id,
+                    );
+                    let row = Self::execute_returning_one_conn(&mut **conn, &q)
+                        .await?
+                        .unwrap_or(Value::Null);
                     out.push(row);
                 }
             }
@@ -228,7 +303,10 @@ impl CrudService {
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
-            return Err(AppError::BadRequest(format!("bulk create limited to {} items", BULK_LIMIT)));
+            return Err(AppError::BadRequest(format!(
+                "bulk create limited to {} items",
+                BULK_LIMIT
+            )));
         }
         let mut out = Vec::with_capacity(items.len());
         let mut row_errors: Vec<(usize, AppError)> = Vec::new();
@@ -237,16 +315,29 @@ impl CrudService {
                 let mut tx = pool.begin().await?;
                 for (idx, body) in items.iter().enumerate() {
                     let sp = format!("sp_{}", idx);
-                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut *tx)
+                        .await?;
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
+                    let q = insert(
+                        entity,
+                        body,
+                        include_pk,
+                        schema_override,
+                        rls_tenant_id,
+                        caller_user_id,
+                    );
                     match Self::execute_returning_one_tx(&mut tx, &q).await {
                         Ok(row) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
                             out.push(row.unwrap_or(Value::Null));
                         }
                         Err(e) => {
-                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
                             row_errors.push((idx, e));
                         }
                     }
@@ -261,16 +352,29 @@ impl CrudService {
             TenantExecutor::Conn(conn) => {
                 for (idx, body) in items.iter().enumerate() {
                     let sp = format!("sp_{}", idx);
-                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut **conn)
+                        .await?;
                     let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(entity, body, include_pk, schema_override, rls_tenant_id, caller_user_id);
+                    let q = insert(
+                        entity,
+                        body,
+                        include_pk,
+                        schema_override,
+                        rls_tenant_id,
+                        caller_user_id,
+                    );
                     match Self::execute_returning_one_conn(&mut **conn, &q).await {
                         Ok(row) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
                             out.push(row.unwrap_or(Value::Null));
                         }
                         Err(e) => {
-                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
                             row_errors.push((idx, e));
                         }
                     }
@@ -305,10 +409,18 @@ impl CrudService {
             TenantExecutor::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for body in items {
-                    let id = body.get(pk).ok_or_else(|| AppError::Validation(format!("each item must have '{}'", pk)))?;
+                    let id = body.get(pk).ok_or_else(|| {
+                        AppError::Validation(format!("each item must have '{}'", pk))
+                    })?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(entity, id, &body_without_pk, schema_override, caller_user_id);
+                    let q = update(
+                        entity,
+                        id,
+                        &body_without_pk,
+                        schema_override,
+                        caller_user_id,
+                    );
                     if let Some(row) = Self::execute_returning_one_tx(&mut tx, &q).await? {
                         out.push(row);
                     }
@@ -317,10 +429,18 @@ impl CrudService {
             }
             TenantExecutor::Conn(conn) => {
                 for body in items {
-                    let id = body.get(pk).ok_or_else(|| AppError::Validation(format!("each item must have '{}'", pk)))?;
+                    let id = body.get(pk).ok_or_else(|| {
+                        AppError::Validation(format!("each item must have '{}'", pk))
+                    })?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(entity, id, &body_without_pk, schema_override, caller_user_id);
+                    let q = update(
+                        entity,
+                        id,
+                        &body_without_pk,
+                        schema_override,
+                        caller_user_id,
+                    );
                     if let Some(row) = Self::execute_returning_one_conn(&mut **conn, &q).await? {
                         out.push(row);
                     }
@@ -343,7 +463,10 @@ impl CrudService {
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
         const BULK_LIMIT: usize = 100;
         if items.len() > BULK_LIMIT {
-            return Err(AppError::BadRequest(format!("bulk update limited to {} items", BULK_LIMIT)));
+            return Err(AppError::BadRequest(format!(
+                "bulk update limited to {} items",
+                BULK_LIMIT
+            )));
         }
         let pk = entity.pk_columns[0].clone();
         let mut out = Vec::with_capacity(items.len());
@@ -355,25 +478,42 @@ impl CrudService {
                     let id = match body.get(&pk) {
                         Some(id) => id.clone(),
                         None => {
-                            row_errors.push((idx, AppError::Validation(format!("each item must have '{}'", pk))));
+                            row_errors.push((
+                                idx,
+                                AppError::Validation(format!("each item must have '{}'", pk)),
+                            ));
                             continue;
                         }
                     };
                     let sp = format!("sp_{}", idx);
-                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut *tx)
+                        .await?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(&pk);
-                    let q = update(entity, &id, &body_without_pk, schema_override, caller_user_id);
+                    let q = update(
+                        entity,
+                        &id,
+                        &body_without_pk,
+                        schema_override,
+                        caller_user_id,
+                    );
                     match Self::execute_returning_one_tx(&mut tx, &q).await {
                         Ok(Some(row)) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
                             out.push(row);
                         }
                         Ok(None) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
                         }
                         Err(e) => {
-                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut *tx).await?;
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
                             row_errors.push((idx, e));
                         }
                     }
@@ -390,25 +530,42 @@ impl CrudService {
                     let id = match body.get(&pk) {
                         Some(id) => id.clone(),
                         None => {
-                            row_errors.push((idx, AppError::Validation(format!("each item must have '{}'", pk))));
+                            row_errors.push((
+                                idx,
+                                AppError::Validation(format!("each item must have '{}'", pk)),
+                            ));
                             continue;
                         }
                     };
                     let sp = format!("sp_{}", idx);
-                    sqlx::query(&format!("SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut **conn)
+                        .await?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(&pk);
-                    let q = update(entity, &id, &body_without_pk, schema_override, caller_user_id);
+                    let q = update(
+                        entity,
+                        &id,
+                        &body_without_pk,
+                        schema_override,
+                        caller_user_id,
+                    );
                     match Self::execute_returning_one_conn(&mut **conn, &q).await {
                         Ok(Some(row)) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
                             out.push(row);
                         }
                         Ok(None) => {
-                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
                         }
                         Err(e) => {
-                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp)).execute(&mut **conn).await?;
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
                             row_errors.push((idx, e));
                         }
                     }
@@ -430,7 +587,12 @@ impl CrudService {
         let bind = Self::to_sqlx_param(&params[0]);
         let row = match executor {
             TenantExecutor::Pool(pool) => sqlx::query(sql).bind(bind).fetch_optional(*pool).await?,
-            TenantExecutor::Conn(conn) => sqlx::query(sql).bind(bind).fetch_optional(&mut **conn).await?,
+            TenantExecutor::Conn(conn) => {
+                sqlx::query(sql)
+                    .bind(bind)
+                    .fetch_optional(&mut **conn)
+                    .await?
+            }
         };
         Ok(row.map(|r| row_to_json(&r)))
     }
@@ -548,7 +710,11 @@ impl CrudService {
         params.push(Value::String(action.to_string()));
         placeholders.push(format!("${}", params.len()));
 
-        params.push(audit_by.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null));
+        params.push(
+            audit_by
+                .map(|s| Value::String(s.to_string()))
+                .unwrap_or(Value::Null),
+        );
         placeholders.push(format!("${}", params.len()));
 
         params.push(changed.unwrap_or(Value::Null));
@@ -556,7 +722,10 @@ impl CrudService {
 
         let row_obj = row.as_object();
         for col in &entity.columns {
-            let raw = row_obj.and_then(|o| o.get(&col.name)).cloned().unwrap_or(Value::Null);
+            let raw = row_obj
+                .and_then(|o| o.get(&col.name))
+                .cloned()
+                .unwrap_or(Value::Null);
             let val = coerce_json_value_for_pg_array(raw, col.pg_type.as_deref());
             let param_num = params.len() + 1;
             let ph = col
@@ -582,16 +751,26 @@ impl CrudService {
             query = query.bind(Self::to_sqlx_param(p));
         }
         match executor {
-            TenantExecutor::Pool(pool) => { query.execute(*pool).await?; }
-            TenantExecutor::Conn(conn) => { query.execute(&mut **conn).await?; }
+            TenantExecutor::Pool(pool) => {
+                query.execute(*pool).await?;
+            }
+            TenantExecutor::Conn(conn) => {
+                query.execute(&mut **conn).await?;
+            }
         }
         Ok(())
     }
 }
 
 fn compute_changed_fields(pre: &Value, post: &Value, entity: &ResolvedEntity) -> Value {
-    let pre_obj = match pre.as_object() { Some(o) => o, None => return Value::Null };
-    let post_obj = match post.as_object() { Some(o) => o, None => return Value::Null };
+    let pre_obj = match pre.as_object() {
+        Some(o) => o,
+        None => return Value::Null,
+    };
+    let post_obj = match post.as_object() {
+        Some(o) => o,
+        None => return Value::Null,
+    };
     let mut changes = serde_json::Map::new();
     for col in &entity.columns {
         let pre_val = pre_obj.get(&col.name).unwrap_or(&Value::Null);
@@ -607,8 +786,8 @@ fn compute_changed_fields(pre: &Value, post: &Value, entity: &ResolvedEntity) ->
 }
 
 fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
-    use sqlx::Row;
     use sqlx::Column;
+    use sqlx::Row;
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name();
@@ -661,7 +840,11 @@ fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     }
     if let Ok(v) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(name) {
         if let Some(vec) = v {
-            return Value::Array(vec.into_iter().map(|u| Value::String(u.to_string())).collect());
+            return Value::Array(
+                vec.into_iter()
+                    .map(|u| Value::String(u.to_string()))
+                    .collect(),
+            );
         }
     }
     if let Ok(v) = row.try_get::<Option<Vec<i64>>, _>(name) {

@@ -103,7 +103,10 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_packages
     );
     sqlx::query(&packages_ddl).execute(pool).await?;
-    let alter_pkg_semver = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT", q_packages);
+    let alter_pkg_semver = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT",
+        q_packages
+    );
     let _ = sqlx::query(&alter_pkg_semver).execute(pool).await;
     let q_packages_history = qualified_sys_table("_sys_packages_history");
     let packages_history_ddl = format!(
@@ -120,12 +123,21 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_packages_history
     );
     sqlx::query(&packages_history_ddl).execute(pool).await?;
-    let alter_pkg_hist_semver = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT", q_packages_history);
+    let alter_pkg_hist_semver = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS semantic_version TEXT",
+        q_packages_history
+    );
     let _ = sqlx::query(&alter_pkg_hist_semver).execute(pool).await;
     // Migrate to surrogate PK so multiple uninstalls of the same package (same id/version) don't violate uniqueness
-    let add_history_id = format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS history_id BIGSERIAL", q_packages_history);
+    let add_history_id = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS history_id BIGSERIAL",
+        q_packages_history
+    );
     let _ = sqlx::query(&add_history_id).execute(pool).await;
-    let drop_old_pk = format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_packages_history_pkey", q_packages_history);
+    let drop_old_pk = format!(
+        "ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_packages_history_pkey",
+        q_packages_history
+    );
     let _ = sqlx::query(&drop_old_pk).execute(pool).await;
     let add_new_pk_cond = format!(
         "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '_sys_packages_history_history_id_pkey') THEN \
@@ -148,7 +160,10 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_tenants
     );
     sqlx::query(&tenants_ddl).execute(pool).await?;
-    let drop_schema_name = format!("ALTER TABLE {} DROP COLUMN IF EXISTS schema_name", q_tenants);
+    let drop_schema_name = format!(
+        "ALTER TABLE {} DROP COLUMN IF EXISTS schema_name",
+        q_tenants
+    );
     let _ = sqlx::query(&drop_schema_name).execute(pool).await;
 
     let q_kv_data = qualified_sys_table("_sys_kv_data");
@@ -173,7 +188,10 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_kv_data
     );
     let _ = sqlx::query(&alter_kv_tenant).execute(pool).await;
-    let drop_pk = format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_kv_data_pkey", q_kv_data);
+    let drop_pk = format!(
+        "ALTER TABLE {} DROP CONSTRAINT IF EXISTS _sys_kv_data_pkey",
+        q_kv_data
+    );
     let _ = sqlx::query(&drop_pk).execute(pool).await;
     let add_pk = format!(
         "ALTER TABLE {} ADD PRIMARY KEY (tenant_id, package_id, namespace, key)",
@@ -210,7 +228,9 @@ async fn ensure_migration_tables(pool: &PgPool) -> Result<(), AppError> {
             applied_at TIMESTAMPTZ
         )"#,
         q_plans
-    )).execute(pool).await?;
+    ))
+    .execute(pool)
+    .await?;
 
     let q_audit = qualified_sys_table("_sys_migration_audit");
     sqlx::query(&format!(
@@ -236,7 +256,9 @@ async fn ensure_migration_tables(pool: &PgPool) -> Result<(), AppError> {
             executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"#,
         q_audit
-    )).execute(pool).await?;
+    ))
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -286,7 +308,10 @@ pub async fn save_migration_plan(
 }
 
 /// Fetch a migration plan by id, or None if not found.
-pub async fn get_migration_plan(pool: &PgPool, id: &str) -> Result<Option<MigrationPlanRow>, AppError> {
+pub async fn get_migration_plan(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<MigrationPlanRow>, AppError> {
     let q = qualified_sys_table("_sys_migration_plans");
     let row: Option<(String, String, String, Option<String>, String, serde_json::Value, Vec<u8>, String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)> =
         sqlx::query_as(&format!(
@@ -297,9 +322,35 @@ pub async fn get_migration_plan(pool: &PgPool, id: &str) -> Result<Option<Migrat
         .fetch_optional(pool)
         .await
         .map_err(AppError::Db)?;
-    Ok(row.map(|(id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at)| {
-        MigrationPlanRow { id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at }
-    }))
+    Ok(row.map(
+        |(
+            id,
+            package_id,
+            tenant_id,
+            from_version,
+            to_version,
+            plan_json,
+            zip_bytes,
+            status,
+            created_at,
+            expires_at,
+            applied_at,
+        )| {
+            MigrationPlanRow {
+                id,
+                package_id,
+                tenant_id,
+                from_version,
+                to_version,
+                plan_json,
+                zip_bytes,
+                status,
+                created_at,
+                expires_at,
+                applied_at,
+            }
+        },
+    ))
 }
 
 /// Atomically mark a migration plan as applied. Returns false if already applied or not found.
@@ -481,21 +532,43 @@ pub struct PackageRow {
 /// List all rows from _sys_packages ordered by id.
 pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
-    let rows: Vec<(String, serde_json::Value, i64, DateTime<Utc>, Option<String>)> =
-        sqlx::query_as(&format!("SELECT id, payload, version, updated_at, semantic_version FROM {} ORDER BY id", q))
-            .fetch_all(pool)
-            .await
-            .map_err(AppError::Db)?;
+    let rows: Vec<(
+        String,
+        serde_json::Value,
+        i64,
+        DateTime<Utc>,
+        Option<String>,
+    )> = sqlx::query_as(&format!(
+        "SELECT id, payload, version, updated_at, semantic_version FROM {} ORDER BY id",
+        q
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::Db)?;
     Ok(rows
         .into_iter()
-        .map(|(id, payload, version, updated_at, semantic_version)| PackageRow { id, payload, version, updated_at, semantic_version })
+        .map(
+            |(id, payload, version, updated_at, semantic_version)| PackageRow {
+                id,
+                payload,
+                version,
+                updated_at,
+                semantic_version,
+            },
+        )
         .collect())
 }
 
 /// Fetch a single package row by id, or None if not installed.
 pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
-    let row: Option<(String, serde_json::Value, i64, DateTime<Utc>, Option<String>)> = sqlx::query_as(&format!(
+    let row: Option<(
+        String,
+        serde_json::Value,
+        i64,
+        DateTime<Utc>,
+        Option<String>,
+    )> = sqlx::query_as(&format!(
         "SELECT id, payload, version, updated_at, semantic_version FROM {} WHERE id = $1",
         q
     ))
@@ -503,11 +576,23 @@ pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, 
     .fetch_optional(pool)
     .await
     .map_err(AppError::Db)?;
-    Ok(row.map(|(id, payload, version, updated_at, semantic_version)| PackageRow { id, payload, version, updated_at, semantic_version }))
+    Ok(row.map(
+        |(id, payload, version, updated_at, semantic_version)| PackageRow {
+            id,
+            payload,
+            version,
+            updated_at,
+            semantic_version,
+        },
+    ))
 }
 
 /// Count rows in a config table for a given package.
-pub async fn count_package_kind(pool: &PgPool, kind: &str, package_id: &str) -> Result<i64, AppError> {
+pub async fn count_package_kind(
+    pool: &PgPool,
+    kind: &str,
+    package_id: &str,
+) -> Result<i64, AppError> {
     let table = sys_table_for_kind(kind)
         .ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
     let q = qualified_sys_table(table);
@@ -574,13 +659,10 @@ pub async fn upsert_package(
         .await?;
     }
 
-    sqlx::query(&format!(
-        "DELETE FROM {} WHERE id = $1",
-        q_packages
-    ))
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query(&format!("DELETE FROM {} WHERE id = $1", q_packages))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
 
     let semver_param: Option<&str> = if semantic_version.is_empty() {
         None
@@ -642,10 +724,13 @@ pub async fn delete_package_and_config(pool: &PgPool, package_id: &str) -> Resul
             .execute(&mut *tx)
             .await?;
         let history_table = qualified_sys_table(&format!("{}_history", table));
-        sqlx::query(&format!("DELETE FROM {} WHERE package_id = $1", history_table))
-            .bind(package_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {} WHERE package_id = $1",
+            history_table
+        ))
+        .bind(package_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // Delete KV data for this package
@@ -674,11 +759,12 @@ pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> 
     let opts = sqlx::postgres::PgConnectOptions::from_str(&admin_url)
         .map_err(|e| AppError::BadRequest(format!("invalid DATABASE_URL: {}", e)))?;
     let mut conn: sqlx::PgConnection = opts.connect().await.map_err(AppError::Db)?;
-    let exists: (bool,) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
-        .bind(&db_name)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(AppError::Db)?;
+    let exists: (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&db_name)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(AppError::Db)?;
     if !exists.0 {
         let quoted = quote_ident(&db_name);
         sqlx::query(&format!("CREATE DATABASE {}", quoted))
@@ -690,7 +776,10 @@ pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> 
 }
 
 fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
-    let path_start = url.rfind('/').ok_or_else(|| AppError::BadRequest("DATABASE_URL: no path".into()))? + 1;
+    let path_start = url
+        .rfind('/')
+        .ok_or_else(|| AppError::BadRequest("DATABASE_URL: no path".into()))?
+        + 1;
     let path_and_query = url.get(path_start..).unwrap_or("");
     let db_name = path_and_query.split('?').next().unwrap_or("").trim();
     let base = url.get(..path_start).unwrap_or(url);

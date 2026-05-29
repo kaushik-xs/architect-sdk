@@ -1,6 +1,8 @@
 //! Load config from in-memory structs or from architect._sys_* tables in DB.
 
-use crate::config::resolved::{ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel};
+use crate::config::resolved::{
+    ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel,
+};
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
 use crate::error::ConfigError;
@@ -15,14 +17,16 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let tables_by_id: HashMap<_, _> = config.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-    let columns_by_table: HashMap<_, Vec<&ColumnConfig>> = config
-        .columns
-        .iter()
-        .fold(HashMap::new(), |mut m, c| {
+    let columns_by_table: HashMap<_, Vec<&ColumnConfig>> =
+        config.columns.iter().fold(HashMap::new(), |mut m, c| {
             m.entry(c.table_id.as_str()).or_default().push(c);
             m
         });
-    let column_id_to_name: HashMap<&str, &str> = config.columns.iter().map(|c| (c.id.as_str(), c.name.as_str())).collect();
+    let column_id_to_name: HashMap<&str, &str> = config
+        .columns
+        .iter()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect();
     let table_id_to_path: HashMap<&str, &str> = config
         .api_entities
         .iter()
@@ -33,12 +37,12 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
     let mut entity_by_path = HashMap::new();
 
     for api in &config.api_entities {
-        let table = tables_by_id
-            .get(api.entity_id.as_str())
-            .ok_or_else(|| ConfigError::MissingReference {
+        let table = tables_by_id.get(api.entity_id.as_str()).ok_or_else(|| {
+            ConfigError::MissingReference {
                 kind: "table",
                 id: api.entity_id.clone(),
-            })?;
+            }
+        })?;
         let table_sid = table.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id
             .get(table_sid)
@@ -131,7 +135,11 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             validation: api.validation.clone(),
             events: api.events.clone(),
             archive_field: api.archive_field.clone().or_else(|| {
-                if api.operations.iter().any(|o| o == "archive" || o == "unarchive") {
+                if api
+                    .operations
+                    .iter()
+                    .any(|o| o == "archive" || o == "unarchive")
+                {
                     Some("archived_at".to_string())
                 } else {
                     None
@@ -190,11 +198,21 @@ fn build_includes_for_table(
 ) -> Vec<IncludeSpec> {
     let mut includes = Vec::new();
     for rel in relationships {
-        let from_col = column_id_to_name.get(rel.from_column_id.as_str()).map(|s| s.to_string());
-        let to_col = column_id_to_name.get(rel.to_column_id.as_str()).map(|s| s.to_string());
-        let from_path = table_id_to_path.get(rel.from_table_id.as_str()).map(|s| s.to_string());
-        let to_path = table_id_to_path.get(rel.to_table_id.as_str()).map(|s| s.to_string());
-        if let (Some(our_key), Some(their_key), Some(related_path)) = (from_col.clone(), to_col.clone(), to_path.clone()) {
+        let from_col = column_id_to_name
+            .get(rel.from_column_id.as_str())
+            .map(|s| s.to_string());
+        let to_col = column_id_to_name
+            .get(rel.to_column_id.as_str())
+            .map(|s| s.to_string());
+        let from_path = table_id_to_path
+            .get(rel.from_table_id.as_str())
+            .map(|s| s.to_string());
+        let to_path = table_id_to_path
+            .get(rel.to_table_id.as_str())
+            .map(|s| s.to_string());
+        if let (Some(our_key), Some(their_key), Some(related_path)) =
+            (from_col.clone(), to_col.clone(), to_path.clone())
+        {
             if rel.from_table_id == our_table_id {
                 includes.push(IncludeSpec {
                     name: related_path.clone(),
@@ -205,7 +223,8 @@ fn build_includes_for_table(
                 });
             }
         }
-        if let (Some(our_key), Some(their_key), Some(related_path)) = (to_col, from_col, from_path) {
+        if let (Some(our_key), Some(their_key), Some(related_path)) = (to_col, from_col, from_path)
+        {
             if rel.to_table_id == our_table_id {
                 includes.push(IncludeSpec {
                     name: related_path.clone(),
@@ -263,11 +282,21 @@ fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
         Some("json".into())
     } else if lower.contains("uuid") {
         Some("uuid".into())
-    } else if lower == "numeric" || lower.starts_with("numeric(") || lower == "decimal" || lower.starts_with("decimal(") {
+    } else if lower == "numeric"
+        || lower.starts_with("numeric(")
+        || lower == "decimal"
+        || lower.starts_with("decimal(")
+    {
         Some("numeric".into())
-    } else if lower == "smallint" || lower == "int2" || lower == "smallserial" || lower == "serial2" {
+    } else if lower == "smallint" || lower == "int2" || lower == "smallserial" || lower == "serial2"
+    {
         Some("smallint".into())
-    } else if lower == "integer" || lower == "int" || lower == "int4" || lower == "serial" || lower == "serial4" {
+    } else if lower == "integer"
+        || lower == "int"
+        || lower == "int4"
+        || lower == "serial"
+        || lower == "serial4"
+    {
         Some("integer".into())
     } else if lower == "bigint" || lower == "int8" || lower == "bigserial" || lower == "serial8" {
         Some("bigint".into())
@@ -363,7 +392,10 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
         PkType::Uuid
     } else if type_lower.contains("bigserial") || type_lower.contains("bigint") {
         PkType::BigInt
-    } else if type_lower.contains("serial") || type_lower.contains("integer") || type_lower.contains("int") {
+    } else if type_lower.contains("serial")
+        || type_lower.contains("integer")
+        || type_lower.contains("int")
+    {
         PkType::Int
     } else {
         PkType::Text
@@ -372,7 +404,9 @@ fn infer_pk_type(col: &ColumnConfig) -> PkType {
 
 /// Load full config from architect._sys_* tables for one package. Tables must already exist (ensure_sys_tables).
 pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfig, ConfigError> {
-    let mut schemas = load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas"), package_id).await?;
+    let mut schemas =
+        load_config_table::<SchemaConfig>(pool, &qualified_sys_table("_sys_schemas"), package_id)
+            .await?;
     if schemas.is_empty() {
         schemas = vec![SchemaConfig {
             id: "default".into(),
@@ -380,13 +414,36 @@ pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfi
             comment: None,
         }];
     }
-    let enums = load_config_table::<EnumConfig>(pool, &qualified_sys_table("_sys_enums"), package_id).await?;
-    let tables = load_config_table::<TableConfig>(pool, &qualified_sys_table("_sys_tables"), package_id).await?;
-    let columns = load_config_table::<ColumnConfig>(pool, &qualified_sys_table("_sys_columns"), package_id).await?;
-    let indexes = load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes"), package_id).await?;
-    let relationships = load_config_table::<RelationshipConfig>(pool, &qualified_sys_table("_sys_relationships"), package_id).await?;
-    let api_entities = load_config_table::<ApiEntityConfig>(pool, &qualified_sys_table("_sys_api_entities"), package_id).await?;
-    let kv_stores = load_config_table::<KvStoreConfig>(pool, &qualified_sys_table("_sys_kv_stores"), package_id).await?;
+    let enums =
+        load_config_table::<EnumConfig>(pool, &qualified_sys_table("_sys_enums"), package_id)
+            .await?;
+    let tables =
+        load_config_table::<TableConfig>(pool, &qualified_sys_table("_sys_tables"), package_id)
+            .await?;
+    let columns =
+        load_config_table::<ColumnConfig>(pool, &qualified_sys_table("_sys_columns"), package_id)
+            .await?;
+    let indexes =
+        load_config_table::<IndexConfig>(pool, &qualified_sys_table("_sys_indexes"), package_id)
+            .await?;
+    let relationships = load_config_table::<RelationshipConfig>(
+        pool,
+        &qualified_sys_table("_sys_relationships"),
+        package_id,
+    )
+    .await?;
+    let api_entities = load_config_table::<ApiEntityConfig>(
+        pool,
+        &qualified_sys_table("_sys_api_entities"),
+        package_id,
+    )
+    .await?;
+    let kv_stores = load_config_table::<KvStoreConfig>(
+        pool,
+        &qualified_sys_table("_sys_kv_stores"),
+        package_id,
+    )
+    .await?;
 
     let config = FullConfig {
         schemas,
@@ -401,11 +458,18 @@ pub async fn load_from_pool(pool: &PgPool, package_id: &str) -> Result<FullConfi
     Ok(config)
 }
 
-async fn load_config_table<T>(pool: &PgPool, table: &str, package_id: &str) -> Result<Vec<T>, ConfigError>
+async fn load_config_table<T>(
+    pool: &PgPool,
+    table: &str,
+    package_id: &str,
+) -> Result<Vec<T>, ConfigError>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let sql = format!("SELECT payload FROM {} WHERE package_id = $1 ORDER BY id", table);
+    let sql = format!(
+        "SELECT payload FROM {} WHERE package_id = $1 ORDER BY id",
+        table
+    );
     tracing::debug!(sql = %sql, package_id = %package_id, "query");
     let rows = sqlx::query_scalar::<_, serde_json::Value>(&sql)
         .bind(package_id)

@@ -57,7 +57,10 @@ pub struct TableConfig {
 #[serde(untagged)]
 pub enum ColumnTypeConfig {
     Simple(String),
-    Parameterized { name: String, params: Option<Vec<u32>> },
+    Parameterized {
+        name: String,
+        params: Option<Vec<u32>>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -136,8 +139,14 @@ fn default_true() -> bool {
 #[serde(untagged)]
 pub enum IndexColumnEntry {
     Name(String),
-    Spec { name: String, direction: Option<String>, nulls: Option<String> },
-    Expression { expression: String },
+    Spec {
+        name: String,
+        direction: Option<String>,
+        nulls: Option<String>,
+    },
+    Expression {
+        expression: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

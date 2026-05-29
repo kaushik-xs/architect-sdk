@@ -28,10 +28,9 @@ pub async fn sign_asset(
         .and_then(|s| s.parse().ok())
         .unwrap_or(900);
 
-    let storage = state
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+    let storage = state.storage.as_ref().ok_or_else(|| {
+        AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into())
+    })?;
 
     let result = storage.presign_url(path, expires).await?;
 

@@ -22,23 +22,11 @@ pub struct MetaCount {
 }
 
 pub fn success_one<T: Serialize>(data: T) -> (StatusCode, Json<SuccessOne<T>>) {
-    (
-        StatusCode::CREATED,
-        Json(SuccessOne {
-            data,
-            meta: None,
-        }),
-    )
+    (StatusCode::CREATED, Json(SuccessOne { data, meta: None }))
 }
 
 pub fn success_one_ok<T: Serialize>(data: T) -> (StatusCode, Json<SuccessOne<T>>) {
-    (
-        StatusCode::OK,
-        Json(SuccessOne {
-            data,
-            meta: None,
-        }),
-    )
+    (StatusCode::OK, Json(SuccessOne { data, meta: None }))
 }
 
 pub fn success_many<T: Serialize>(data: Vec<T>) -> (StatusCode, Json<SuccessMany<T>>) {
@@ -63,7 +51,11 @@ pub fn success_many_created<T: Serialize>(data: Vec<T>) -> (StatusCode, Json<Suc
     )
 }
 
-pub fn error_body(code: &str, message: String, details: Option<serde_json::Value>) -> serde_json::Value {
+pub fn error_body(
+    code: &str,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> serde_json::Value {
     serde_json::json!({
         "error": {
             "code": code,

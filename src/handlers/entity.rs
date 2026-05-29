@@ -1,8 +1,12 @@
 //! Entity CRUD handlers: create, read, update, delete, list, bulk.
 //! Request bodies and query param keys are accepted in camelCase and converted to snake_case for DB; response row keys are converted to camelCase.
 
-use crate::case::{hashmap_keys_to_snake_case, to_camel_case, to_snake_case, value_keys_to_camel_case};
-use crate::config::{load_from_pool, resolve, IncludeDirection, PkType, ResolvedModel, ResolvedEntity};
+use crate::case::{
+    hashmap_keys_to_snake_case, to_camel_case, to_snake_case, value_keys_to_camel_case,
+};
+use crate::config::{
+    load_from_pool, resolve, IncludeDirection, PkType, ResolvedEntity, ResolvedModel,
+};
 use crate::error::{AppError, BulkFieldError};
 use crate::events::spawn_events;
 use crate::extractors::tenant::TenantId;
@@ -35,11 +39,14 @@ fn strip_sensitive_columns(row: &mut Value, sensitive_columns: &HashSet<String>)
 fn parse_id(id_str: &str, pk_type: &PkType) -> Result<Value, AppError> {
     Ok(match pk_type {
         PkType::Uuid => {
-            let u = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::BadRequest("invalid uuid".into()))?;
+            let u = uuid::Uuid::parse_str(id_str)
+                .map_err(|_| AppError::BadRequest("invalid uuid".into()))?;
             Value::String(u.to_string())
         }
         PkType::BigInt | PkType::Int => {
-            let n: i64 = id_str.parse().map_err(|_| AppError::BadRequest("invalid id".into()))?;
+            let n: i64 = id_str
+                .parse()
+                .map_err(|_| AppError::BadRequest("invalid id".into()))?;
             Value::Number(n.into())
         }
         PkType::Text => Value::String(id_str.to_string()),
@@ -65,7 +72,11 @@ fn db_errors_to_bulk_field_errors(row_errors: Vec<(usize, AppError)>) -> Vec<Bul
             let field = raw_field
                 .map(|f| to_camel_case(&f))
                 .unwrap_or_else(|| "unknown".to_string());
-            BulkFieldError { index, field, message }
+            BulkFieldError {
+                index,
+                field,
+                message,
+            }
         })
         .collect()
 }
@@ -145,7 +156,10 @@ async fn parse_multipart(
     {
         let field_name = field.name().unwrap_or("").to_string();
         let filename = field.file_name().map(|s| s.to_string());
-        let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
         let data = field
             .bytes()
             .await
@@ -160,8 +174,9 @@ async fn parse_multipart(
                 data,
             });
         } else {
-            let text = String::from_utf8(data)
-                .map_err(|e| AppError::BadRequest(format!("field '{}' is not valid UTF-8: {}", field_name, e)))?;
+            let text = String::from_utf8(data).map_err(|e| {
+                AppError::BadRequest(format!("field '{}' is not valid UTF-8: {}", field_name, e))
+            })?;
             text_fields.entry(field_name).or_default().push(text);
         }
     }
@@ -194,15 +209,18 @@ async fn process_asset_uploads(
     if files.is_empty() {
         return Ok(());
     }
-    let storage = state
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+    let storage = state.storage.as_ref().ok_or_else(|| {
+        AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into())
+    })?;
 
     // Group files by field name to support asset[] (multiple files per column).
-    let mut groups: std::collections::BTreeMap<String, Vec<UploadedFile>> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<String, Vec<UploadedFile>> =
+        std::collections::BTreeMap::new();
     for file in files {
-        groups.entry(file.field_name.clone()).or_default().push(file);
+        groups
+            .entry(file.field_name.clone())
+            .or_default()
+            .push(file);
     }
 
     for (field_name, group) in groups {
@@ -231,12 +249,22 @@ async fn process_asset_uploads(
             // Upload new files and append their paths.
             for file in group {
                 if let Some(rule) = entity.validation.get(&col_name) {
-                    validate_asset_field(&col_name, &file.filename, &file.content_type, file.data.len(), rule)?;
+                    validate_asset_field(
+                        &col_name,
+                        &file.filename,
+                        &file.content_type,
+                        file.data.len(),
+                        rule,
+                    )?;
                 }
                 let asset_cfg = col.asset_config.as_ref();
-                let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+                let compression = asset_cfg
+                    .and_then(|c| c.compression.as_deref())
+                    .unwrap_or("none");
                 let data = compress(file.data, compression)?;
-                let prefix_template = asset_cfg.and_then(|c| c.prefix.as_deref()).unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+                let prefix_template = asset_cfg
+                    .and_then(|c| c.prefix.as_deref())
+                    .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
                 let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
                 let ext = std::path::Path::new(&file.filename)
                     .extension()
@@ -244,7 +272,9 @@ async fn process_asset_uploads(
                     .map(|e| format!(".{}", e))
                     .unwrap_or_default();
                 let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
-                storage.upload(&object_name, data, &file.content_type).await?;
+                storage
+                    .upload(&object_name, data, &file.content_type)
+                    .await?;
                 paths.push(Value::String(object_name));
             }
             body.insert(col_name, Value::Array(paths));
@@ -252,12 +282,22 @@ async fn process_asset_uploads(
             // Single-file asset: take the first (and expected only) file.
             let file = group.into_iter().next().unwrap();
             if let Some(rule) = entity.validation.get(&col_name) {
-                validate_asset_field(&col_name, &file.filename, &file.content_type, file.data.len(), rule)?;
+                validate_asset_field(
+                    &col_name,
+                    &file.filename,
+                    &file.content_type,
+                    file.data.len(),
+                    rule,
+                )?;
             }
             let asset_cfg = col.asset_config.as_ref();
-            let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+            let compression = asset_cfg
+                .and_then(|c| c.compression.as_deref())
+                .unwrap_or("none");
             let data = compress(file.data, compression)?;
-            let prefix_template = asset_cfg.and_then(|c| c.prefix.as_deref()).unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
+            let prefix_template = asset_cfg
+                .and_then(|c| c.prefix.as_deref())
+                .unwrap_or("{entity}/{yyyy}/{mm}/{dd}");
             let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
             let ext = std::path::Path::new(&file.filename)
                 .extension()
@@ -265,7 +305,9 @@ async fn process_asset_uploads(
                 .map(|e| format!(".{}", e))
                 .unwrap_or_default();
             let object_name = format!("{}/{}{}", prefix, uuid::Uuid::new_v4(), ext);
-            storage.upload(&object_name, data, &file.content_type).await?;
+            storage
+                .upload(&object_name, data, &file.content_type)
+                .await?;
             body.insert(col_name, Value::String(object_name));
         }
     }
@@ -281,10 +323,9 @@ async fn upload_json_value(
     asset_cfg: Option<&crate::config::AssetColumnConfig>,
     val: &Value,
 ) -> Result<String, AppError> {
-    let storage = state
-        .storage
-        .as_ref()
-        .ok_or_else(|| AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into()))?;
+    let storage = state.storage.as_ref().ok_or_else(|| {
+        AppError::BadRequest("storage is not configured (set STORAGE_PROVIDER env var)".into())
+    })?;
 
     let data = serde_json::to_vec(val)
         .map_err(|e| AppError::BadRequest(format!("failed to serialize {}: {}", col_name, e)))?;
@@ -296,13 +337,17 @@ async fn upload_json_value(
             if data.len() > limit {
                 return Err(AppError::Validation(format!(
                     "{}: JSON payload {} bytes exceeds maximum of {:.1} MB",
-                    col_name, data.len(), max_mb
+                    col_name,
+                    data.len(),
+                    max_mb
                 )));
             }
         }
     }
 
-    let compression = asset_cfg.and_then(|c| c.compression.as_deref()).unwrap_or("none");
+    let compression = asset_cfg
+        .and_then(|c| c.compression.as_deref())
+        .unwrap_or("none");
     let data = compress(data, compression)?;
 
     let prefix_template = asset_cfg
@@ -311,7 +356,9 @@ async fn upload_json_value(
     let prefix = resolve_prefix(prefix_template, tenant_id, &entity.table_name);
     let object_name = format!("{}/{}.json", prefix, uuid::Uuid::new_v4());
 
-    storage.upload(&object_name, data, "application/json").await?;
+    storage
+        .upload(&object_name, data, "application/json")
+        .await?;
     Ok(object_name)
 }
 
@@ -377,7 +424,10 @@ async fn process_json_asset_fields(
                         paths.push(Value::String(s));
                     }
                     other @ Value::Object(_) | other @ Value::Array(_) => {
-                        let path = upload_json_value(state, entity, tenant_id, &col.name, asset_cfg, &other).await?;
+                        let path = upload_json_value(
+                            state, entity, tenant_id, &col.name, asset_cfg, &other,
+                        )
+                        .await?;
                         paths.push(Value::String(path));
                     }
                     _ => {
@@ -393,7 +443,8 @@ async fn process_json_asset_fields(
                 Some(v @ Value::Object(_)) | Some(v @ Value::Array(_)) => v.clone(),
                 _ => continue,
             };
-            let path = upload_json_value(state, entity, tenant_id, &col.name, asset_cfg, &val).await?;
+            let path =
+                upload_json_value(state, entity, tenant_id, &col.name, asset_cfg, &val).await?;
             body.insert(col.name.clone(), Value::String(path));
         }
     }
@@ -427,7 +478,11 @@ async fn sign_row_assets(
                 continue;
             }
             let camel = crate::case::to_camel_case(&col.name);
-            let key = if map.contains_key(&col.name) { col.name.as_str() } else { camel.as_str() };
+            let key = if map.contains_key(&col.name) {
+                col.name.as_str()
+            } else {
+                camel.as_str()
+            };
 
             if col.asset_is_array {
                 // asset[] — presign each path string in the array.
@@ -472,7 +527,11 @@ fn collect_row_asset_paths(row: &Value, col_name: &str) -> Vec<String> {
             .iter()
             .filter_map(|v| {
                 if let Value::String(s) = v {
-                    if !s.is_empty() { Some(s.clone()) } else { None }
+                    if !s.is_empty() {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -506,7 +565,13 @@ async fn delete_dropped_asset_paths(
             }
             Some(Value::Array(arr)) => arr
                 .iter()
-                .filter_map(|v| if let Value::String(s) = v { Some(s.clone()) } else { None })
+                .filter_map(|v| {
+                    if let Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
             _ => HashSet::new(),
         }
@@ -568,7 +633,12 @@ fn resolve_includes(
         let related = model
             .entity_by_path(&spec.related_path_segment)
             .cloned()
-            .ok_or_else(|| AppError::BadRequest(format!("related entity not found: {}", spec.related_path_segment)))?;
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "related entity not found: {}",
+                    spec.related_path_segment
+                ))
+            })?;
         out.push((name.clone(), spec, related));
     }
     Ok(out)
@@ -593,7 +663,9 @@ pub enum TenantContext {
 impl TenantContext {
     pub fn config_pool(&self) -> &sqlx::PgPool {
         match self {
-            TenantContext::Pool { config_pool, .. } | TenantContext::Rls { config_pool, .. } => config_pool,
+            TenantContext::Pool { config_pool, .. } | TenantContext::Rls { config_pool, .. } => {
+                config_pool
+            }
         }
     }
     /// Pool used for DDL (migrations) and entity data. For schema/rls with database_url this is the tenant DB; otherwise architect DB.
@@ -605,13 +677,20 @@ impl TenantContext {
     /// When set (schema strategy), create schemas/tables in this schema on the migration pool.
     pub fn schema_override(&self) -> Option<&str> {
         match self {
-            TenantContext::Pool { schema_override, .. } => schema_override.as_deref(),
+            TenantContext::Pool {
+                schema_override, ..
+            } => schema_override.as_deref(),
             TenantContext::Rls { .. } => None,
         }
     }
     pub fn package_cache_key(&self) -> &str {
         match self {
-            TenantContext::Pool { package_cache_key, .. } | TenantContext::Rls { package_cache_key, .. } => package_cache_key,
+            TenantContext::Pool {
+                package_cache_key, ..
+            }
+            | TenantContext::Rls {
+                package_cache_key, ..
+            } => package_cache_key,
         }
     }
     /// When RLS strategy: column name to set on INSERT (e.g. "tenant_id"). Used by migrations and CRUD.
@@ -644,14 +723,22 @@ pub async fn resolve_tenant_context(
     let package_id = package_id_opt.unwrap_or(DEFAULT_PACKAGE_ID);
     let package_cache_key = package_id.to_string();
 
-    let entry = state.tenant_registry.get(tenant_id).ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
+    let entry = state
+        .tenant_registry
+        .get(tenant_id)
+        .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
 
     // Architect schema and _sys_* config tables exist only in DATABASE_URL (from .env), always in the architect schema. Tenant DBs are used for app data/migrations only.
     let architect_pool = state.pool.clone();
 
     match &entry.strategy {
         TenantStrategy::Database => {
-            let database_url = entry.database_url.as_deref().ok_or_else(|| AppError::BadRequest(format!("tenant {}: strategy database requires database_url", tenant_id)))?;
+            let database_url = entry.database_url.as_deref().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "tenant {}: strategy database requires database_url",
+                    tenant_id
+                ))
+            })?;
             let pool = get_or_create_tenant_pool(state, tenant_id, database_url).await?;
             Ok(TenantContext::Pool {
                 pool: pool.clone(),
@@ -682,7 +769,10 @@ pub async fn get_or_create_tenant_pool(
     database_url: &str,
 ) -> Result<sqlx::PgPool, AppError> {
     let existing = {
-        let guard = state.tenant_pools.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        let guard = state
+            .tenant_pools
+            .read()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
         guard.get(tenant_id).cloned()
     };
     if let Some(p) = existing {
@@ -693,8 +783,13 @@ pub async fn get_or_create_tenant_pool(
         .connect(database_url)
         .await?;
     {
-        let mut guard = state.tenant_pools.write().map_err(|_| AppError::BadRequest("state lock".into()))?;
-        guard.entry(tenant_id.to_string()).or_insert_with(|| new_pool.clone());
+        let mut guard = state
+            .tenant_pools
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
+        guard
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| new_pool.clone());
     }
     Ok(new_pool)
 }
@@ -708,13 +803,20 @@ pub(crate) async fn get_or_load_package_model(
     package_id: &str,
 ) -> Result<ResolvedModel, AppError> {
     {
-        let guard = state.package_models.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+        let guard = state
+            .package_models
+            .read()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
         if let Some(m) = guard.get(cache_key) {
             return Ok(m.clone());
         }
     }
-    let config = load_from_pool(config_pool, package_id).await.map_err(AppError::Config)?;
-    let model = resolve(&config).map_err(AppError::Config)?.with_package_id(package_id);
+    let config = load_from_pool(config_pool, package_id)
+        .await
+        .map_err(AppError::Config)?;
+    let model = resolve(&config)
+        .map_err(AppError::Config)?
+        .with_package_id(package_id);
     state
         .package_models
         .write()
@@ -731,7 +833,9 @@ fn post_process_include_columns(
     for row in rows.iter_mut() {
         if let Value::Object(map) = row {
             for (name, _spec, related) in resolved_includes {
-                let Some(included) = map.get_mut(name) else { continue };
+                let Some(included) = map.get_mut(name) else {
+                    continue;
+                };
                 if let Value::String(s) = included {
                     if let Ok(parsed) = serde_json::from_str::<Value>(s) {
                         *included = parsed;
@@ -798,7 +902,10 @@ async fn attach_includes<'a>(
                 }
                 for row in rows.iter_mut() {
                     if let Value::Object(ref mut map) = row {
-                        let key_val = map.get(&spec.our_key_column).cloned().unwrap_or(Value::Null);
+                        let key_val = map
+                            .get(&spec.our_key_column)
+                            .cloned()
+                            .unwrap_or(Value::Null);
                         let key = serde_json::to_string(&key_val).unwrap_or_default();
                         let included = key_to_row.get(&key).cloned().unwrap_or(Value::Null);
                         map.insert(name.clone(), included);
@@ -831,12 +938,12 @@ async fn attach_includes<'a>(
                 }
                 for row in rows.iter_mut() {
                     if let Value::Object(ref mut map) = row {
-                        let key_val = map.get(&spec.our_key_column).cloned().unwrap_or(Value::Null);
-                        let key = serde_json::to_string(&key_val).unwrap_or_default();
-                        let arr = grouped
-                            .get(&key)
+                        let key_val = map
+                            .get(&spec.our_key_column)
                             .cloned()
-                            .unwrap_or_default();
+                            .unwrap_or(Value::Null);
+                        let key = serde_json::to_string(&key_val).unwrap_or_default();
+                        let arr = grouped.get(&key).cloned().unwrap_or_default();
                         map.insert(name.clone(), Value::Array(arr));
                     }
                 }
@@ -884,22 +991,44 @@ pub async fn list(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''")))
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
 
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
@@ -912,7 +1041,13 @@ pub async fn list(
         match k.as_str() {
             "limit" => limit = v.parse().ok(),
             "offset" => offset = v.parse().ok(),
-            "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "include" => {
+                include_names = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
             "q" => filter_str = Some(v),
             "sort" => sort_str = Some(v),
             "sign" => sign_param = Some(v),
@@ -947,7 +1082,10 @@ pub async fn list(
     };
     let resolved_all: Vec<(String, crate::config::IncludeSpec, ResolvedEntity)> =
         if !all_include_names.is_empty() {
-            let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+            let model = state
+                .model
+                .read()
+                .map_err(|_| AppError::BadRequest("state lock".into()))?;
             resolve_includes(&model, &entity, &all_include_names)?
         } else {
             Vec::new()
@@ -973,7 +1111,17 @@ pub async fn list(
         .collect();
 
     let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, &filter_include_selects, schema_override).await?
+        CrudService::list(
+            &mut executor,
+            &entity,
+            filter.as_ref(),
+            &sort,
+            limit,
+            offset,
+            &filter_include_selects,
+            schema_override,
+        )
+        .await?
     } else {
         let data_include_selects: Vec<IncludeSelect> = resolved_data
             .iter()
@@ -1034,19 +1182,43 @@ pub async fn create(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
 
     // Dispatch by Content-Type: multipart for file uploads, JSON for everything else.
     let is_multipart = request
@@ -1073,14 +1245,36 @@ pub async fn create(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let mut row = CrudService::create(
+        &mut executor,
+        &entity,
+        &body,
+        schema_override,
+        ctx.rls_tenant_id(),
+        user_id_opt.as_deref(),
+    )
+    .await?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "create",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn read(
@@ -1094,33 +1288,73 @@ pub async fn read(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override).await?
+    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override)
+        .await?
         .ok_or_else(|| AppError::NotFound(id_str))?;
     let include_names: Vec<String> = params
         .get("include")
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     if !include_names.is_empty() {
         let resolved = {
-            let model = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?;
+            let model = state
+                .model
+                .read()
+                .map_err(|_| AppError::BadRequest("state lock".into()))?;
             resolve_includes(&model, &entity, &include_names)?
         };
         let mut rows = [row];
-        attach_includes(&mut executor, schema_override, &entity, &mut rows, &resolved).await?;
+        attach_includes(
+            &mut executor,
+            schema_override,
+            &entity,
+            &mut rows,
+            &resolved,
+        )
+        .await?;
         row = rows[0].clone();
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
@@ -1129,14 +1363,27 @@ pub async fn read(
     // Presign asset columns when ?sign= is present.
     let sign_param = params.get("sign").cloned();
     if sign_param.is_some() {
-        let sign_expires: u64 = params.get("sign_expires").and_then(|s| s.parse().ok()).unwrap_or(900);
+        let sign_expires: u64 = params
+            .get("sign_expires")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(900);
         let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
-            if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+            if s == "true" {
+                None
+            } else {
+                Some(s.split(',').map(|c| to_snake_case(c.trim())).collect())
+            }
         });
         sign_row_assets(&state, &entity, &mut row, &sign_cols, sign_expires).await?;
     }
 
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn update(
@@ -1151,19 +1398,43 @@ pub async fn update(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "patch",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
 
     let is_multipart = request
@@ -1199,7 +1470,9 @@ pub async fn update(
         || (state.event_client.is_some()
             && entity.events.iter().any(|e| {
                 e.on == "update"
-                    && e.condition.as_ref().map_or(false, |c| c.changed_to.is_some())
+                    && e.condition
+                        .as_ref()
+                        .map_or(false, |c| c.changed_to.is_some())
             }));
     let pre_update_row = if needs_pre_read {
         CrudService::read(&mut executor, &entity, &id, schema_override).await?
@@ -1207,8 +1480,16 @@ pub async fn update(
         None
     };
 
-    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override, user_id_opt.as_deref()).await?
-        .ok_or_else(|| AppError::NotFound(id_str))?;
+    let mut row = CrudService::update(
+        &mut executor,
+        &entity,
+        &id,
+        &body,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(id_str))?;
 
     // Hard-delete any asset files dropped from storage after a successful DB write.
     if let Some(ref old_row) = pre_update_row {
@@ -1221,9 +1502,23 @@ pub async fn update(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, row.clone(), tenant_id_str, pre_update_row);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "update",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            pre_update_row,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn delete(
@@ -1236,19 +1531,43 @@ pub async fn delete(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "delete",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     // Prefetch the full row before deletion for event triggers and asset storage cleanup.
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
@@ -1259,7 +1578,14 @@ pub async fn delete(
     } else {
         None
     };
-    CrudService::delete(&mut executor, &entity, &id, schema_override, user_id_opt.as_deref()).await?;
+    CrudService::delete(
+        &mut executor,
+        &entity,
+        &id,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?;
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {
@@ -1297,19 +1623,43 @@ pub async fn bulk_create(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1323,15 +1673,29 @@ pub async fn bulk_create(
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
-            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+            all_errors.push(BulkFieldError {
+                index,
+                field: to_camel_case(&field),
+                message,
+            });
         }
     }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let (mut rows, db_errs) = CrudService::bulk_create_collecting(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let (mut rows, db_errs) = CrudService::bulk_create_collecting(
+        &mut executor,
+        &entity,
+        &items,
+        schema_override,
+        ctx.rls_tenant_id(),
+        user_id_opt.as_deref(),
+    )
+    .await?;
     if !db_errs.is_empty() {
-        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
     }
     let raw_rows = rows.clone();
     for row in &mut rows {
@@ -1341,7 +1705,15 @@ pub async fn bulk_create(
     if let Some(client) = &state.event_client {
         let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, api_row, tid.clone(), None);
+            spawn_events(
+                std::sync::Arc::clone(client),
+                &entity,
+                "create",
+                raw_row,
+                api_row,
+                tid.clone(),
+                None,
+            );
         }
     }
     let count = rows.len() as u64;
@@ -1365,19 +1737,43 @@ pub async fn bulk_update(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = state.model.read().map_err(|_| AppError::BadRequest("state lock".into()))?.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "patch",
+    )
+    .await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1391,15 +1787,28 @@ pub async fn bulk_update(
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
-            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+            all_errors.push(BulkFieldError {
+                index,
+                field: to_camel_case(&field),
+                message,
+            });
         }
     }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let (mut rows, db_errs) = CrudService::bulk_update_collecting(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    let (mut rows, db_errs) = CrudService::bulk_update_collecting(
+        &mut executor,
+        &entity,
+        &items,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?;
     if !db_errs.is_empty() {
-        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
     }
     let raw_rows = rows.clone();
     for row in &mut rows {
@@ -1410,7 +1819,15 @@ pub async fn bulk_update(
         let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
             // bulk_update doesn't pre-fetch old rows; changed_to checks post-update value only.
-            spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, api_row, tid.clone(), None);
+            spawn_events(
+                std::sync::Arc::clone(client),
+                &entity,
+                "update",
+                raw_row,
+                api_row,
+                tid.clone(),
+                None,
+            );
         }
     }
     let count = rows.len() as u64;
@@ -1433,23 +1850,50 @@ pub async fn list_package(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
     let mut limit: Option<u32> = None;
     let mut offset: Option<u32> = None;
     let mut include_names: Vec<String> = Vec::new();
@@ -1461,7 +1905,13 @@ pub async fn list_package(
         match k.as_str() {
             "limit" => limit = v.parse().ok(),
             "offset" => offset = v.parse().ok(),
-            "include" => include_names = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "include" => {
+                include_names = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
             "q" => filter_str = Some(v),
             "sort" => sort_str = Some(v),
             "sign" => sign_param = Some(v),
@@ -1470,7 +1920,11 @@ pub async fn list_package(
         }
     }
     let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
-        if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+        if s == "true" {
+            None
+        } else {
+            Some(s.split(',').map(|c| to_snake_case(c.trim())).collect())
+        }
     });
     let filter: Option<FilterNode> = filter_str.as_deref().map(parse_rsql).transpose()?;
     let sort = sort_str.as_deref().map(parse_sort).unwrap_or_default();
@@ -1508,7 +1962,17 @@ pub async fn list_package(
         .collect();
 
     let mut rows = if include_names.is_empty() {
-        CrudService::list(&mut executor, &entity, filter.as_ref(), &sort, limit, offset, &filter_include_selects, schema_override).await?
+        CrudService::list(
+            &mut executor,
+            &entity,
+            filter.as_ref(),
+            &sort,
+            limit,
+            offset,
+            &filter_include_selects,
+            schema_override,
+        )
+        .await?
     } else {
         let data_include_selects: Vec<IncludeSelect> = resolved_data
             .iter()
@@ -1530,7 +1994,8 @@ pub async fn list_package(
             data_include_selects.as_slice(),
             &filter_include_selects,
             schema_override,
-        ).await?;
+        )
+        .await?;
         post_process_include_columns(&mut rows, &resolved_data);
         rows
     };
@@ -1544,7 +2009,13 @@ pub async fn list_package(
         }
     }
     let count = rows.len() as u64;
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
 }
 
 pub async fn create_package(
@@ -1556,23 +2027,50 @@ pub async fn create_package(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
 
     let is_multipart = request
         .headers()
@@ -1598,14 +2096,36 @@ pub async fn create_package(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
-    let mut row = CrudService::create(&mut executor, &entity, &body, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let mut row = CrudService::create(
+        &mut executor,
+        &entity,
+        &body,
+        schema_override,
+        ctx.rls_tenant_id(),
+        user_id_opt.as_deref(),
+    )
+    .await?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "create",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn read_package(
@@ -1616,30 +2136,74 @@ pub async fn read_package(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "read") {
         return Err(AppError::BadRequest("read not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "get").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override).await?.ok_or_else(|| AppError::NotFound(id_str.clone()))?;
-    let include_names: Vec<String> = params.get("include").map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    let mut row = CrudService::read(&mut executor, &entity, &id, schema_override)
+        .await?
+        .ok_or_else(|| AppError::NotFound(id_str.clone()))?;
+    let include_names: Vec<String> = params
+        .get("include")
+        .map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     if !include_names.is_empty() {
         let resolved = resolve_includes(&model, &entity, &include_names)?;
         let mut rows = [row];
-        attach_includes(&mut executor, schema_override, &entity, &mut rows, &resolved).await?;
+        attach_includes(
+            &mut executor,
+            schema_override,
+            &entity,
+            &mut rows,
+            &resolved,
+        )
+        .await?;
         row = rows[0].clone();
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
@@ -1647,14 +2211,27 @@ pub async fn read_package(
 
     let sign_param = params.get("sign").cloned();
     if sign_param.is_some() {
-        let sign_expires: u64 = params.get("sign_expires").and_then(|s| s.parse().ok()).unwrap_or(900);
+        let sign_expires: u64 = params
+            .get("sign_expires")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(900);
         let sign_cols: Option<HashSet<String>> = sign_param.as_deref().and_then(|s| {
-            if s == "true" { None } else { Some(s.split(',').map(|c| to_snake_case(c.trim())).collect()) }
+            if s == "true" {
+                None
+            } else {
+                Some(s.split(',').map(|c| to_snake_case(c.trim())).collect())
+            }
         });
         sign_row_assets(&state, &entity, &mut row, &sign_cols, sign_expires).await?;
     }
 
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn update_package(
@@ -1666,23 +2243,50 @@ pub async fn update_package(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "patch",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
 
     let is_multipart = request
@@ -1718,7 +2322,16 @@ pub async fn update_package(
         None
     };
 
-    let mut row = CrudService::update(&mut executor, &entity, &id, &body, schema_override, user_id_opt.as_deref()).await?.ok_or_else(|| AppError::NotFound(id_str))?;
+    let mut row = CrudService::update(
+        &mut executor,
+        &entity,
+        &id,
+        &body,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(id_str))?;
 
     // Hard-delete dropped asset files after a successful DB write.
     if let Some(ref old_row) = pre_update_row {
@@ -1731,9 +2344,23 @@ pub async fn update_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "update",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 pub async fn delete_package(
@@ -1743,23 +2370,50 @@ pub async fn delete_package(
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment))?;
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "delete").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "delete",
+    )
+    .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
     // Prefetch the full row before deletion for event triggers and asset storage cleanup.
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
@@ -1770,7 +2424,14 @@ pub async fn delete_package(
     } else {
         None
     };
-    CrudService::delete(&mut executor, &entity, &id, schema_override, user_id_opt.as_deref()).await?;
+    CrudService::delete(
+        &mut executor,
+        &entity,
+        &id,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?;
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {
@@ -1805,23 +2466,50 @@ pub async fn bulk_create_package(
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "post").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1835,15 +2523,29 @@ pub async fn bulk_create_package(
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
-            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+            all_errors.push(BulkFieldError {
+                index,
+                field: to_camel_case(&field),
+                message,
+            });
         }
     }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let (raw_rows, db_errs) = CrudService::bulk_create_collecting(&mut executor, &entity, &items, schema_override, ctx.rls_tenant_id(), user_id_opt.as_deref()).await?;
+    let (raw_rows, db_errs) = CrudService::bulk_create_collecting(
+        &mut executor,
+        &entity,
+        &items,
+        schema_override,
+        ctx.rls_tenant_id(),
+        user_id_opt.as_deref(),
+    )
+    .await?;
     if !db_errs.is_empty() {
-        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
     }
     let mut rows = raw_rows.clone();
     for row in &mut rows {
@@ -1853,11 +2555,25 @@ pub async fn bulk_create_package(
     let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
     if let Some(client) = &state.event_client {
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(std::sync::Arc::clone(client), &entity, "create", raw_row, api_row, tid.clone(), None);
+            spawn_events(
+                std::sync::Arc::clone(client),
+                &entity,
+                "create",
+                raw_row,
+                api_row,
+                tid.clone(),
+                None,
+            );
         }
     }
     let count = rows.len() as u64;
-    Ok((axum::http::StatusCode::CREATED, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
 }
 
 pub async fn bulk_update_package(
@@ -1868,23 +2584,50 @@ pub async fn bulk_update_package(
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
     };
-    let entity = model.entity_by_path(&path_segment).cloned().ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
-    crate::authrs::check_entity_permission_opt(&state.authrs_client, tenant_id_opt.as_deref(), user_id_opt.as_deref(), &entity, "patch").await?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "patch",
+    )
+    .await?;
     let items: Vec<HashMap<String, Value>> = match body {
         Value::Array(arr) => {
             let mut out = Vec::new();
@@ -1898,15 +2641,28 @@ pub async fn bulk_update_package(
     let mut all_errors: Vec<BulkFieldError> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         for (field, message) in RequestValidator::validate_collecting(item, &entity.validation) {
-            all_errors.push(BulkFieldError { index, field: to_camel_case(&field), message });
+            all_errors.push(BulkFieldError {
+                index,
+                field: to_camel_case(&field),
+                message,
+            });
         }
     }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
-    let (raw_rows, db_errs) = CrudService::bulk_update_collecting(&mut executor, &entity, &items, schema_override, user_id_opt.as_deref()).await?;
+    let (raw_rows, db_errs) = CrudService::bulk_update_collecting(
+        &mut executor,
+        &entity,
+        &items,
+        schema_override,
+        user_id_opt.as_deref(),
+    )
+    .await?;
     if !db_errs.is_empty() {
-        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(db_errs)));
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
     }
     let mut rows = raw_rows.clone();
     for row in &mut rows {
@@ -1916,11 +2672,25 @@ pub async fn bulk_update_package(
     let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
     if let Some(client) = &state.event_client {
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(std::sync::Arc::clone(client), &entity, "update", raw_row, api_row, tid.clone(), None);
+            spawn_events(
+                std::sync::Arc::clone(client),
+                &entity,
+                "update",
+                raw_row,
+                api_row,
+                tid.clone(),
+                None,
+            );
         }
     }
     let count = rows.len() as u64;
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessMany { data: rows, meta: crate::response::MetaCount { count } })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
 }
 
 /// Archive a single entity by id (default model).
@@ -1938,10 +2708,21 @@ pub async fn archive(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -1956,10 +2737,9 @@ pub async fn archive(
     if !entity.operations.iter().any(|o| o == "archive") {
         return Err(AppError::BadRequest("archive not allowed".into()));
     }
-    let archive_field = entity
-        .archive_field
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
+        AppError::BadRequest("archive_field is not configured for this entity".into())
+    })?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -1976,9 +2756,23 @@ pub async fn archive(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "archive", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "archive",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 /// Unarchive a single entity by id (default model).
@@ -1996,10 +2790,21 @@ pub async fn unarchive(
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -2014,10 +2819,9 @@ pub async fn unarchive(
     if !entity.operations.iter().any(|o| o == "unarchive") {
         return Err(AppError::BadRequest("unarchive not allowed".into()));
     }
-    let archive_field = entity
-        .archive_field
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
+        AppError::BadRequest("archive_field is not configured for this entity".into())
+    })?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2027,16 +2831,33 @@ pub async fn unarchive(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    let mut row =
+        CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("{} not found or not currently archived", id_str))
+            })?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "unarchive", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "unarchive",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 /// Unarchive a single entity by id (package-scoped model).
@@ -2049,14 +2870,31 @@ pub async fn unarchive_package(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -2068,10 +2906,9 @@ pub async fn unarchive_package(
     if !entity.operations.iter().any(|o| o == "unarchive") {
         return Err(AppError::BadRequest("unarchive not allowed".into()));
     }
-    let archive_field = entity
-        .archive_field
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
+        AppError::BadRequest("archive_field is not configured for this entity".into())
+    })?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2081,16 +2918,33 @@ pub async fn unarchive_package(
     )
     .await?;
     let id = parse_id(&id_str, &entity.pk_type)?;
-    let mut row = CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    let mut row =
+        CrudService::unarchive(&mut executor, &entity, archive_field, &id, schema_override)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("{} not found or not currently archived", id_str))
+            })?;
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "unarchive", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "unarchive",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }
 
 /// Archive a single entity by id (package-scoped model).
@@ -2103,14 +2957,31 @@ pub async fn archive_package(
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
     let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
-    let model = get_or_load_package_model(&state, ctx.config_pool(), ctx.package_cache_key(), &package_id).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<PoolConnection<Postgres>> = None;
     let (mut executor, schema_override) = match &ctx {
-        TenantContext::Pool { pool, schema_override, .. } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
-        TenantContext::Rls { tenant_id, pool, .. } => {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (TenantExecutor::Pool(pool), schema_override.as_deref()),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
             let mut conn = pool.acquire().await?;
-            sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id.replace('\'', "''"))).execute(&mut *conn).await?;
+            sqlx::query(&format!(
+                "SET LOCAL app.tenant_id = '{}'",
+                tenant_id.replace('\'', "''")
+            ))
+            .execute(&mut *conn)
+            .await?;
             rls_conn = Some(conn);
             (TenantExecutor::Conn(&mut *rls_conn.as_mut().unwrap()), None)
         }
@@ -2122,10 +2993,9 @@ pub async fn archive_package(
     if !entity.operations.iter().any(|o| o == "archive") {
         return Err(AppError::BadRequest("archive not allowed".into()));
     }
-    let archive_field = entity
-        .archive_field
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("archive_field is not configured for this entity".into()))?;
+    let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
+        AppError::BadRequest("archive_field is not configured for this entity".into())
+    })?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2142,7 +3012,21 @@ pub async fn archive_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(std::sync::Arc::clone(client), &entity, "archive", raw_row, row.clone(), tenant_id_str, None);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "archive",
+            raw_row,
+            row.clone(),
+            tenant_id_str,
+            None,
+        );
     }
-    Ok((axum::http::StatusCode::OK, Json(crate::response::SuccessOne { data: row, meta: None })))
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
 }

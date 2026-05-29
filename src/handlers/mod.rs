@@ -1,12 +1,12 @@
 //! HTTP handlers for entity CRUD, config ingestion, package install, KV store data, and asset signing.
 
 pub mod asset;
-pub mod entity;
 pub mod config;
-pub mod package;
+pub mod entity;
 pub mod kv;
+pub mod package;
 pub use asset::*;
-pub use entity::*;
 pub use config::*;
-pub use package::*;
+pub use entity::*;
 pub use kv::*;
+pub use package::*;

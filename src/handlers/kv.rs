@@ -11,7 +11,11 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::Value;
 
-async fn validate_namespace(pool: &sqlx::PgPool, package_id: &str, namespace: &str) -> Result<(), AppError> {
+async fn validate_namespace(
+    pool: &sqlx::PgPool,
+    package_id: &str,
+    namespace: &str,
+) -> Result<(), AppError> {
     let q = qualified_sys_table("_sys_kv_stores");
     let exists: Option<(String,)> = sqlx::query_as(&format!(
         "SELECT id FROM {} WHERE id = $1 AND package_id = $2",
@@ -21,7 +25,12 @@ async fn validate_namespace(pool: &sqlx::PgPool, package_id: &str, namespace: &s
     .bind(package_id)
     .fetch_optional(pool)
     .await?;
-    exists.ok_or_else(|| AppError::NotFound(format!("kv namespace '{}' not found in package '{}'", namespace, package_id)))?;
+    exists.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "kv namespace '{}' not found in package '{}'",
+            namespace, package_id
+        ))
+    })?;
     Ok(())
 }
 
@@ -89,7 +98,9 @@ pub async fn kv_get(
         .bind(&key)
         .fetch_optional(pool)
         .await?;
-    let value = row.ok_or_else(|| AppError::NotFound(format!("kv key not found: {} / {}", namespace, key)))?.0;
+    let value = row
+        .ok_or_else(|| AppError::NotFound(format!("kv key not found: {} / {}", namespace, key)))?
+        .0;
     Ok(success_one_ok(value))
 }
 
@@ -162,7 +173,10 @@ pub async fn kv_delete(
         .execute(pool)
         .await?;
     if result.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!("kv key not found: {} / {}", namespace, key)));
+        return Err(AppError::NotFound(format!(
+            "kv key not found: {} / {}",
+            namespace, key
+        )));
     }
     Ok((axum::http::StatusCode::NO_CONTENT, ()))
 }
