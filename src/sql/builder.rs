@@ -1,6 +1,7 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
 use crate::config::{IncludeDirection, PkType, ResolvedEntity};
+use crate::db::{postgres as pg, TypeCategory};
 use crate::error::AppError;
 use crate::sql::rsql::{FilterNode, RsqlOp, SortSpec};
 use serde_json::Value;
@@ -125,38 +126,9 @@ fn pk_placeholder(entity: &ResolvedEntity, param_num: u32) -> String {
 
 // ─── RSQL → SQL ───────────────────────────────────────────────────────────────
 
-/// Classify a PostgreSQL type string into a broad category for operator validation.
-fn pg_type_category(pg_type: &str) -> &'static str {
-    let base = pg_type
-        .trim_end_matches("[]")
-        .split('(')
-        .next()
-        .unwrap_or(pg_type)
-        .trim()
-        .to_lowercase();
-    match base.as_str() {
-        "text" | "varchar" | "char" | "bpchar" | "citext" | "name" | "character varying"
-        | "character" => "text",
-        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial" | "bigserial"
-        | "smallserial" => "int",
-        "float4" | "float8" | "numeric" | "decimal" | "real" | "money" | "double precision" => {
-            "float"
-        }
-        "bool" | "boolean" => "bool",
-        "uuid" => "uuid",
-        "date" => "date",
-        "timestamp"
-        | "timestamptz"
-        | "timestamp with time zone"
-        | "timestamp without time zone" => "timestamp",
-        "time" | "timetz" | "time with time zone" | "time without time zone" => "time",
-        _ => "other",
-    }
-}
-
-fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
+fn op_valid_for_category(op: &RsqlOp, category: TypeCategory) -> bool {
     match category {
-        "text" => matches!(
+        TypeCategory::Text => matches!(
             op,
             RsqlOp::Eq
                 | RsqlOp::Neq
@@ -169,7 +141,7 @@ fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
                 | RsqlOp::Ends
                 | RsqlOp::Null(_)
         ),
-        "int" | "float" => matches!(
+        TypeCategory::Int | TypeCategory::Float => matches!(
             op,
             RsqlOp::Eq
                 | RsqlOp::Neq
@@ -182,12 +154,12 @@ fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
                 | RsqlOp::Out
                 | RsqlOp::Null(_)
         ),
-        "bool" => matches!(op, RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Null(_)),
-        "uuid" => matches!(
+        TypeCategory::Bool => matches!(op, RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Null(_)),
+        TypeCategory::Uuid => matches!(
             op,
             RsqlOp::Eq | RsqlOp::Neq | RsqlOp::In | RsqlOp::Out | RsqlOp::Null(_)
         ),
-        "date" | "timestamp" | "time" => matches!(
+        TypeCategory::Date | TypeCategory::Timestamp | TypeCategory::Time => matches!(
             op,
             RsqlOp::Eq
                 | RsqlOp::Neq
@@ -200,7 +172,8 @@ fn op_valid_for_category(op: &RsqlOp, category: &str) -> bool {
                 | RsqlOp::Out
                 | RsqlOp::Null(_)
         ),
-        _ => true, // unknown / custom types: allow everything
+        // JSON, bytes, arrays, custom types: allow all operators.
+        TypeCategory::Json | TypeCategory::Bytes | TypeCategory::Other => true,
     }
 }
 
@@ -223,10 +196,10 @@ fn build_leaf_sql(
     q: &mut QueryBuf,
     field_label: &str,
 ) -> Result<String, AppError> {
-    let category = pg_type_category(pg_type.unwrap_or("text"));
+    let category = pg::type_category_from_cast(pg_type.unwrap_or("text"));
     if !op_valid_for_category(op, category) {
         return Err(AppError::Validation(format!(
-            "operator {} is not valid for {} field '{}' (type: {})",
+            "operator {} is not valid for {:?} field '{}' (type: {})",
             op.display(),
             category,
             field_label,

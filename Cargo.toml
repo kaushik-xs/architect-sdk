@@ -3,7 +3,7 @@ members = [".", "example_consumer"]
 
 [package]
 name = "foundry-rs"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Configuration-driven REST backend library for Rust with PostgreSQL — define schemas, tables, and APIs in JSON, get a production-grade REST service."
@@ -21,6 +21,8 @@ name = "architect_sdk"
 path = "src/lib.rs"
 
 [features]
+default = ["postgres"]
+postgres = []
 storage-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 storage-azure = ["dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_identity", "dep:time"]
 storage-gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]

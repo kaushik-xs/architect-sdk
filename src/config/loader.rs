@@ -5,6 +5,7 @@ use crate::config::resolved::{
 };
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
+use crate::db::{parse_canonical, postgres as pg};
 use crate::error::ConfigError;
 use crate::store::qualified_sys_table;
 use sqlx::PgPool;
@@ -72,13 +73,14 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             .iter()
             .map(|c| {
                 let is_pk = pk_names.contains(&c.name);
-                let type_str = match &c.type_ {
-                    ColumnTypeConfig::Simple(s) => s.to_lowercase(),
-                    ColumnTypeConfig::Parameterized { name, .. } => name.to_lowercase(),
-                };
-                let is_asset = type_str == "asset" || type_str == "asset[]";
-                let asset_is_array = type_str == "asset[]";
-                let pg_type = column_pg_type_name(&c.type_);
+                let canonical = parse_canonical(&c.type_);
+                let is_asset = matches!(
+                    canonical,
+                    crate::db::CanonicalType::Asset | crate::db::CanonicalType::AssetArray
+                );
+                let asset_is_array =
+                    matches!(canonical, crate::db::CanonicalType::AssetArray);
+                let pg_type = pg::cast_name(&canonical);
                 ColumnInfo {
                     name: c.name.clone(),
                     pk_type: if is_pk { Some(pk_type.clone()) } else { None },
@@ -241,78 +243,6 @@ fn build_includes_for_table(
     includes
 }
 
-fn column_pg_type_name(ty: &ColumnTypeConfig) -> Option<String> {
-    let name = match ty {
-        ColumnTypeConfig::Simple(s) => s.as_str(),
-        ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
-    };
-    let lower = name.to_lowercase();
-    // Asset pseudo-types must be intercepted BEFORE the generic `ends_with("[]")` guard
-    // below, otherwise "asset[]" would be returned verbatim and PostgreSQL would reject the
-    // cast with "type asset[] does not exist".
-    if lower == "asset[]" {
-        return Some("jsonb".into());
-    }
-    if lower == "asset" {
-        return Some("text".into());
-    }
-
-    // Check array and schema-qualified types first so they are preserved verbatim
-    // (e.g. `uuid[]` must not be shortened to `uuid`, `sample.order_status[]` keeps both).
-    if name.ends_with("[]") {
-        return Some(name.to_string());
-    }
-    if name.contains('.') {
-        // Schema-qualified custom type (e.g. sample.order_status); cast so text binds correctly
-        return Some(name.to_string());
-    }
-    if lower == "timestamptz" || lower == "timestamp with time zone" {
-        Some("timestamptz".into())
-    } else if lower == "timestamp" || lower.starts_with("timestamp ") {
-        Some("timestamp".into())
-    } else if lower == "date" {
-        Some("date".into())
-    } else if lower == "timetz" || lower == "time with time zone" {
-        Some("timetz".into())
-    } else if lower == "time" || lower.starts_with("time ") {
-        Some("time".into())
-    } else if lower == "boolean" || lower == "bool" {
-        Some("boolean".into())
-    } else if lower == "jsonb" {
-        Some("jsonb".into())
-    } else if lower == "json" {
-        Some("json".into())
-    } else if lower.contains("uuid") {
-        Some("uuid".into())
-    } else if lower == "numeric"
-        || lower.starts_with("numeric(")
-        || lower == "decimal"
-        || lower.starts_with("decimal(")
-    {
-        Some("numeric".into())
-    } else if lower == "smallint" || lower == "int2" || lower == "smallserial" || lower == "serial2"
-    {
-        Some("smallint".into())
-    } else if lower == "integer"
-        || lower == "int"
-        || lower == "int4"
-        || lower == "serial"
-        || lower == "serial4"
-    {
-        Some("integer".into())
-    } else if lower == "bigint" || lower == "int8" || lower == "bigserial" || lower == "serial8" {
-        Some("bigint".into())
-    } else if lower == "real" || lower == "float4" {
-        Some("real".into())
-    } else if lower == "double precision" || lower == "float8" {
-        Some("double precision".into())
-    } else if lower == "float" || lower.starts_with("float(") {
-        // Postgres FLOAT(n): n<=24 is real, n>25 is double precision; default to double precision.
-        Some("double precision".into())
-    } else {
-        None
-    }
-}
 
 /// Build the column list for a synthetic audit entity.
 /// Prepends the five audit metadata columns then appends all source columns with pk_type cleared
@@ -385,22 +315,25 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
 }
 
 fn infer_pk_type(col: &ColumnConfig) -> PkType {
-    let type_str = match &col.type_ {
-        ColumnTypeConfig::Simple(s) => s.as_str(),
-        ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
-    };
-    let type_lower = type_str.to_lowercase();
-    if type_lower.contains("uuid") {
-        PkType::Uuid
-    } else if type_lower.contains("bigserial") || type_lower.contains("bigint") {
-        PkType::BigInt
-    } else if type_lower.contains("serial")
-        || type_lower.contains("integer")
-        || type_lower.contains("int")
-    {
-        PkType::Int
-    } else {
-        PkType::Text
+    use crate::db::CanonicalType;
+    match parse_canonical(&col.type_) {
+        CanonicalType::Uuid => PkType::Uuid,
+        CanonicalType::BigInt | CanonicalType::BigSerial => PkType::BigInt,
+        CanonicalType::Int | CanonicalType::Serial | CanonicalType::SmallInt => PkType::Int,
+        // Custom pass-through: fall back to string matching for raw SQL types.
+        CanonicalType::Custom(s) => {
+            let lower = s.to_lowercase();
+            if lower.contains("uuid") {
+                PkType::Uuid
+            } else if lower.contains("bigserial") || lower.contains("bigint") {
+                PkType::BigInt
+            } else if lower.contains("serial") || lower.contains("int") {
+                PkType::Int
+            } else {
+                PkType::Text
+            }
+        }
+        _ => PkType::Text,
     }
 }
 

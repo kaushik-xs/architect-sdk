@@ -3,6 +3,7 @@
 
 use crate::config::types::*;
 use crate::config::{validate, FullConfig};
+use crate::db::{parse_canonical, postgres as pg};
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -110,7 +111,7 @@ pub async fn apply_migrations(
             .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
-            let typ = type_str(&c.type_, &schemas_by_id);
+            let typ = pg::ddl_type(&parse_canonical(&c.type_));
             let mut def = format!("{} {}", quote(&c.name), typ);
             if !c.nullable {
                 def.push_str(" NOT NULL");
@@ -633,7 +634,6 @@ pub fn compute_migration_plan(
         .map(|r| (r.id.as_str(), r))
         .collect();
 
-    let empty: HashMap<&str, &SchemaConfig> = HashMap::new();
     let mut steps: Vec<MigrationStep> = Vec::new();
 
     let schema_name_for = |sid: &str, schemas: &HashMap<&str, &SchemaConfig>| -> String {
@@ -794,7 +794,7 @@ pub fn compute_migration_plan(
             .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
-            let typ = type_str(&c.type_, &empty);
+            let typ = pg::ddl_type(&parse_canonical(&c.type_));
             let mut def = format!("{} {}", quote(&c.name), typ);
             if !c.nullable {
                 def.push_str(" NOT NULL");
@@ -988,8 +988,8 @@ pub fn compute_migration_plan(
             }
 
             // Type change
-            let old_type = type_str(&old_col.type_, &empty);
-            let new_type = type_str(&new_col.type_, &empty);
+            let old_type = pg::ddl_type(&parse_canonical(&old_col.type_));
+            let new_type = pg::ddl_type(&parse_canonical(&new_col.type_));
             if old_type.to_uppercase() != new_type.to_uppercase() {
                 let col_name = &new_col.name;
                 steps.push(MigrationStep {
@@ -1146,7 +1146,7 @@ pub fn compute_migration_plan(
             }
         } else {
             // New column: ADD COLUMN
-            let new_type = type_str(&new_col.type_, &empty);
+            let new_type = pg::ddl_type(&parse_canonical(&new_col.type_));
             let mut col_def = format!("{} {}", quote(&new_col.name), new_type);
             if !new_col.nullable {
                 col_def.push_str(" NOT NULL");
@@ -1583,7 +1583,6 @@ pub async fn execute_migration_plan(
 /// All source columns are replicated as nullable with no constraints, plus five audit metadata
 /// columns prepended: audit_id (PK), audit_action, audit_at, audit_by, changed_fields.
 fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnConfig]) -> String {
-    let empty: HashMap<&str, &SchemaConfig> = HashMap::new();
     let audit_name = format!("{}_audit", table_name);
     let audit_full = format!("{}.{}", quote(schema_name), quote(&audit_name));
 
@@ -1602,7 +1601,7 @@ fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnCo
 
     let config_col_names: HashSet<&str> = source_cols.iter().map(|c| c.name.as_str()).collect();
     for c in source_cols {
-        let typ = type_str(&c.type_, &empty);
+        let typ = pg::ddl_type(&parse_canonical(&c.type_));
         col_defs.push(format!("{} {}", quote(&c.name), typ));
     }
     for (name, typ) in [
@@ -1625,34 +1624,3 @@ fn audit_table_ddl(schema_name: &str, table_name: &str, source_cols: &[&ColumnCo
     )
 }
 
-fn type_str(ty: &ColumnTypeConfig, _schemas_by_id: &HashMap<&str, &SchemaConfig>) -> String {
-    match ty {
-        ColumnTypeConfig::Simple(s) => {
-            if s.eq_ignore_ascii_case("asset[]") {
-                // Asset array columns store JSONB arrays of relative storage paths.
-                "JSONB".to_string()
-            } else if s.eq_ignore_ascii_case("asset") {
-                // Asset columns are stored as plain text (relative storage path).
-                "TEXT".to_string()
-            } else {
-                s.clone()
-            }
-        }
-        ColumnTypeConfig::Parameterized { name, params } => {
-            let p = params
-                .as_ref()
-                .map(|v| {
-                    v.iter()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            if p.is_empty() {
-                name.clone()
-            } else {
-                format!("{}({})", name, p)
-            }
-        }
-    }
-}
