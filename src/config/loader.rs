@@ -128,7 +128,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             path_segment: api.path_segment.clone(),
             pk_columns: pk_names.clone(),
             pk_type: pk_type.clone(),
-            columns: columns,
+            columns,
             operations: api.operations.clone(),
             sensitive_columns,
             includes,
