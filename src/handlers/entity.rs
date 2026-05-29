@@ -124,7 +124,7 @@ async fn enrich_with_parent_ref<'a>(
     let db_rows: Vec<(String, String)> = {
         let mut qry = sqlx::query_as::<_, (String, String)>(&select_sql);
         for id in &parent_ids {
-            qry = qry.bind(id.to_string());
+            qry = qry.bind(*id);
         }
         match executor.executor {
             crate::service::TenantExecutorInner::Pool(pool) => qry.fetch_all(pool).await?,
