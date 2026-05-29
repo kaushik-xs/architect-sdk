@@ -176,7 +176,10 @@ async fn resolve_and_update_parent_refs<'a>(
         .columns
         .iter()
         .find(|c| c.name == pk)
-        .map(|c| c.pg_type.as_deref() == Some("uuid") || matches!(c.pk_type, Some(crate::config::PkType::Uuid)))
+        .map(|c| {
+            c.pg_type.as_deref() == Some("uuid")
+                || matches!(c.pk_type, Some(crate::config::PkType::Uuid))
+        })
         .unwrap_or(true); // default: treat as uuid (all standard tables use uuid PKs)
 
     // Issue UPDATE parent_id for each row that had a parentRef, and patch in-memory row.
@@ -196,7 +199,9 @@ async fn resolve_and_update_parent_refs<'a>(
             .and_then(|o| o.get(&pk))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let Some(row_uuid_str) = row_uuid_str else { continue };
+        let Some(row_uuid_str) = row_uuid_str else {
+            continue;
+        };
 
         if pk_is_uuid {
             let parent_uuid = uuid::Uuid::parse_str(parent_uuid_str)
@@ -239,7 +244,10 @@ async fn resolve_and_update_parent_refs<'a>(
         }
 
         if let Some(obj) = rows[i].as_object_mut() {
-            obj.insert("parent_id".to_string(), Value::String(parent_uuid_str.clone()));
+            obj.insert(
+                "parent_id".to_string(),
+                Value::String(parent_uuid_str.clone()),
+            );
         }
     }
     Ok(())
