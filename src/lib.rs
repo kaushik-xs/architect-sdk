@@ -15,6 +15,7 @@
 //! See the [repository](https://github.com/kaushik-xs/architect-sdk) for full examples.
 
 pub mod authrs;
+pub mod db;
 pub mod case;
 pub mod config;
 pub mod error;
