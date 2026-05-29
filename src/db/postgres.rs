@@ -68,8 +68,10 @@ pub fn cast_name(t: &CanonicalType) -> Option<String> {
         CanonicalType::Boolean => "boolean",
         CanonicalType::Bytes => "bytea",
         // Arrays: cast to the element type followed by [].
+        // Fall back to the DDL type name for inner types that need no scalar cast (e.g. text, int).
         CanonicalType::Array(inner) => {
-            return cast_name(inner).map(|c| format!("{}[]", c));
+            let inner_cast = cast_name(inner).unwrap_or_else(|| ddl_type(inner).to_lowercase());
+            return Some(format!("{}[]", inner_cast));
         }
         // Schema-qualified custom types (enums like schema.my_enum) cast directly to the type name.
         CanonicalType::Custom(s) if s.contains('.') => {
