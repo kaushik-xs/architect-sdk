@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-29
+
+### Fixed
+- Resolve all clippy warnings (`redundant_field_names`, `collapsible_match`, `map_entry`, `too_many_arguments`, `type_complexity`, `useless_conversion`, `explicit_auto_deref`, `cloned_ref_to_slice_refs`)
+
 ## [0.1.1] - 2026-05-29
 
 ### Changed
