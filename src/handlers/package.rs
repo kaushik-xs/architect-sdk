@@ -171,6 +171,7 @@ fn read_kind_from_zip<R: std::io::Read + std::io::Seek>(
 
 /// Apply DDL for one target pool — either the full `apply_migrations` (fresh install) or
 /// `execute_migration_plan` (upgrade). Returns a single `TenantMigrationOutcome`.
+#[allow(clippy::too_many_arguments)]
 async fn apply_ddl_to_pool(
     migration_pool: &PgPool,
     config_pool: &PgPool,

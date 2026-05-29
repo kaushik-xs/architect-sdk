@@ -22,6 +22,7 @@ pub struct CrudService;
 impl CrudService {
     /// List rows with optional RSQL filter and sort, limit (default 100, max 1000), offset (default 0).
     /// `filter_includes` supplies related-entity metadata for dotted-field EXISTS filters; pass `&[]` when unused.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -49,6 +50,7 @@ impl CrudService {
 
     /// List rows with includes in a single query (scalar subqueries with json_agg/row_to_json). Returns rows with include keys already set (JSON).
     /// `includes` drives scalar subqueries for response data; `filter_includes` is the superset used for EXISTS generation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_with_includes<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -84,7 +86,7 @@ impl CrudService {
         schema_override: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = select_by_id(entity, schema_override);
-        Self::query_one_exec(executor, &q.sql, &[id.clone()]).await
+        Self::query_one_exec(executor, &q.sql, std::slice::from_ref(id)).await
     }
 
     /// Fetch rows from entity where column IN (values). Used for batch-loading related rows.
@@ -152,7 +154,7 @@ impl CrudService {
     ) -> Result<Option<Value>, AppError> {
         let pre_row = if entity.audit_log {
             let q = select_by_id(entity, schema_override);
-            Self::query_one_exec(executor, &q.sql, &[id.clone()]).await?
+            Self::query_one_exec(executor, &q.sql, std::slice::from_ref(id)).await?
         } else {
             None
         };
@@ -185,8 +187,12 @@ impl CrudService {
         caller_user_id: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = delete(entity, schema_override);
-        let result =
-            Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await?;
+        let result = Self::execute_returning_one_with_params_exec(
+            executor,
+            &q.sql,
+            std::slice::from_ref(id),
+        )
+        .await?;
         if entity.audit_log {
             if let Some(ref deleted_row) = result {
                 Self::insert_audit(
@@ -214,7 +220,8 @@ impl CrudService {
         schema_override: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = archive(entity, archive_field, schema_override);
-        Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
+        Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
+            .await
     }
 
     /// Unarchive one row by id: clears archive_field (sets to NULL) if it is currently NOT NULL.
@@ -227,7 +234,8 @@ impl CrudService {
         schema_override: Option<&str>,
     ) -> Result<Option<Value>, AppError> {
         let q = unarchive(entity, archive_field, schema_override);
-        Self::execute_returning_one_with_params_exec(executor, &q.sql, &[id.clone()]).await
+        Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
+            .await
     }
 
     /// Bulk create in a transaction (when using pool) or on the same connection (when using conn). Returns vec of created rows.
@@ -280,7 +288,7 @@ impl CrudService {
                         rls_tenant_id,
                         caller_user_id,
                     );
-                    let row = Self::execute_returning_one_conn(&mut **conn, &q)
+                    let row = Self::execute_returning_one_conn(conn, &q)
                         .await?
                         .unwrap_or(Value::Null);
                     out.push(row);
@@ -364,7 +372,7 @@ impl CrudService {
                         rls_tenant_id,
                         caller_user_id,
                     );
-                    match Self::execute_returning_one_conn(&mut **conn, &q).await {
+                    match Self::execute_returning_one_conn(conn, &q).await {
                         Ok(row) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut **conn)
@@ -441,7 +449,7 @@ impl CrudService {
                         schema_override,
                         caller_user_id,
                     );
-                    if let Some(row) = Self::execute_returning_one_conn(&mut **conn, &q).await? {
+                    if let Some(row) = Self::execute_returning_one_conn(conn, &q).await? {
                         out.push(row);
                     }
                 }
@@ -550,7 +558,7 @@ impl CrudService {
                         schema_override,
                         caller_user_id,
                     );
-                    match Self::execute_returning_one_conn(&mut **conn, &q).await {
+                    match Self::execute_returning_one_conn(conn, &q).await {
                         Ok(Some(row)) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut **conn)
@@ -799,94 +807,64 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
 
 fn cell_to_value(row: &sqlx::postgres::PgRow, name: &str) -> Value {
     use sqlx::Row;
-    if let Ok(v) = row.try_get::<Option<i16>, _>(name) {
-        if let Some(n) = v {
-            return Value::Number(n.into());
+    if let Ok(Some(n)) = row.try_get::<Option<i16>, _>(name) {
+        return Value::Number(n.into());
+    }
+    if let Ok(Some(n)) = row.try_get::<Option<i32>, _>(name) {
+        return Value::Number(n.into());
+    }
+    if let Ok(Some(n)) = row.try_get::<Option<i64>, _>(name) {
+        return Value::Number(n.into());
+    }
+    if let Ok(Some(n)) = row.try_get::<Option<f32>, _>(name) {
+        if let Some(n) = serde_json::Number::from_f64(n as f64) {
+            return Value::Number(n);
         }
     }
-    if let Ok(v) = row.try_get::<Option<i32>, _>(name) {
-        if let Some(n) = v {
-            return Value::Number(n.into());
+    if let Ok(Some(n)) = row.try_get::<Option<f64>, _>(name) {
+        if let Some(n) = serde_json::Number::from_f64(n) {
+            return Value::Number(n);
         }
     }
-    if let Ok(v) = row.try_get::<Option<i64>, _>(name) {
-        if let Some(n) = v {
-            return Value::Number(n.into());
-        }
+    if let Ok(Some(b)) = row.try_get::<Option<bool>, _>(name) {
+        return Value::Bool(b);
     }
-    if let Ok(v) = row.try_get::<Option<f32>, _>(name) {
-        if let Some(n) = v {
-            if let Some(n) = serde_json::Number::from_f64(n as f64) {
-                return Value::Number(n);
+    if let Ok(Some(vec)) = row.try_get::<Option<Vec<String>>, _>(name) {
+        return Value::Array(vec.into_iter().map(Value::String).collect());
+    }
+    if let Ok(Some(vec)) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(name) {
+        return Value::Array(
+            vec.into_iter()
+                .map(|u| Value::String(u.to_string()))
+                .collect(),
+        );
+    }
+    if let Ok(Some(vec)) = row.try_get::<Option<Vec<i64>>, _>(name) {
+        return Value::Array(vec.into_iter().map(|n| Value::Number(n.into())).collect());
+    }
+    if let Ok(Some(u)) = row.try_get::<Option<uuid::Uuid>, _>(name) {
+        return Value::String(u.to_string());
+    }
+    if let Ok(Some(d)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(name) {
+        return Value::String(d.to_rfc3339());
+    }
+    if let Ok(Some(d)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(name) {
+        return Value::String(d.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
+    }
+    if let Ok(Some(d)) = row.try_get::<Option<chrono::NaiveDate>, _>(name) {
+        return Value::String(d.format("%Y-%m-%d").to_string());
+    }
+    if let Ok(Some(s)) = row.try_get::<Option<String>, _>(name) {
+        // Numeric columns are selected as ::text; parse so we return a JSON number not string
+        if let Ok(n) = s.trim().parse::<f64>() {
+            if let Some(num) = serde_json::Number::from_f64(n) {
+                return Value::Number(num);
             }
         }
+        return Value::String(s);
     }
-    if let Ok(v) = row.try_get::<Option<f64>, _>(name) {
-        if let Some(n) = v {
-            if let Some(n) = serde_json::Number::from_f64(n) {
-                return Value::Number(n);
-            }
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<bool>, _>(name) {
-        if let Some(b) = v {
-            return Value::Bool(b);
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<String>>, _>(name) {
-        if let Some(vec) = v {
-            return Value::Array(vec.into_iter().map(Value::String).collect());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<uuid::Uuid>>, _>(name) {
-        if let Some(vec) = v {
-            return Value::Array(
-                vec.into_iter()
-                    .map(|u| Value::String(u.to_string()))
-                    .collect(),
-            );
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<i64>>, _>(name) {
-        if let Some(vec) = v {
-            return Value::Array(vec.into_iter().map(|n| Value::Number(n.into())).collect());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<uuid::Uuid>, _>(name) {
-        if let Some(u) = v {
-            return Value::String(u.to_string());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(name) {
-        if let Some(d) = v {
-            return Value::String(d.to_rfc3339());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(name) {
-        if let Some(d) = v {
-            return Value::String(d.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(name) {
-        if let Some(d) = v {
-            return Value::String(d.format("%Y-%m-%d").to_string());
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<String>, _>(name) {
-        if let Some(s) = v {
-            // Numeric columns are selected as ::text; parse so we return a JSON number not string
-            if let Ok(n) = s.trim().parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(n) {
-                    return Value::Number(num);
-                }
-            }
-            return Value::String(s);
-        }
-    }
-    if let Ok(v) = row.try_get::<Option<serde_json::Value>, _>(name) {
-        if let Some(j) = v {
-            return j;
-        }
+    if let Ok(Some(j)) = row.try_get::<Option<serde_json::Value>, _>(name) {
+        return j;
     }
     Value::Null
 }

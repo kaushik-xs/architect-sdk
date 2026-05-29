@@ -61,8 +61,7 @@ fn column_schema_from_pg_type(pg_type: Option<&str>) -> Schema {
         return Schema::Array(
             utoipa::openapi::schema::ArrayBuilder::new()
                 .items(RefOr::T(item_schema))
-                .build()
-                .into(),
+                .build(),
         );
     }
     if t.contains("int") || t.contains("serial") {
@@ -443,8 +442,7 @@ fn bulk_create_operation(
             Content::new(Some(RefOr::T(Schema::Array(
                 utoipa::openapi::schema::ArrayBuilder::new()
                     .items(RefOr::T(item_schema))
-                    .build()
-                    .into(),
+                    .build(),
             )))),
         )
         .required(Some(Required::True))
@@ -486,8 +484,7 @@ fn bulk_update_operation(
             Content::new(Some(RefOr::T(Schema::Array(
                 utoipa::openapi::schema::ArrayBuilder::new()
                     .items(RefOr::T(item_schema))
-                    .build()
-                    .into(),
+                    .build(),
             )))),
         )
         .required(Some(Required::True))

@@ -279,6 +279,7 @@ pub struct MigrationPlanRow {
 }
 
 /// Persist a migration plan (zip bytes + serialized steps) for later confirmation.
+#[allow(clippy::too_many_arguments)]
 pub async fn save_migration_plan(
     pool: &PgPool,
     id: &str,
@@ -313,6 +314,7 @@ pub async fn get_migration_plan(
     id: &str,
 ) -> Result<Option<MigrationPlanRow>, AppError> {
     let q = qualified_sys_table("_sys_migration_plans");
+    #[allow(clippy::type_complexity)]
     let row: Option<(String, String, String, Option<String>, String, serde_json::Value, Vec<u8>, String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)> =
         sqlx::query_as(&format!(
             "SELECT id, package_id, tenant_id, from_version, to_version, plan_json, zip_bytes, status, created_at, expires_at, applied_at FROM {} WHERE id = $1",
@@ -532,6 +534,7 @@ pub struct PackageRow {
 /// List all rows from _sys_packages ordered by id.
 pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(
         String,
         serde_json::Value,
@@ -562,6 +565,7 @@ pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
 /// Fetch a single package row by id, or None if not installed.
 pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
+    #[allow(clippy::type_complexity)]
     let row: Option<(
         String,
         serde_json::Value,

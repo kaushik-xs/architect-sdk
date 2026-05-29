@@ -894,11 +894,11 @@ async fn attach_includes<'a>(
                         .cloned()
                         .map(|v| serde_json::to_string(&v).unwrap_or_default())
                         .unwrap_or_default();
-                    if !key_to_row.contains_key(&k) {
+                    key_to_row.entry(k).or_insert_with(|| {
                         strip_sensitive_columns(&mut r, &related.sensitive_columns);
                         value_keys_to_camel_case(&mut r);
-                        key_to_row.insert(k, r);
-                    }
+                        r
+                    });
                 }
                 for row in rows.iter_mut() {
                     if let Value::Object(ref mut map) = row {
@@ -1469,10 +1469,7 @@ pub async fn update(
     let needs_pre_read = (entity_has_assets && state.storage.is_some())
         || (state.event_client.is_some()
             && entity.events.iter().any(|e| {
-                e.on == "update"
-                    && e.condition
-                        .as_ref()
-                        .map_or(false, |c| c.changed_to.is_some())
+                e.on == "update" && e.condition.as_ref().is_some_and(|c| c.changed_to.is_some())
             }));
     let pre_update_row = if needs_pre_read {
         CrudService::read(&mut executor, &entity, &id, schema_override).await?

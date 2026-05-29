@@ -517,6 +517,7 @@ pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> Q
 /// SELECT list with includes in a single query: main table aliased as "main", each include as a scalar subquery (json_agg for to_many, row_to_json for to_one).
 /// `includes` drives the scalar subqueries (response data); `filter_includes` is the superset used
 /// for EXISTS generation when the filter references dotted fields like `transport_unit.bay`.
+#[allow(clippy::too_many_arguments)]
 pub fn select_list_with_includes(
     entity: &ResolvedEntity,
     filter: Option<&FilterNode>,

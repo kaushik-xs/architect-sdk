@@ -78,15 +78,11 @@ impl<'de> Deserialize<'de> for ColumnDefaultConfig {
         match v {
             serde_json::Value::String(s) => Ok(ColumnDefaultConfig::Literal(s)),
             serde_json::Value::Object(mut obj) => {
-                if let Some(expr) = obj.remove("expression") {
-                    if let serde_json::Value::String(s) = expr {
-                        return Ok(ColumnDefaultConfig::Expression { expression: s });
-                    }
+                if let Some(serde_json::Value::String(s)) = obj.remove("expression") {
+                    return Ok(ColumnDefaultConfig::Expression { expression: s });
                 }
-                if let Some(lit) = obj.remove("value").or_else(|| obj.remove("literal")) {
-                    if let serde_json::Value::String(s) = lit {
-                        return Ok(ColumnDefaultConfig::Literal(s));
-                    }
+                if let Some(serde_json::Value::String(s)) = obj.remove("value").or_else(|| obj.remove("literal")) {
+                    return Ok(ColumnDefaultConfig::Literal(s));
                 }
                 Err(serde::de::Error::custom(format!(
                     "column default must be a string, {{ \"expression\": \"...\" }}, or {{ \"value\": \"...\" }}; got object with keys: {:?}",

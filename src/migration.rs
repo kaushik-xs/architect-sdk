@@ -866,9 +866,8 @@ pub fn compute_migration_plan(
                 object: format!("{}_audit", new_table.name),
                 object_type: "table".into(),
                 description: format!(
-                    "Create audit table \"{}\".\"{}\"",
-                    schema,
-                    format!("{}_audit", new_table.name)
+                    "Create audit table \"{}\".\"{}_audit\"",
+                    schema, new_table.name
                 ),
                 ddl: Some(audit_ddl),
                 safety: MigrationSafety::Safe,
@@ -900,9 +899,8 @@ pub fn compute_migration_plan(
                     object: format!("{}_audit", new_table.name),
                     object_type: "table".into(),
                     description: format!(
-                        "Enable audit log: create \"{}\".\"{}\"",
-                        schema,
-                        format!("{}_audit", new_table.name)
+                        "Enable audit log: create \"{}\".\"{}_audit\"",
+                        schema, new_table.name
                     ),
                     ddl: Some(audit_ddl),
                     safety: MigrationSafety::Safe,
@@ -1433,6 +1431,7 @@ pub fn compute_migration_plan(
 /// Execute a pre-computed `MigrationPlan` against the tenant database.
 /// Writes per-step audit records to the config (architect) database.
 /// Returns counts and any warning messages collected from best-effort failures.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_migration_plan(
     migration_pool: &PgPool,
     config_pool: &PgPool,
