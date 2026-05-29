@@ -813,6 +813,7 @@ pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> 
     #[cfg(feature = "postgres")]
     {
         use std::str::FromStr;
+        use sqlx::ConnectOptions as _;
         let (admin_url, db_name) = parse_db_name_from_url(database_url)?;
         if db_name.is_empty() || db_name == "postgres" {
             return Ok(());
