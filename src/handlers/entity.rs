@@ -145,8 +145,9 @@ async fn resolve_and_update_parent_refs<'a>(
         .collect();
 
     if !missing.is_empty() {
+        // Cast pk to text in the SELECT so sqlx can decode it as String regardless of column type.
         let select_sql = format!(
-            "SELECT {pk_q}, {ref_q} FROM {table} WHERE {ref_q} = ANY($1)",
+            "SELECT {pk_q}::text, {ref_q} FROM {table} WHERE {ref_q} = ANY($1)",
             pk_q = q(&pk),
             ref_q = q(ref_col),
             table = table_q,
@@ -170,6 +171,14 @@ async fn resolve_and_update_parent_refs<'a>(
         }
     }
 
+    // Determine whether parent_id and the PK are uuid columns from the entity's column metadata.
+    let pk_is_uuid = entity
+        .columns
+        .iter()
+        .find(|c| c.name == pk)
+        .map(|c| c.pg_type.as_deref() == Some("uuid") || matches!(c.pk_type, Some(crate::config::PkType::Uuid)))
+        .unwrap_or(true); // default: treat as uuid (all standard tables use uuid PKs)
+
     // Issue UPDATE parent_id for each row that had a parentRef, and patch in-memory row.
     let update_sql = format!(
         "UPDATE {table} SET {pid} = $1 WHERE {pk_q} = $2",
@@ -179,35 +188,58 @@ async fn resolve_and_update_parent_refs<'a>(
     );
     for (i, opt_ref) in parent_refs.iter().enumerate() {
         let Some(ref_val) = opt_ref else { continue };
-        let Some(parent_uuid) = ref_to_uuid.get(ref_val) else {
+        let Some(parent_uuid_str) = ref_to_uuid.get(ref_val) else {
             continue; // unresolvable ref — leave parent_id NULL
         };
-        let row_uuid = rows[i]
+        let row_uuid_str = rows[i]
             .as_object()
             .and_then(|o| o.get(&pk))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let Some(row_uuid) = row_uuid else { continue };
+        let Some(row_uuid_str) = row_uuid_str else { continue };
 
-        match executor {
-            crate::service::TenantExecutor::Pool(pool) => {
-                sqlx::query(&update_sql)
-                    .bind(parent_uuid)
-                    .bind(&row_uuid)
-                    .execute(*pool)
-                    .await?;
+        if pk_is_uuid {
+            let parent_uuid = uuid::Uuid::parse_str(parent_uuid_str)
+                .map_err(|_| AppError::BadRequest(format!("invalid uuid: {}", parent_uuid_str)))?;
+            let row_uuid = uuid::Uuid::parse_str(&row_uuid_str)
+                .map_err(|_| AppError::BadRequest(format!("invalid uuid: {}", row_uuid_str)))?;
+            match executor {
+                crate::service::TenantExecutor::Pool(pool) => {
+                    sqlx::query(&update_sql)
+                        .bind(parent_uuid)
+                        .bind(row_uuid)
+                        .execute(*pool)
+                        .await?;
+                }
+                crate::service::TenantExecutor::Conn(conn) => {
+                    sqlx::query(&update_sql)
+                        .bind(parent_uuid)
+                        .bind(row_uuid)
+                        .execute(&mut **conn)
+                        .await?;
+                }
             }
-            crate::service::TenantExecutor::Conn(conn) => {
-                sqlx::query(&update_sql)
-                    .bind(parent_uuid)
-                    .bind(&row_uuid)
-                    .execute(&mut **conn)
-                    .await?;
+        } else {
+            match executor {
+                crate::service::TenantExecutor::Pool(pool) => {
+                    sqlx::query(&update_sql)
+                        .bind(parent_uuid_str)
+                        .bind(&row_uuid_str)
+                        .execute(*pool)
+                        .await?;
+                }
+                crate::service::TenantExecutor::Conn(conn) => {
+                    sqlx::query(&update_sql)
+                        .bind(parent_uuid_str)
+                        .bind(&row_uuid_str)
+                        .execute(&mut **conn)
+                        .await?;
+                }
             }
         }
 
         if let Some(obj) = rows[i].as_object_mut() {
-            obj.insert("parent_id".to_string(), Value::String(parent_uuid.clone()));
+            obj.insert("parent_id".to_string(), Value::String(parent_uuid_str.clone()));
         }
     }
     Ok(())
