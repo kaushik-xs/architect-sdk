@@ -115,7 +115,7 @@ async fn enrich_with_parent_ref<'a>(
     let d = executor.dialect;
     let phs: Vec<String> = (1..=parent_ids.len()).map(|i| d.placeholder(i)).collect();
     let select_sql = format!(
-        "SELECT {pk_q}, {ref_q} FROM {table} WHERE {pk_q} IN ({placeholders})",
+        "SELECT {pk_q}::text, {ref_q} FROM {table} WHERE {pk_q} IN ({placeholders})",
         pk_q = d.quote_ident(pk),
         ref_q = d.quote_ident(ref_col),
         table = table_q,
