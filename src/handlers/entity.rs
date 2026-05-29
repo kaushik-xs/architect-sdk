@@ -81,6 +81,79 @@ fn db_errors_to_bulk_field_errors(row_errors: Vec<(usize, AppError)>) -> Vec<Bul
         .collect()
 }
 
+/// For entities with `parent_ref_column` set, resolves each row's `parent_id` UUID to the
+/// natural-key value and injects it as `parent_ref` (snake_case, converted to camelCase later).
+/// Rows with no `parent_id` are skipped. One batch SELECT covers all distinct parent UUIDs.
+async fn enrich_with_parent_ref<'a>(
+    executor: &mut crate::service::TenantExecutor<'a>,
+    rows: &mut [Value],
+    entity: &ResolvedEntity,
+    ref_col: &str,
+    schema_override: Option<&str>,
+) -> Result<(), AppError> {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let schema = schema_override.unwrap_or(&entity.schema_name);
+    let table_q = format!("{}.{}", q(schema), q(&entity.table_name));
+    let pk = &entity.pk_columns[0];
+
+    // Collect distinct parent UUIDs present in the result set.
+    let parent_ids: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter_map(|row| {
+            row.as_object()
+                .and_then(|o| o.get("parent_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    if parent_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Fetch id → natural_key for all parent rows in one query.
+    let select_sql = format!(
+        "SELECT {pk_q}::text, {ref_q} FROM {table} WHERE {pk_q} = ANY($1)",
+        pk_q = q(pk),
+        ref_q = q(ref_col),
+        table = table_q,
+    );
+    let db_rows: Vec<(String, String)> = match executor {
+        crate::service::TenantExecutor::Pool(pool) => {
+            sqlx::query_as::<_, (String, String)>(&select_sql)
+                .bind(&parent_ids)
+                .fetch_all(*pool)
+                .await?
+        }
+        crate::service::TenantExecutor::Conn(conn) => {
+            sqlx::query_as::<_, (String, String)>(&select_sql)
+                .bind(&parent_ids)
+                .fetch_all(&mut **conn)
+                .await?
+        }
+    };
+    let uuid_to_ref: HashMap<String, String> = db_rows.into_iter().collect();
+
+    // Inject parent_ref into each row.
+    for row in rows.iter_mut() {
+        let parent_id_str = row
+            .as_object()
+            .and_then(|o| o.get("parent_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(pid) = parent_id_str {
+            if let Some(ref_val) = uuid_to_ref.get(&pid) {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("parent_ref".to_string(), Value::String(ref_val.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Strips `parent_ref` from each item (mutating in place) and returns a parallel vec of the
 /// extracted natural-key strings. Indices with no `parent_ref` get `None`.
 fn extract_parent_refs(items: &mut [HashMap<String, Value>]) -> Vec<Option<String>> {
@@ -1320,6 +1393,9 @@ pub async fn list(
         post_process_include_columns(&mut rows, &resolved_data);
         rows
     };
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        enrich_with_parent_ref(&mut executor, &mut rows, &entity, ref_col, schema_override).await?;
+    }
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
@@ -1528,6 +1604,11 @@ pub async fn read(
         )
         .await?;
         row = rows[0].clone();
+    }
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        let mut rows = [row];
+        enrich_with_parent_ref(&mut executor, &mut rows, &entity, ref_col, schema_override).await?;
+        row = rows.into_iter().next().unwrap();
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -2187,6 +2268,9 @@ pub async fn list_package(
         post_process_include_columns(&mut rows, &resolved_data);
         rows
     };
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        enrich_with_parent_ref(&mut executor, &mut rows, &entity, ref_col, schema_override).await?;
+    }
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
         value_keys_to_camel_case(row);
@@ -2393,6 +2477,11 @@ pub async fn read_package(
         )
         .await?;
         row = rows[0].clone();
+    }
+    if let Some(ref ref_col) = entity.parent_ref_column.clone() {
+        let mut rows = [row];
+        enrich_with_parent_ref(&mut executor, &mut rows, &entity, ref_col, schema_override).await?;
+        row = rows.into_iter().next().unwrap();
     }
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
