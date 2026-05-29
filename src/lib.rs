@@ -1,4 +1,18 @@
-//! Architect SDK: configuration-driven REST backend library.
+//! `foundry-rs` — configuration-driven REST backend library for Rust with PostgreSQL.
+//!
+//! Define your schemas, tables, columns, and API entities in JSON. Get a fully working,
+//! production-grade REST API with multi-tenancy, validation, and OpenAPI docs — no
+//! entity-specific business logic required.
+//!
+//! # Quick Start
+//!
+//! Add to your `Cargo.toml`:
+//! ```toml
+//! [dependencies]
+//! foundry-rs = "0.1"
+//! ```
+//!
+//! See the [repository](https://github.com/kaushik-xs/architect-sdk) for full examples.
 
 pub mod authrs;
 pub mod case;

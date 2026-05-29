@@ -2,12 +2,19 @@
 members = [".", "example_consumer"]
 
 [package]
-name = "architect-sdk"
+name = "foundry-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Configuration-driven REST backend with PostgreSQL"
-publish = false  # private package; use path or git dependency
+rust-version = "1.75"
+description = "Configuration-driven REST backend library for Rust with PostgreSQL — define schemas, tables, and APIs in JSON, get a production-grade REST service."
+license = "MIT"
+authors = ["Kaushik Sundar <tech@rg2k.com>"]
 repository = "https://github.com/kaushik-xs/architect-sdk"
+homepage = "https://github.com/kaushik-xs/architect-sdk"
+documentation = "https://docs.rs/foundry-rs"
+readme = "README.md"
+keywords = ["rest", "api", "postgres", "backend", "configuration"]
+categories = ["web-programming", "database", "web-programming::http-server"]
 
 [lib]
 name = "architect_sdk"
