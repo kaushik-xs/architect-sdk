@@ -2,6 +2,8 @@
 //! Config is stored in the architect DB (DATABASE_URL). Schemas/tables are created in ALL registered tenant databases (broadcast). Bootstrap endpoint handles new Database-strategy tenants added after install.
 
 use crate::config::{load_from_pool, resolve, FullConfig};
+use crate::db::pool::Pool;
+use crate::db::{parse_canonical, CanonicalType, Dialect};
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::{reload_model, replace_config};
@@ -21,11 +23,42 @@ use axum::extract::{Multipart, Path, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use std::collections::HashSet;
 use std::io::Cursor;
 use uuid::Uuid;
 use zip::ZipArchive;
+
+/// Return an error if the config contains `asset` or `asset[]` columns and no storage provider
+/// is configured. Called during package install and column config ingestion so the problem is
+/// caught before any DDL or `_sys_*` writes occur.
+pub(crate) fn reject_asset_columns_without_storage(
+    config: &FullConfig,
+    storage: &Option<std::sync::Arc<dyn crate::storage::StorageProvider>>,
+) -> Result<(), AppError> {
+    if storage.is_some() {
+        return Ok(());
+    }
+    let asset_cols: Vec<String> = config
+        .columns
+        .iter()
+        .filter(|c| {
+            matches!(
+                parse_canonical(&c.type_),
+                CanonicalType::Asset | CanonicalType::AssetArray
+            )
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    if !asset_cols.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Package defines asset column(s) [{}] but no storage provider is configured. \
+             Set STORAGE_PROVIDER (s3 | azure | gcs | rustfs) before installing packages \
+             that use asset or asset[] columns.",
+            asset_cols.join(", ")
+        )));
+    }
+    Ok(())
+}
 
 /// Per-tenant DDL execution result, included in the install/upgrade response.
 #[derive(serde::Serialize)]
@@ -173,8 +206,8 @@ fn read_kind_from_zip<R: std::io::Read + std::io::Seek>(
 /// `execute_migration_plan` (upgrade). Returns a single `TenantMigrationOutcome`.
 #[allow(clippy::too_many_arguments)]
 async fn apply_ddl_to_pool(
-    migration_pool: &PgPool,
-    config_pool: &PgPool,
+    migration_pool: &Pool,
+    config_pool: &Pool,
     config: &FullConfig,
     plan: Option<&MigrationPlan>,
     package_id: &str,
@@ -183,6 +216,7 @@ async fn apply_ddl_to_pool(
     from_version: Option<&str>,
     to_version: &str,
     rls_tenant_column: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> TenantMigrationOutcome {
     match plan {
         // Upgrade path: execute the pre-computed diff plan.
@@ -224,25 +258,27 @@ async fn apply_ddl_to_pool(
             }
         }
         // Fresh install path: apply the full schema.
-        None => match apply_migrations(migration_pool, config, None, rls_tenant_column).await {
-            Ok(()) => TenantMigrationOutcome {
-                target: target.to_string(),
-                strategy: strategy.to_string(),
-                status: "applied".to_string(),
-                warnings: vec![],
-                error: None,
-            },
-            Err(e) => {
-                tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (fresh install)");
-                TenantMigrationOutcome {
+        None => {
+            match apply_migrations(migration_pool, config, None, rls_tenant_column, dialect).await {
+                Ok(()) => TenantMigrationOutcome {
                     target: target.to_string(),
                     strategy: strategy.to_string(),
-                    status: "failed".to_string(),
+                    status: "applied".to_string(),
                     warnings: vec![],
-                    error: Some(e.to_string()),
+                    error: None,
+                },
+                Err(e) => {
+                    tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (fresh install)");
+                    TenantMigrationOutcome {
+                        target: target.to_string(),
+                        strategy: strategy.to_string(),
+                        status: "failed".to_string(),
+                        warnings: vec![],
+                        error: Some(e.to_string()),
+                    }
                 }
             }
-        },
+        }
     }
 }
 
@@ -257,7 +293,7 @@ async fn apply_ddl_to_pool(
 /// the `_sys_*` config has already been committed and must not be rolled back here.
 async fn broadcast_ddl(
     state: &AppState,
-    config_pool: &PgPool,
+    config_pool: &Pool,
     config: &FullConfig,
     old_config: Option<&FullConfig>,
     package_id: &str,
@@ -270,19 +306,21 @@ async fn broadcast_ddl(
     // `_rls_tenant_column` is intentionally ignored by compute_migration_plan, so
     // the same plan is valid for both RLS and Database targets.
     let plan: Option<MigrationPlan> = match old_config {
-        Some(old) => match compute_migration_plan(old, config, None, None) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::error!(error = %e, "could not compute migration plan for broadcast");
-                return vec![TenantMigrationOutcome {
-                    target: "all".to_string(),
-                    strategy: "n/a".to_string(),
-                    status: "failed".to_string(),
-                    warnings: vec![],
-                    error: Some(format!("migration plan error: {}", e)),
-                }];
+        Some(old) => {
+            match compute_migration_plan(old, config, None, None, state.dialect.as_ref()) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not compute migration plan for broadcast");
+                    return vec![TenantMigrationOutcome {
+                        target: "all".to_string(),
+                        strategy: "n/a".to_string(),
+                        status: "failed".to_string(),
+                        warnings: vec![],
+                        error: Some(format!("migration plan error: {}", e)),
+                    }];
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -299,6 +337,7 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
+            state.dialect.as_ref(),
         )
         .await;
         outcomes.push(outcome);
@@ -336,6 +375,7 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
+            state.dialect.as_ref(),
         )
         .await;
         outcomes.push(outcome);
@@ -368,6 +408,7 @@ async fn broadcast_ddl(
             from_version,
             to_version,
             None,
+            state.dialect.as_ref(),
         )
         .await;
         outcomes.push(outcome);
@@ -506,7 +547,7 @@ pub async fn install_package(
             }
             body
         };
-        replace_config(config_pool, kind, body, false, id).await?;
+        replace_config(config_pool, kind, body, false, id, None).await?;
         applied.push((*kind).to_string());
     }
 
@@ -515,6 +556,9 @@ pub async fn install_package(
     let config = load_from_pool(config_pool, id)
         .await
         .map_err(AppError::Config)?;
+
+    // Reject the install if the package contains asset columns but no storage is configured.
+    reject_asset_columns_without_storage(&config, &state.storage)?;
 
     // Broadcast DDL to every registered tenant database.
     // For a fresh install old_config is None (apply_migrations). For an upgrade it is Some (compute_migration_plan + execute).
@@ -646,7 +690,7 @@ pub async fn uninstall_package(
 
 /// Build the stats + full config payload for a package by fetching all 8 config kinds in parallel.
 async fn package_detail_data(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     package_id: &str,
 ) -> Result<Value, crate::error::AppError> {
     use crate::handlers::config::get_config;
@@ -926,6 +970,7 @@ pub async fn preview_migration_handler(
         &new_config,
         ctx.schema_override(),
         ctx.rls_tenant_column(),
+        state.dialect.as_ref(),
     )
     .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
 
@@ -1068,7 +1113,7 @@ pub async fn apply_migration_handler(
             }
             body
         };
-        replace_config(config_pool, kind, body, false, &row.package_id).await?;
+        replace_config(config_pool, kind, body, false, &row.package_id, None).await?;
     }
     upsert_package(config_pool, &row.package_id, &manifest_value).await?;
 
@@ -1182,7 +1227,7 @@ pub async fn bootstrap_tenant_handler(
     let pool = get_or_create_tenant_pool(&state, tenant_id, database_url).await?;
 
     // apply_migrations is idempotent: safe on both an empty DB and an already-migrated one.
-    apply_migrations(&pool, &config, None, None).await?;
+    apply_migrations(&pool, &config, None, None, state.dialect.as_ref()).await?;
 
     // Populate the model cache for this tenant so entity routes resolve without a reload.
     let model = crate::config::resolve(&config)

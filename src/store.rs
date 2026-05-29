@@ -1,11 +1,9 @@
 //! _sys_* table DDL and config persistence. All _sys_* tables live in a schema named from `ARCHITECT_SCHEMA` env (default `architect`).
 
+use crate::db::{pool::Pool, Dialect};
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
-use sqlx::ConnectOptions;
-use sqlx::PgPool;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 /// Schema name for _sys_* tables. From env `ARCHITECT_SCHEMA`, default `architect`. Must be a valid PostgreSQL identifier.
 pub fn architect_schema() -> String {
@@ -34,7 +32,7 @@ pub const DEFAULT_PACKAGE_ID: &str = "_default";
 
 /// Create schema from `ARCHITECT_SCHEMA` env if not exists, then _sys_* tables.
 /// Config tables have (id, package_id) as composite primary key; _sys_packages has id only.
-pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
+pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(), AppError> {
     let schema = architect_schema();
     sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
         .execute(pool)
@@ -43,17 +41,18 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     for table in CONFIG_TABLES {
         let q_table = qualified_sys_table(table);
         let ddl = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {} (
-                id TEXT NOT NULL,
-                package_id TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                version BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (id, package_id)
-            )
-            "#,
-            q_table
+            "CREATE TABLE IF NOT EXISTS {} (\
+                id TEXT NOT NULL, \
+                package_id TEXT NOT NULL, \
+                payload {} NOT NULL, \
+                updated_at {} NOT NULL DEFAULT {}, \
+                version BIGINT NOT NULL DEFAULT 1, \
+                PRIMARY KEY (id, package_id)\
+            )",
+            q_table,
+            dialect.sys_json_type(),
+            dialect.sys_timestamp_type(),
+            dialect.now_fn(),
         );
         sqlx::query(&ddl).execute(pool).await?;
         let alter_version = format!(
@@ -69,17 +68,18 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
 
         let history_table = qualified_sys_table(&format!("{}_history", table));
         let history_ddl = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {} (
-                id TEXT NOT NULL,
-                package_id TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                version BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (id, package_id, version)
-            )
-            "#,
-            history_table
+            "CREATE TABLE IF NOT EXISTS {} (\
+                id TEXT NOT NULL, \
+                package_id TEXT NOT NULL, \
+                payload {} NOT NULL, \
+                version BIGINT NOT NULL, \
+                created_at {} NOT NULL DEFAULT {}, \
+                PRIMARY KEY (id, package_id, version)\
+            )",
+            history_table,
+            dialect.sys_json_type(),
+            dialect.sys_timestamp_type(),
+            dialect.now_fn(),
         );
         sqlx::query(&history_ddl).execute(pool).await?;
         let alter_history_package = format!(
@@ -91,16 +91,17 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
 
     let q_packages = qualified_sys_table("_sys_packages");
     let packages_ddl = format!(
-        r#"
-        CREATE TABLE IF NOT EXISTS {} (
-            id TEXT PRIMARY KEY,
-            payload JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            version BIGINT NOT NULL DEFAULT 1,
-            semantic_version TEXT
-        )
-        "#,
-        q_packages
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id TEXT PRIMARY KEY, \
+            payload {} NOT NULL, \
+            updated_at {} NOT NULL DEFAULT {}, \
+            version BIGINT NOT NULL DEFAULT 1, \
+            semantic_version TEXT\
+        )",
+        q_packages,
+        dialect.sys_json_type(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
     );
     sqlx::query(&packages_ddl).execute(pool).await?;
     let alter_pkg_semver = format!(
@@ -110,17 +111,18 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     let _ = sqlx::query(&alter_pkg_semver).execute(pool).await;
     let q_packages_history = qualified_sys_table("_sys_packages_history");
     let packages_history_ddl = format!(
-        r#"
-        CREATE TABLE IF NOT EXISTS {} (
-            id TEXT NOT NULL,
-            payload JSONB NOT NULL,
-            version BIGINT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            semantic_version TEXT,
-            PRIMARY KEY (id, version)
-        )
-        "#,
-        q_packages_history
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id TEXT NOT NULL, \
+            payload {} NOT NULL, \
+            version BIGINT NOT NULL, \
+            created_at {} NOT NULL DEFAULT {}, \
+            semantic_version TEXT, \
+            PRIMARY KEY (id, version)\
+        )",
+        q_packages_history,
+        dialect.sys_json_type(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
     );
     sqlx::query(&packages_history_ddl).execute(pool).await?;
     let alter_pkg_hist_semver = format!(
@@ -130,8 +132,9 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     let _ = sqlx::query(&alter_pkg_hist_semver).execute(pool).await;
     // Migrate to surrogate PK so multiple uninstalls of the same package (same id/version) don't violate uniqueness
     let add_history_id = format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS history_id BIGSERIAL",
-        q_packages_history
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS history_id {}",
+        q_packages_history,
+        dialect.sys_bigserial_type()
     );
     let _ = sqlx::query(&add_history_id).execute(pool).await;
     let drop_old_pk = format!(
@@ -139,25 +142,27 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
         q_packages_history
     );
     let _ = sqlx::query(&drop_old_pk).execute(pool).await;
-    let add_new_pk_cond = format!(
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '_sys_packages_history_history_id_pkey') THEN \
-         ALTER TABLE {} ADD CONSTRAINT _sys_packages_history_history_id_pkey PRIMARY KEY (history_id); END IF; END $$",
-        q_packages_history
-    );
-    let _ = sqlx::query(&add_new_pk_cond).execute(pool).await;
+    if dialect.name() == "postgres" {
+        let add_new_pk_cond = format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '_sys_packages_history_history_id_pkey') THEN \
+             ALTER TABLE {} ADD CONSTRAINT _sys_packages_history_history_id_pkey PRIMARY KEY (history_id); END IF; END $$",
+            q_packages_history
+        );
+        let _ = sqlx::query(&add_new_pk_cond).execute(pool).await;
+    }
 
     let q_tenants = qualified_sys_table("_sys_tenants");
     let tenants_ddl = format!(
-        r#"
-        CREATE TABLE IF NOT EXISTS {} (
-            id TEXT PRIMARY KEY,
-            strategy TEXT NOT NULL,
-            database_url TEXT,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            comment TEXT
-        )
-        "#,
-        q_tenants
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id TEXT PRIMARY KEY, \
+            strategy TEXT NOT NULL, \
+            database_url TEXT, \
+            updated_at {} NOT NULL DEFAULT {}, \
+            comment TEXT\
+        )",
+        q_tenants,
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
     );
     sqlx::query(&tenants_ddl).execute(pool).await?;
     let drop_schema_name = format!(
@@ -168,18 +173,19 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
 
     let q_kv_data = qualified_sys_table("_sys_kv_data");
     let kv_data_ddl = format!(
-        r#"
-        CREATE TABLE IF NOT EXISTS {} (
-            tenant_id TEXT NOT NULL,
-            package_id TEXT NOT NULL,
-            namespace TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (tenant_id, package_id, namespace, key)
-        )
-        "#,
-        q_kv_data
+        "CREATE TABLE IF NOT EXISTS {} (\
+            tenant_id TEXT NOT NULL, \
+            package_id TEXT NOT NULL, \
+            namespace TEXT NOT NULL, \
+            key TEXT NOT NULL, \
+            value {} NOT NULL, \
+            updated_at {} NOT NULL DEFAULT {}, \
+            PRIMARY KEY (tenant_id, package_id, namespace, key)\
+        )",
+        q_kv_data,
+        dialect.sys_json_type(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
     );
     sqlx::query(&kv_data_ddl).execute(pool).await?;
     // Migrate existing tables that had no tenant_id: add column and new PK.
@@ -199,63 +205,74 @@ pub async fn ensure_sys_tables(pool: &PgPool) -> Result<(), AppError> {
     );
     let _ = sqlx::query(&add_pk).execute(pool).await;
     // Ensure value column is JSON type (for existing tables that had value as text).
-    let alter_value_json = format!(
-        "ALTER TABLE {} ALTER COLUMN value TYPE JSONB USING value::jsonb",
-        q_kv_data
-    );
-    let _ = sqlx::query(&alter_value_json).execute(pool).await;
+    if dialect.name() == "postgres" {
+        let alter_value_json = format!(
+            "ALTER TABLE {} ALTER COLUMN value TYPE JSONB USING value::jsonb",
+            q_kv_data
+        );
+        let _ = sqlx::query(&alter_value_json).execute(pool).await;
+    }
 
-    ensure_migration_tables(pool).await?;
+    ensure_migration_tables(pool, dialect).await?;
 
     Ok(())
 }
 
 /// Create _sys_migration_plans and _sys_migration_audit tables if they don't exist.
-async fn ensure_migration_tables(pool: &PgPool) -> Result<(), AppError> {
+async fn ensure_migration_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(), AppError> {
     let q_plans = qualified_sys_table("_sys_migration_plans");
     sqlx::query(&format!(
-        r#"CREATE TABLE IF NOT EXISTS {} (
-            id TEXT PRIMARY KEY,
-            package_id TEXT NOT NULL,
-            tenant_id TEXT NOT NULL,
-            from_version TEXT,
-            to_version TEXT NOT NULL,
-            plan_json JSONB NOT NULL,
-            zip_bytes BYTEA NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
-            applied_at TIMESTAMPTZ
-        )"#,
-        q_plans
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id TEXT PRIMARY KEY, \
+            package_id TEXT NOT NULL, \
+            tenant_id TEXT NOT NULL, \
+            from_version TEXT, \
+            to_version TEXT NOT NULL, \
+            plan_json {} NOT NULL, \
+            zip_bytes BYTEA NOT NULL, \
+            status TEXT NOT NULL DEFAULT 'pending', \
+            created_at {} NOT NULL DEFAULT {}, \
+            expires_at {} NOT NULL DEFAULT {} + INTERVAL '24 hours', \
+            applied_at {}\
+        )",
+        q_plans,
+        dialect.sys_json_type(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
+        dialect.sys_timestamp_type(),
     ))
     .execute(pool)
     .await?;
 
     let q_audit = qualified_sys_table("_sys_migration_audit");
     sqlx::query(&format!(
-        r#"CREATE TABLE IF NOT EXISTS {} (
-            id BIGSERIAL PRIMARY KEY,
-            migration_plan_id TEXT NOT NULL,
-            package_id TEXT NOT NULL,
-            tenant_id TEXT NOT NULL,
-            from_version TEXT,
-            to_version TEXT NOT NULL,
-            step_number INT NOT NULL,
-            operation TEXT NOT NULL,
-            schema_name TEXT NOT NULL,
-            table_name TEXT,
-            object_name TEXT NOT NULL,
-            object_type TEXT NOT NULL,
-            description TEXT NOT NULL,
-            ddl TEXT,
-            safety TEXT NOT NULL,
-            risk TEXT NOT NULL,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )"#,
-        q_audit
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id {} PRIMARY KEY, \
+            migration_plan_id TEXT NOT NULL, \
+            package_id TEXT NOT NULL, \
+            tenant_id TEXT NOT NULL, \
+            from_version TEXT, \
+            to_version TEXT NOT NULL, \
+            step_number INT NOT NULL, \
+            operation TEXT NOT NULL, \
+            schema_name TEXT NOT NULL, \
+            table_name TEXT, \
+            object_name TEXT NOT NULL, \
+            object_type TEXT NOT NULL, \
+            description TEXT NOT NULL, \
+            ddl TEXT, \
+            safety TEXT NOT NULL, \
+            risk TEXT NOT NULL, \
+            status TEXT NOT NULL, \
+            error_message TEXT, \
+            executed_at {} NOT NULL DEFAULT {}\
+        )",
+        q_audit,
+        dialect.sys_bigserial_type(),
+        dialect.sys_timestamp_type(),
+        dialect.now_fn(),
     ))
     .execute(pool)
     .await?;
@@ -281,7 +298,7 @@ pub struct MigrationPlanRow {
 /// Persist a migration plan (zip bytes + serialized steps) for later confirmation.
 #[allow(clippy::too_many_arguments)]
 pub async fn save_migration_plan(
-    pool: &PgPool,
+    pool: &Pool,
     id: &str,
     package_id: &str,
     tenant_id: &str,
@@ -310,7 +327,7 @@ pub async fn save_migration_plan(
 
 /// Fetch a migration plan by id, or None if not found.
 pub async fn get_migration_plan(
-    pool: &PgPool,
+    pool: &Pool,
     id: &str,
 ) -> Result<Option<MigrationPlanRow>, AppError> {
     let q = qualified_sys_table("_sys_migration_plans");
@@ -356,7 +373,7 @@ pub async fn get_migration_plan(
 }
 
 /// Atomically mark a migration plan as applied. Returns false if already applied or not found.
-pub async fn mark_migration_plan_applied(pool: &PgPool, id: &str) -> Result<bool, AppError> {
+pub async fn mark_migration_plan_applied(pool: &Pool, id: &str) -> Result<bool, AppError> {
     let q = qualified_sys_table("_sys_migration_plans");
     let result = sqlx::query(&format!(
         "UPDATE {} SET status = 'applied', applied_at = NOW() WHERE id = $1 AND status = 'pending'",
@@ -371,7 +388,7 @@ pub async fn mark_migration_plan_applied(pool: &PgPool, id: &str) -> Result<bool
 /// Append one audit record for a migration step execution.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_migration_audit(
-    pool: &PgPool,
+    pool: &Pool,
     migration_plan_id: &str,
     package_id: &str,
     tenant_id: &str,
@@ -456,7 +473,7 @@ fn config_payloads_unchanged(
 /// If incoming payloads are deep-equal to current, no write is performed and no new version is created.
 /// Returns (count inserted, version). Call within transaction for atomicity.
 pub async fn replace_config_rows(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut crate::db::pool::Connection,
     table: &str,
     package_id: &str,
     records: &[serde_json::Value],
@@ -532,7 +549,7 @@ pub struct PackageRow {
 }
 
 /// List all rows from _sys_packages ordered by id.
-pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
+pub async fn list_packages(pool: &Pool) -> Result<Vec<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
@@ -563,7 +580,7 @@ pub async fn list_packages(pool: &PgPool) -> Result<Vec<PackageRow>, AppError> {
 }
 
 /// Fetch a single package row by id, or None if not installed.
-pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, AppError> {
+pub async fn get_package(pool: &Pool, id: &str) -> Result<Option<PackageRow>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
     #[allow(clippy::type_complexity)]
     let row: Option<(
@@ -593,7 +610,7 @@ pub async fn get_package(pool: &PgPool, id: &str) -> Result<Option<PackageRow>, 
 
 /// Count rows in a config table for a given package.
 pub async fn count_package_kind(
-    pool: &PgPool,
+    pool: &Pool,
     kind: &str,
     package_id: &str,
 ) -> Result<i64, AppError> {
@@ -610,7 +627,7 @@ pub async fn count_package_kind(
 }
 
 /// List all package ids from _sys_packages (what is installed in the DB). Used to generate OpenAPI spec from _sys_* config.
-pub async fn list_package_ids(pool: &PgPool) -> Result<Vec<String>, AppError> {
+pub async fn list_package_ids(pool: &Pool) -> Result<Vec<String>, AppError> {
     let q = qualified_sys_table(PACKAGES_TABLE);
     let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT id FROM {} ORDER BY id", q))
         .fetch_all(pool)
@@ -622,7 +639,7 @@ pub async fn list_package_ids(pool: &PgPool) -> Result<Vec<String>, AppError> {
 /// Upsert one package row by id: copy current to history if exists, then insert or replace with new payload.
 /// Semantic version is read from payload.version (e.g. manifest "version": "1.0.0"). Version is only incremented when semantic_version changes.
 pub async fn upsert_package(
-    pool: &PgPool,
+    pool: &Pool,
     id: &str,
     payload: &serde_json::Value,
 ) -> Result<i64, AppError> {
@@ -690,7 +707,7 @@ pub async fn upsert_package(
 
 /// Delete all config rows and KV data for a package, then remove the package record.
 /// Copies the current package row to _sys_packages_history before delete. Call after reverting migrations on the tenant DB.
-pub async fn delete_package_and_config(pool: &PgPool, package_id: &str) -> Result<(), AppError> {
+pub async fn delete_package_and_config(pool: &Pool, package_id: &str) -> Result<(), AppError> {
     let q_packages = qualified_sys_table(PACKAGES_TABLE);
     let q_packages_history = qualified_sys_table(PACKAGES_HISTORY_TABLE);
     let q_kv_data = qualified_sys_table("_sys_kv_data");
@@ -753,32 +770,76 @@ pub async fn delete_package_and_config(pool: &PgPool, package_id: &str) -> Resul
     Ok(())
 }
 
-/// Ensure the database in `database_url` exists; create it if not. Connects to the
-/// default `postgres` database to run CREATE DATABASE. Call before creating the main pool.
+/// Create a connection pool for the compiled-in dialect.
+///
+/// This is the recommended way to build a pool in consumer binaries — it uses the correct
+/// pool type for whichever dialect feature is active without requiring `#[cfg(feature = ...)]`
+/// in caller code.
+pub async fn create_pool(database_url: &str, max_connections: u32) -> Result<Pool, AppError> {
+    #[cfg(feature = "postgres")]
+    return sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(database_url)
+        .await
+        .map_err(AppError::Db);
+
+    #[cfg(feature = "mysql")]
+    return sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(database_url)
+        .await
+        .map_err(AppError::Db);
+
+    #[cfg(feature = "sqlite")]
+    return sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect(database_url)
+        .await
+        .map_err(AppError::Db);
+
+    #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
+    Err(AppError::BadRequest(
+        "No database dialect feature enabled. Enable one of: postgres, mysql, sqlite.".into(),
+    ))
+}
+
+/// Ensure the database in `database_url` exists; create it if not.
+///
+/// - **Postgres**: connects to the admin `postgres` database and runs `CREATE DATABASE`.
+/// - **SQLite**: the database file is created automatically on first connect — this is a no-op.
+/// - **MySQL**: database auto-creation is not supported here; create the database manually or
+///   rely on connection-string options like `createDatabaseIfNotExist=true`.
 pub async fn ensure_database_exists(database_url: &str) -> Result<(), AppError> {
-    let (admin_url, db_name) = parse_db_name_from_url(database_url)?;
-    if db_name.is_empty() || db_name == "postgres" {
-        return Ok(());
+    #[cfg(feature = "postgres")]
+    {
+        use std::str::FromStr;
+        let (admin_url, db_name) = parse_db_name_from_url(database_url)?;
+        if db_name.is_empty() || db_name == "postgres" {
+            return Ok(());
+        }
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&admin_url)
+            .map_err(|e| AppError::BadRequest(format!("invalid DATABASE_URL: {}", e)))?;
+        let mut conn: sqlx::PgConnection = opts.connect().await.map_err(AppError::Db)?;
+        let exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(&db_name)
+                .fetch_one(&mut conn)
+                .await
+                .map_err(AppError::Db)?;
+        if !exists.0 {
+            let quoted = quote_ident(&db_name);
+            sqlx::query(&format!("CREATE DATABASE {}", quoted))
+                .execute(&mut conn)
+                .await
+                .map_err(AppError::Db)?;
+        }
     }
-    let opts = sqlx::postgres::PgConnectOptions::from_str(&admin_url)
-        .map_err(|e| AppError::BadRequest(format!("invalid DATABASE_URL: {}", e)))?;
-    let mut conn: sqlx::PgConnection = opts.connect().await.map_err(AppError::Db)?;
-    let exists: (bool,) =
-        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
-            .bind(&db_name)
-            .fetch_one(&mut conn)
-            .await
-            .map_err(AppError::Db)?;
-    if !exists.0 {
-        let quoted = quote_ident(&db_name);
-        sqlx::query(&format!("CREATE DATABASE {}", quoted))
-            .execute(&mut conn)
-            .await
-            .map_err(AppError::Db)?;
-    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = database_url;
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
 fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
     let path_start = url
         .rfind('/')
@@ -791,6 +852,7 @@ fn parse_db_name_from_url(url: &str) -> Result<(String, String), AppError> {
     Ok((admin_url, db_name.to_string()))
 }
 
+#[cfg(feature = "postgres")]
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }

@@ -1,13 +1,11 @@
-//! Convert serde_json::Value to types that sqlx can bind.
+//! Convert serde_json::Value to bindable SQL parameter values across all dialects.
 
 use serde_json::Value;
-use sqlx::encode::{Encode, IsNull};
-use sqlx::postgres::{PgTypeInfo, Postgres};
-use sqlx::Database;
 
-/// A value that can be bound to a PostgreSQL query. Converts from serde_json::Value.
+/// A value that can be bound to a SQL query parameter.
+/// Variants are dialect-agnostic; feature-gated `Encode` impls below handle the wire format.
 #[derive(Clone, Debug)]
-pub enum PgBindValue {
+pub enum BindValue {
     Null,
     Bool(bool),
     I64(i64),
@@ -17,76 +15,163 @@ pub enum PgBindValue {
     Json(Value),
 }
 
-impl PgBindValue {
+impl BindValue {
     pub fn from_json(v: &Value) -> Result<Self, crate::error::AppError> {
         Ok(match v {
-            Value::Null => PgBindValue::Null,
-            Value::Bool(b) => PgBindValue::Bool(*b),
+            Value::Null => BindValue::Null,
+            Value::Bool(b) => BindValue::Bool(*b),
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
-                    PgBindValue::I64(i)
+                    BindValue::I64(i)
                 } else if let Some(f) = n.as_f64() {
-                    PgBindValue::F64(f)
+                    BindValue::F64(f)
                 } else {
-                    PgBindValue::I64(n.as_i64().unwrap_or(0))
+                    BindValue::I64(0)
                 }
             }
             Value::String(s) => {
                 if let Ok(u) = uuid::Uuid::parse_str(s) {
-                    PgBindValue::Uuid(u)
+                    BindValue::Uuid(u)
                 } else {
-                    PgBindValue::String(s.clone())
+                    BindValue::String(s.clone())
                 }
             }
-            Value::Array(_) | Value::Object(_) => PgBindValue::Json(v.clone()),
+            Value::Array(_) | Value::Object(_) => BindValue::Json(v.clone()),
         })
     }
 }
 
-impl<'q> Encode<'q, Postgres> for PgBindValue {
-    fn encode_by_ref(
-        &self,
-        buf: &mut <Postgres as Database>::ArgumentBuffer<'q>,
-    ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
-        // type_info() is TEXT for all variants, so parameters must be valid UTF-8 text.
-        // Encoding I64/F64 as binary would break; use decimal strings + $n::numeric casts.
-        // Booleans: "true"/"false" + $n::boolean. JSON objects/arrays: serde_json::to_string
-        // + $n::jsonb (or ::json) so jsonb columns accept TEXT-shaped params.
-        Ok(match self {
-            PgBindValue::Null => <Option<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
-            PgBindValue::Bool(b) => {
-                let s: &str = if *b { "true" } else { "false" };
-                <&str as Encode<Postgres>>::encode_by_ref(&s, buf)?
-            }
-            PgBindValue::I64(n) => {
-                let s = n.to_string();
-                let s_ref = s.as_str();
-                <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?
-            }
-            PgBindValue::F64(n) => {
-                let s = format!("{}", n);
-                let s_ref = s.as_str();
-                <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?
-            }
-            PgBindValue::String(s) => {
-                let s_ref: &str = s.as_str();
-                <&str as Encode<Postgres>>::encode_by_ref(&s_ref, buf)?
-            }
-            PgBindValue::Uuid(u) => {
-                let u_str = u.to_string();
-                <&str as Encode<Postgres>>::encode_by_ref(&u_str.as_str(), buf)?
-            }
-            PgBindValue::Json(v) => {
-                let s = serde_json::to_string(v)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
-            }
-        })
+// ─── PostgreSQL ───────────────────────────────────────────────────────────────
+
+#[cfg(feature = "postgres")]
+mod pg_impl {
+    use super::BindValue;
+    use sqlx::encode::{Encode, IsNull};
+    use sqlx::postgres::{PgTypeInfo, Postgres};
+    use sqlx::Database;
+
+    impl<'q> Encode<'q, Postgres> for BindValue {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <Postgres as Database>::ArgumentBuffer<'q>,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(match self {
+                BindValue::Null => <Option<i32> as Encode<Postgres>>::encode_by_ref(&None, buf)?,
+                BindValue::Bool(b) => {
+                    let s: &str = if *b { "true" } else { "false" };
+                    <&str as Encode<Postgres>>::encode_by_ref(&s, buf)?
+                }
+                BindValue::I64(n) => {
+                    let s = n.to_string();
+                    <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+                }
+                BindValue::F64(n) => {
+                    let s = format!("{}", n);
+                    <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+                }
+                BindValue::String(s) => {
+                    <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+                }
+                BindValue::Uuid(u) => {
+                    let s = u.to_string();
+                    <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+                }
+                BindValue::Json(v) => {
+                    let s = serde_json::to_string(v)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    <&str as Encode<Postgres>>::encode_by_ref(&s.as_str(), buf)?
+                }
+            })
+        }
+    }
+
+    impl sqlx::Type<Postgres> for BindValue {
+        fn type_info() -> PgTypeInfo {
+            PgTypeInfo::with_name("TEXT")
+        }
     }
 }
 
-impl sqlx::Type<Postgres> for PgBindValue {
-    fn type_info() -> PgTypeInfo {
-        PgTypeInfo::with_name("TEXT")
+// ─── MySQL ────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "mysql")]
+mod mysql_impl {
+    use super::BindValue;
+    use sqlx::encode::{Encode, IsNull};
+    use sqlx::mysql::{MySql, MySqlTypeInfo};
+    use sqlx::Database;
+
+    impl<'q> Encode<'q, MySql> for BindValue {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <MySql as Database>::ArgumentBuffer<'q>,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(match self {
+                BindValue::Null => <Option<i32> as Encode<MySql>>::encode_by_ref(&None, buf)?,
+                BindValue::Bool(b) => <i32 as Encode<MySql>>::encode_by_ref(&(*b as i32), buf)?,
+                BindValue::I64(n) => <i64 as Encode<MySql>>::encode_by_ref(n, buf)?,
+                BindValue::F64(n) => <f64 as Encode<MySql>>::encode_by_ref(n, buf)?,
+                BindValue::String(s) => <String as Encode<MySql>>::encode_by_ref(s, buf)?,
+                BindValue::Uuid(u) => {
+                    let s = u.to_string();
+                    <String as Encode<MySql>>::encode_by_ref(&s, buf)?
+                }
+                BindValue::Json(v) => {
+                    let s = serde_json::to_string(v)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    <String as Encode<MySql>>::encode_by_ref(&s, buf)?
+                }
+            })
+        }
+    }
+
+    impl sqlx::Type<MySql> for BindValue {
+        fn type_info() -> MySqlTypeInfo {
+            <String as sqlx::Type<MySql>>::type_info()
+        }
     }
 }
+
+// ─── SQLite ───────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+mod sqlite_impl {
+    use super::BindValue;
+    use sqlx::encode::{Encode, IsNull};
+    use sqlx::sqlite::{Sqlite, SqliteTypeInfo};
+    use sqlx::Database;
+
+    impl<'q> Encode<'q, Sqlite> for BindValue {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <Sqlite as Database>::ArgumentBuffer<'q>,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(match self {
+                BindValue::Null => <Option<i32> as Encode<Sqlite>>::encode_by_ref(&None, buf)?,
+                BindValue::Bool(b) => <i32 as Encode<Sqlite>>::encode_by_ref(&(*b as i32), buf)?,
+                BindValue::I64(n) => <i64 as Encode<Sqlite>>::encode_by_ref(n, buf)?,
+                BindValue::F64(n) => <f64 as Encode<Sqlite>>::encode_by_ref(n, buf)?,
+                BindValue::String(s) => <String as Encode<Sqlite>>::encode_by_ref(s, buf)?,
+                BindValue::Uuid(u) => {
+                    let s = u.to_string();
+                    <String as Encode<Sqlite>>::encode_by_ref(&s, buf)?
+                }
+                BindValue::Json(v) => {
+                    let s = serde_json::to_string(v)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    <String as Encode<Sqlite>>::encode_by_ref(&s, buf)?
+                }
+            })
+        }
+    }
+
+    impl sqlx::Type<Sqlite> for BindValue {
+        fn type_info() -> SqliteTypeInfo {
+            <String as sqlx::Type<Sqlite>>::type_info()
+        }
+    }
+}
+
+/// Backward-compat alias — existing call sites referencing PgBindValue continue to compile.
+#[cfg(feature = "postgres")]
+pub type PgBindValue = BindValue;

@@ -1,12 +1,16 @@
 # Architect SDK
 
-Configuration-driven REST backend library for Rust with PostgreSQL. Define your entire data model — schemas, tables, columns, indexes, relationships, API endpoints — in JSON. No entity-specific business logic required.
+Configuration-driven REST backend library for Rust. Define your entire data model — schemas, tables, columns, indexes, relationships, API endpoints — in JSON. No entity-specific business logic required.
+
+Supports **PostgreSQL**, **MySQL**, and **SQLite** via compile-time dialect selection.
 
 ## Features
 
 - **Config-driven schema**: All DB structure defined in JSON; no hardcoded migrations
 - **Auto CRUD API**: List, read, create, update, delete, bulk ops — all generated from config
-- **Multi-tenancy**: Database-per-tenant or Row-Level Security (RLS), configured per tenant
+- **Multi-database**: PostgreSQL, MySQL 8+, SQLite 3.35+ — one dialect per binary, zero overhead
+- **Canonical type system**: Standard type names in package configs (`uuid`, `json`, `timestamp`, …) mapped to each database's native types automatically
+- **Multi-tenancy**: Database-per-tenant or Row-Level Security (RLS, Postgres only), configured per tenant
 - **Package system**: Deploy config as versioned ZIP packages with install/uninstall/upgrade
 - **Migration planning**: Diff-based upgrades with preview before execution
 - **Asset storage**: File uploads with S3, Azure, GCS, or local filesystem backends
@@ -15,7 +19,7 @@ Configuration-driven REST backend library for Rust with PostgreSQL. Define your 
 - **Event publishing**: Optional async event publishing to Decision Hub after CRUD ops
 - **Authorization**: Optional permission checks via Authrs integration
 - **OpenAPI spec**: Dynamically generated from config at `GET /spec`
-- **Safe SQL**: All identifiers from validated config; values always use `$N` placeholders
+- **Safe SQL**: All identifiers from validated config; values always use parameterized placeholders
 
 ---
 
@@ -25,11 +29,17 @@ Add the SDK to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-foundry-rs = "0.1"
+# PostgreSQL (default)
+foundry-rs = "0.2"
 
-# With cloud storage support
-foundry-rs = { version = "0.1", features = ["storage-s3"] }
-# Other storage features: storage-azure, storage-gcs, storage-all
+# MySQL
+foundry-rs = { version = "0.2", default-features = false, features = ["mysql"] }
+
+# SQLite
+foundry-rs = { version = "0.2", default-features = false, features = ["sqlite"] }
+
+# With cloud storage
+foundry-rs = { version = "0.2", features = ["storage-s3"] }
 ```
 
 The crate is published as [`foundry-rs`](https://crates.io/crates/foundry-rs) on crates.io. The Rust library name is `architect_sdk` — import it as `use architect_sdk::...`.
@@ -45,6 +55,45 @@ cargo run --example server
 
 ---
 
+## Database Dialect Selection
+
+Exactly **one** dialect feature must be enabled per binary. The active dialect is determined at compile time — there is no runtime overhead.
+
+| Database | Feature flag | Notes |
+|---|---|---|
+| PostgreSQL 12+ | `postgres` *(default)* | Full support including RLS, JSONB, native UUID, named enums |
+| MySQL 8.0+ | `mysql` | UUID stored as CHAR(36), JSON (no JSONB), no RLS |
+| SQLite 3.35+ | `sqlite` | UUID/JSON/timestamps stored as TEXT, no RLS |
+
+```toml
+# Explicit Postgres (same as default)
+foundry-rs = { version = "0.2", features = ["postgres"] }
+
+# Switch to MySQL — disable default first
+foundry-rs = { version = "0.2", default-features = false, features = ["mysql"] }
+```
+
+Enabling more than one dialect feature at a time is a **compile error** (caught by `build.rs`).
+
+### Type mapping
+
+Package configs use canonical type names. The SDK maps them to each database's native type at DDL-generation time — no package changes are needed when switching databases.
+
+| Canonical type | PostgreSQL | MySQL | SQLite |
+|---|---|---|---|
+| `uuid` | `UUID` | `CHAR(36)` | `TEXT` |
+| `json` / `jsonb` | `JSONB` | `JSON` | `TEXT` |
+| `timestamp` | `TIMESTAMPTZ` | `DATETIME(6)` | `TEXT` (ISO-8601) |
+| `boolean` | `BOOLEAN` | `TINYINT(1)` | `INTEGER` (0/1) |
+| `bytes` | `BYTEA` | `BLOB` | `BLOB` |
+| `serial` | `SERIAL` | `INT AUTO_INCREMENT` | `INTEGER` |
+| `bigserial` | `BIGSERIAL` | `BIGINT AUTO_INCREMENT` | `INTEGER` |
+| `array(T)` | `T[]` | `JSON` *(degraded)* | `TEXT` *(degraded)* |
+
+Degraded types emit a `tracing::warn` at startup so operators know what feature was traded.
+
+---
+
 ## Usage
 
 ### 1. Minimal Server
@@ -53,6 +102,7 @@ The full startup sequence: create the DB if missing, ensure system tables exist,
 
 ```rust
 use architect_sdk::{
+    db::active_dialect,
     ensure_database_exists, ensure_sys_tables,
     load_from_pool, load_registry_from_pool, resolve,
     common_routes_with_ready, config_routes, entity_routes,
@@ -78,13 +128,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the database if it doesn't exist yet
     ensure_database_exists(&database_url).await?;
 
+    // Build the pool for the compiled-in dialect
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await?;
 
+    // Resolve the active dialect (postgres / mysql / sqlite — set by feature flag)
+    let dialect = active_dialect();
+
     // Create architect schema + all _sys_* tables
-    ensure_sys_tables(&pool).await?;
+    ensure_sys_tables(&pool, dialect.as_ref()).await?;
 
     // Load tenant registry from _sys_tenants
     let tenant_registry = load_registry_from_pool(&pool).await?;
@@ -110,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage,
         event_client,
         authrs_client,
+        dialect,            // <-- new field
     };
 
     let app = axum::Router::new()
@@ -124,47 +179,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 2. Loading Config from a Package Directory
 
-Instead of loading from the database, you can load config from a local directory containing a `manifest.json` and config JSON files. This is useful during development or for seeding a fresh server.
-
-Set `PACKAGE_PATH=sample` in your `.env` (or call the loader directly):
+Instead of loading from the database, you can load config from a local directory. Set `PACKAGE_PATH=sample` in your `.env`, or call the loader directly:
 
 ```rust
-use architect_sdk::{apply_migrations, resolve, FullConfig, config::{SchemaConfig, TableConfig, ColumnConfig, ApiEntityConfig}};
-
-// Minimal in-code config (no JSON files needed)
-let config = FullConfig {
-    schemas: serde_json::from_str(r#"[{"id":"s1","name":"public"}]"#)?,
-    tables:  serde_json::from_str(r#"[{"id":"t1","schema_id":"s1","name":"users"}]"#)?,
-    columns: serde_json::from_str(r#"[
-        {"id":"c1","table_id":"t1","name":"name","type":{"Simple":"TEXT"},"nullable":false}
-    ]"#)?,
-    api_entities: serde_json::from_str(r#"[
-        {"id":"ae1","table_id":"t1","path_segment":"users","operations":["list","read","create","update","delete"]}
-    ]"#)?,
-    enums: vec![],
-    indexes: vec![],
-    relationships: vec![],
-    kv_stores: vec![],
-};
+use architect_sdk::{apply_migrations, resolve, db::active_dialect};
 
 // Apply DDL (CREATE SCHEMA / TABLE / INDEX / FK) — idempotent for schemas and enums
-apply_migrations(&pool, &config, None, None).await?;
+let dialect = active_dialect();
+apply_migrations(&pool, &config, None, None, dialect.as_ref()).await?;
 
 let model = resolve(&config)?.with_package_id("my-package");
 ```
 
-For a directory-based package (the same format used by `PACKAGE_PATH`), see [`examples/server.rs`](examples/server.rs) — it reads `manifest.json` plus per-kind JSON files (`tables.json`, `columns.json`, etc.) and builds a `FullConfig` from them.
+For a directory-based package (the same format used by `PACKAGE_PATH`), see [`examples/server.rs`](examples/server.rs).
 
 ### 3. Multi-Tenancy
 
-Tenants are stored in `_sys_tenants`. Register tenants by inserting rows directly (or via your own admin flow):
+Tenants are stored in `_sys_tenants`. Register tenants by inserting rows directly:
 
 ```sql
--- Database-per-tenant
+-- Database-per-tenant (works on all dialects)
 INSERT INTO architect._sys_tenants (id, strategy, database_url)
 VALUES ('acme', 'database', 'postgres://localhost/acme_db');
 
--- RLS tenant (shared DB, row-level isolation)
+-- RLS tenant (Postgres only — shared DB, row-level isolation)
 INSERT INTO architect._sys_tenants (id, strategy, database_url)
 VALUES ('beta', 'rls', NULL);
 ```
@@ -176,15 +214,15 @@ GET /api/v1/users HTTP/1.1
 X-Tenant-ID: acme
 ```
 
-The SDK resolves the tenant from the registry, connects to the right database (Database strategy) or sets `app.tenant_id` in the session (RLS strategy), then executes the query. Tenant pools are created lazily on first use.
+> **Note:** The RLS strategy uses `CREATE POLICY` and `SET LOCAL app.tenant_id` — Postgres only. MySQL and SQLite tenants must use the Database strategy (separate database per tenant).
 
-For **RLS**, apply migrations with the `rls_tenant_column` parameter so the SDK adds the `tenant_id` column and RLS policies automatically:
+For **RLS**, apply migrations with the `rls_tenant_column` parameter:
 
 ```rust
-apply_migrations(&pool, &config, None, Some("tenant_id")).await?;
+apply_migrations(&pool, &config, None, Some("tenant_id"), dialect.as_ref()).await?;
 ```
 
-After registering new Database-strategy tenants post-install, call the bootstrap endpoint to create their schema:
+After registering new Database-strategy tenants post-install, call the bootstrap endpoint:
 
 ```http
 POST /api/v1/config/package/my-package/bootstrap
@@ -193,7 +231,7 @@ X-Tenant-ID: acme
 
 ### 4. Packages
 
-A **package** is a versioned ZIP containing `manifest.json` + config JSONs for one domain. This is the recommended way to deploy config changes to a running server.
+A **package** is a versioned ZIP containing `manifest.json` + config JSONs for one domain.
 
 **Install:**
 ```http
@@ -204,8 +242,6 @@ Content-Type: multipart/form-data
 file=@my-package.zip
 ```
 
-The SDK extracts the ZIP, validates all config, writes to `_sys_*` tables, runs DDL against every tenant database, and reloads the in-memory model — all atomically in one request.
-
 **Preview an upgrade** (diff old config against new ZIP before touching any DB):
 ```http
 POST /api/v1/config/package/migration/preview
@@ -215,7 +251,7 @@ Content-Type: multipart/form-data
 file=@my-package-v2.zip
 ```
 
-Response includes a `migration_id` and an ordered list of DDL steps, each annotated with `safety` and `risk`:
+Response includes a `migration_id` and ordered DDL steps annotated with `safety` and `risk`:
 
 ```json
 {
@@ -226,12 +262,6 @@ Response includes a `migration_id` and an ordered list of DDL steps, each annota
       "sql": "ALTER TABLE public.orders ADD COLUMN notes TEXT",
       "safety": "Safe",
       "risk": "None"
-    },
-    {
-      "operation": "SetNotNull",
-      "sql": "ALTER TABLE public.orders ALTER COLUMN status SET NOT NULL",
-      "safety": "BestEffort",
-      "risk": "ExistingNullsMustBeAbsent"
     }
   ]
 }
@@ -249,14 +279,15 @@ DELETE /api/v1/config/package/my-package
 X-Tenant-ID: acme
 ```
 
-You can also drive migrations programmatically:
+Programmatic usage:
 
 ```rust
-use architect_sdk::{compute_migration_plan, execute_migration_plan};
+use architect_sdk::{compute_migration_plan, execute_migration_plan, db::active_dialect};
 
-let plan = compute_migration_plan(&old_config, &new_config)?;
+let dialect = active_dialect();
+let plan = compute_migration_plan(&old_config, &new_config, dialect.as_ref())?;
 // Inspect plan.steps — check safety/risk before proceeding
-let summary = execute_migration_plan(&pool, &plan, "migration-run-id").await?;
+let summary = execute_migration_plan(&pool, &plan, "migration-run-id", dialect.as_ref()).await?;
 println!("applied: {}, warned: {}", summary.applied, summary.warned);
 ```
 
@@ -265,8 +296,7 @@ println!("applied: {}, warned: {}", summary.applied, summary.warned);
 Columns of type `asset` or `asset[]` accept file uploads via `multipart/form-data`. Enable the relevant storage backend in `Cargo.toml` and set env vars:
 
 ```toml
-# Cargo.toml
-foundry-rs = { version = "0.1", features = ["storage-s3"] }
+foundry-rs = { version = "0.2", features = ["storage-s3"] }
 ```
 
 ```env
@@ -296,14 +326,14 @@ X-Tenant-ID: acme
 
 ### 6. Validation
 
-Validation rules are declared per column in config and are enforced automatically — no handler code required.
+Validation rules are declared per column in config and enforced automatically:
 
 ```json
 {
   "id": "c_email",
   "table_id": "t_users",
   "name": "email",
-  "type": { "Simple": "TEXT" },
+  "type": "text",
   "nullable": false,
   "validation": {
     "required": true,
@@ -313,7 +343,7 @@ Validation rules are declared per column in config and are enforced automaticall
 }
 ```
 
-On a `POST` (full validation), all `required` fields must be present. On a `PATCH` (partial validation), only the fields included in the request body are validated. Failures return HTTP `422`:
+On `POST` (full validation) all `required` fields must be present. On `PATCH` (partial) only provided fields are validated. Failures return HTTP `422`:
 
 ```json
 {
@@ -329,7 +359,7 @@ On a `POST` (full validation), all `required` fields must be present. On a `PATC
 
 ### 7. Audit Logging
 
-Set `audit_log: true` on any table config. The SDK creates a companion `{table}_audit` table and a trigger that records every INSERT, UPDATE, and DELETE automatically — no application code needed.
+Set `audit_log: true` on any table. The SDK creates a companion `{table}_audit` table and records every INSERT, UPDATE, and DELETE automatically.
 
 ```json
 { "id": "t1", "schema_id": "s1", "name": "orders", "audit_log": true }
@@ -337,15 +367,15 @@ Set `audit_log: true` on any table config. The SDK creates a companion `{table}_
 
 Each audit row contains:
 - `audit_id` — UUID primary key
-- `audit_action` — `INSERT`, `UPDATE`, or `DELETE`
+- `audit_action` — `create`, `update`, or `delete`
 - `audit_at` — timestamp of the change
-- `audit_by` — value of `X-User-ID` header at request time
-- `changed_fields` — JSONB delta (only the columns that changed)
-- Full nullable copy of every row column for point-in-time snapshots
+- `audit_by` — value of `X-User-ID` header
+- `changed_fields` — JSON delta (only columns that changed)
+- Full nullable copy of every source column for point-in-time snapshots
 
 ### 8. Related Entity Includes
 
-Define a relationship in config, then use `?include=` on list or read requests to embed related rows in a single query (no N+1):
+Define a relationship in config, then use `?include=` to embed related rows (single query, no N+1):
 
 ```http
 GET /api/v1/users?include=orders
@@ -358,45 +388,22 @@ X-Tenant-ID: acme
     {
       "id": "u1",
       "name": "Alice",
-      "orders": [
-        { "id": "o1", "total": "49.99" }
-      ]
+      "orders": [{ "id": "o1", "total": "49.99" }]
     }
   ],
   "meta": { "count": 1, "offset": 0, "limit": 10 }
 }
 ```
 
-Include multiple relationships by comma-separating path segments: `?include=orders,payments`.
+Include multiple relationships: `?include=orders,payments`.
 
 ### 9. Event Publishing (Decision Hub)
 
-Set `DECISION_HUB_URL` in the environment. The SDK automatically publishes async events after every create, update, delete, and archive operation — no code changes required.
-
-```env
-DECISION_HUB_URL=http://decision-hub:8080
-DECISION_HUB_TIMEOUT_SECS=5
-```
-
-Events are fire-and-forget: failures are logged but never surface to the API caller.
+Set `DECISION_HUB_URL`. The SDK publishes async events after every create, update, delete, and archive — fire-and-forget, never blocks the API caller.
 
 ### 10. Authorization (Authrs)
 
-Set `AUTHRS_URL` and `SERVICE_NAME`. The SDK checks permissions before every entity operation using the `X-User-ID` header.
-
-```env
-AUTHRS_URL=http://authrs:8080
-SERVICE_NAME=my-service
-```
-
-Every request to `/api/v1/:entity` must include:
-
-```http
-X-Tenant-ID: acme
-X-User-ID: user-abc
-```
-
-The SDK checks `service:my-service/package:default/table:users` with action `getUsers` (for `GET`) before executing the query. A missing or unauthorized user receives `401 Unauthorized`.
+Set `AUTHRS_URL` and `SERVICE_NAME`. The SDK checks permissions before every entity operation using the `X-User-ID` header. Unauthorized requests receive `401`.
 
 ---
 
@@ -404,7 +411,7 @@ The SDK checks `service:my-service/package:default/table:users` with action `get
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `DATABASE_URL` | PostgreSQL connection string for the central architect DB | required |
+| `DATABASE_URL` | Connection string for the central architect DB | required |
 | `ARCHITECT_SCHEMA` | Schema for `_sys_*` tables | `architect` |
 | `PACKAGE_PATH` | Load config from this directory instead of DB | — |
 | `RUST_LOG` | Log level filter (e.g. `architect_sdk=debug`) | — |
@@ -451,12 +458,10 @@ All data routes require `X-Tenant-ID` header. When Authrs is enabled, `X-User-ID
 
 ### Config Ingestion
 
-Each config kind has a `POST` (create/replace) and `GET` (retrieve) endpoint:
-
 | Path | Kind |
 |---|---|
 | `/api/v1/config/schemas` | Schema definitions |
-| `/api/v1/config/enums` | PostgreSQL ENUM types |
+| `/api/v1/config/enums` | Enum types (Postgres: `CREATE TYPE AS ENUM`; MySQL/SQLite: CHECK constraints) |
 | `/api/v1/config/tables` | Table definitions |
 | `/api/v1/config/columns` | Column definitions |
 | `/api/v1/config/indexes` | Index definitions |
@@ -529,6 +534,35 @@ HTTP status codes: `200`, `201`, `207`, `401`, `404`, `409`, `422`, `500`.
 
 ## Configuration Reference
 
+### Canonical Column Types
+
+Use these names in `"type"` fields. The SDK maps them to the correct DDL type for the active database.
+
+| Canonical | Aliases accepted | Description |
+|---|---|---|
+| `text` | `TEXT` | Unbounded unicode text |
+| `varchar` | `VARCHAR(n)`, `character varying` | Variable-length text with optional cap |
+| `char` | `CHAR(n)`, `character` | Fixed-length text |
+| `int` | `INTEGER`, `INT`, `serial` | 32-bit integer (serial = auto-increment) |
+| `bigint` | `BIGINT`, `bigserial` | 64-bit integer |
+| `smallint` | `SMALLINT` | 16-bit integer |
+| `float` | `DOUBLE PRECISION`, `float8` | 64-bit float |
+| `real` | `REAL`, `float4` | 32-bit float |
+| `decimal` | `NUMERIC(p,s)`, `DECIMAL` | Fixed-precision decimal |
+| `boolean` | `BOOLEAN`, `bool` | True/false |
+| `uuid` | `UUID` | 128-bit UUID |
+| `json` | `JSON`, `jsonb`, `JSONB` | JSON document (stored as JSONB on Postgres) |
+| `timestamp` | `TIMESTAMPTZ`, `timestamp with time zone` | Timestamp with timezone |
+| `timestamp_ntz` | `TIMESTAMP WITHOUT TIME ZONE` | Timestamp without timezone |
+| `date` | `DATE` | Calendar date |
+| `time` | `TIME` | Time of day |
+| `timetz` | `TIME WITH TIME ZONE` | Time with timezone |
+| `bytes` | `BYTEA`, `bytea` | Binary data |
+| `asset` | — | SDK pseudo-type: stores a file path string |
+| `asset[]` | — | SDK pseudo-type: stores a JSON array of file paths |
+
+Existing packages using raw SQL type names (e.g. `"TIMESTAMPTZ"`, `"INT"`) continue to work unchanged — they pass through as `Custom` types and are rendered verbatim in DDL.
+
 ### Schema
 
 ```json
@@ -541,28 +575,29 @@ HTTP status codes: `200`, `201`, `207`, `401`, `404`, `409`, `422`, `500`.
 { "id": "e1", "schema_id": "s1", "name": "order_status", "values": ["pending", "shipped", "delivered"] }
 ```
 
+On Postgres: `CREATE TYPE public.order_status AS ENUM (...)`.  
+On MySQL/SQLite: rendered as a `CHECK (col IN (...))` constraint on the column.
+
 ### Table
 
 ```json
 {
   "id": "t1", "schema_id": "s1", "name": "orders",
-  "primary_key": "single",
+  "primary_key": "id",
   "unique": [["email"]],
   "check": [],
   "audit_log": true
 }
 ```
 
-Setting `audit_log: true` creates a companion `orders_audit` table recording every INSERT, UPDATE, and DELETE with a full row snapshot and `changed_fields` JSONB delta.
-
-Every table automatically gets: `id` (UUID PK), `created_at`, `updated_at`, `archived_at`, `created_by`, `updated_by`.
+Every table automatically gets: `created_at`, `updated_at`, `archived_at`, `created_by`, `updated_by` — each typed to the dialect's timestamp/text equivalent.
 
 ### Column
 
 ```json
 {
   "id": "c1", "table_id": "t1", "name": "email",
-  "type": { "Simple": "TEXT" },
+  "type": "text",
   "nullable": false,
   "validation": {
     "required": true,
@@ -572,15 +607,13 @@ Every table automatically gets: `id` (UUID PK), `created_at`, `updated_at`, `arc
 }
 ```
 
-**Supported types:** `TEXT`, `VARCHAR(n)`, `INTEGER`, `BIGINT`, `SMALLINT`, `BOOLEAN`, `NUMERIC(p,s)`, `DECIMAL`, `REAL`, `DOUBLE PRECISION`, `UUID`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `JSON`, `JSONB`, `BYTEA`, custom enums, `asset`, `asset[]`.
-
 **Validation rules:** `required`, `min_length`, `max_length`, `pattern` (regex), `allowed` (enum list), `minimum`, `maximum`, `format` (`email` | `uuid`).
 
 ### API Entity
 
 ```json
 {
-  "id": "ae1", "table_id": "t1",
+  "entity_id": "t1",
   "path_segment": "orders",
   "operations": ["list", "read", "create", "update", "delete"],
   "sensitive_columns": ["password_hash"],
@@ -593,8 +626,8 @@ Every table automatically gets: `id` (UUID PK), `created_at`, `updated_at`, `arc
 ```json
 {
   "id": "r1",
-  "from_table_id": "t1", "from_column_id": "c_user_id",
-  "to_table_id": "t2", "to_column_id": "c_id",
+  "from_schema_id": "s1", "from_table_id": "t1", "from_column_id": "c_user_id",
+  "to_schema_id": "s1",   "to_table_id":   "t2", "to_column_id":   "c_id",
   "name": "user",
   "on_delete": "CASCADE"
 }
@@ -617,9 +650,9 @@ Every table automatically gets: `id` (UUID PK), `created_at`, `updated_at`, `arc
 
 Tenants are registered in `_sys_tenants`. Two isolation strategies:
 
-**Database** — each tenant has its own PostgreSQL database. DDL is broadcast to all tenant DBs on package install/uninstall.
+**Database** — each tenant has its own database. DDL is broadcast to all tenant DBs on package install/uninstall. Works on all dialects.
 
-**RLS** — tenants share a database. The SDK sets `app.tenant_id` via `SET LOCAL` before each query. PostgreSQL RLS policies enforce isolation. All tables get a `tenant_id` column automatically.
+**RLS** — tenants share a database. The SDK sets the tenant identifier in the session before each query and PostgreSQL RLS policies enforce row-level isolation. **Postgres only.** All tables get a `tenant_id` column automatically.
 
 All data routes require `X-Tenant-ID: <tenant_id>` header.
 
@@ -644,7 +677,7 @@ my-package.zip
 **Upgrade:** `POST /api/v1/config/package/migration/preview` → review → `POST /api/v1/config/package/migration/apply/:id`  
 **Uninstall:** `DELETE /api/v1/config/package/:package_id`
 
-Migration steps carry safety (`Safe` | `BestEffort` | `WarnOnly`) and risk (`None` | `MayFail` | `ExistingNullsMustBeAbsent` | `DataWillBeModified` | `ManualActionRequired`) metadata so you know exactly what will happen before applying.
+Migration steps carry `safety` (`Safe` | `BestEffort` | `WarnOnly`) and `risk` (`None` | `MayFail` | `ExistingNullsMustBeAbsent` | `DataWillBeModified` | `ManualActionRequired`) metadata so you know exactly what will happen before applying.
 
 ---
 
@@ -695,45 +728,12 @@ All stored in the `architect` schema (configurable via `ARCHITECT_SCHEMA`):
 
 ---
 
-## Build & Test
+## Adding a New Dialect
 
-```bash
-cargo build
-cargo test
-cargo fmt --all
-cargo clippy --all -- -D warnings
-```
+1. Add a Cargo feature (`mysql` / `sqlite` pattern applies).
+2. Create `src/db/your_dialect.rs` implementing the `Dialect` trait (~20 methods).
+3. Gate it with `#[cfg(feature = "your_dialect")]` in `src/db/mod.rs`.
+4. Add it to `active_dialect()` in `src/db/mod.rs`.
+5. Add `your_dialect = ["sqlx/your_dialect"]` to `Cargo.toml`.
 
-CI (GitHub Actions) runs on push/PR to `main`: fmt check, build, test, clippy.
-
----
-
-## Sample Packages
-
-| Directory | Description |
-|---|---|
-| `sample/` | Minimal: 2 tables (users, orders), FK, email unique constraint |
-| `sample_ecommerce/` | Full e-commerce: 12 tables, 4 enums, 18 relationships, multi-tenant ready |
-
----
-
-## Private GitHub and CI
-
-For a private repo, authenticate Cargo:
-
-**Local (HTTPS):**
-```bash
-git config --global url."https://<PAT>@github.com/".insteadOf "https://github.com/"
-```
-
-**CI (GitHub Actions):**
-```yaml
-- run: |
-    git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
-```
-
----
-
-## License
-
-MIT
+The `Dialect` trait covers: DDL types, identifier quoting, parameter placeholders, type casting, `NOW()`, UUID defaults, `RETURNING`, upsert conflict, JSON aggregation for includes, system-table DDL helpers, and multi-tenancy session setup.

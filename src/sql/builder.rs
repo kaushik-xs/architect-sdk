@@ -1,7 +1,7 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
 use crate::config::{IncludeDirection, PkType, ResolvedEntity};
-use crate::db::{postgres as pg, TypeCategory};
+use crate::db::{type_category_from_cast, Dialect, TypeCategory};
 use crate::error::AppError;
 use crate::sql::rsql::{FilterNode, RsqlOp, SortSpec};
 use serde_json::Value;
@@ -117,10 +117,17 @@ pub fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Valu
 }
 
 /// Placeholder for PK in WHERE (e.g. $1 or $1::uuid) so bound text is cast when column is UUID.
-fn pk_placeholder(entity: &ResolvedEntity, param_num: u32) -> String {
+fn pk_placeholder(entity: &ResolvedEntity, param_num: usize, dialect: &dyn Dialect) -> String {
+    let ph = dialect.placeholder(param_num);
     match &entity.pk_type {
-        PkType::Uuid => format!("${}::uuid", param_num),
-        _ => format!("${}", param_num),
+        PkType::Uuid => {
+            if let Some(cast) = dialect.cast_name(&crate::db::CanonicalType::Uuid) {
+                dialect.cast_expr(&ph, &cast)
+            } else {
+                ph
+            }
+        }
+        _ => ph,
     }
 }
 
@@ -177,10 +184,11 @@ fn op_valid_for_category(op: &RsqlOp, category: TypeCategory) -> bool {
     }
 }
 
-fn make_placeholder(n: u32, cast: Option<&str>) -> String {
+fn make_placeholder(n: usize, cast: Option<&str>, dialect: &dyn Dialect) -> String {
+    let ph = dialect.placeholder(n);
     match cast {
-        Some(t) => format!("${}::{}", n, t),
-        None => format!("${}", n),
+        Some(t) => dialect.cast_expr(&ph, t),
+        None => ph,
     }
 }
 
@@ -195,8 +203,9 @@ fn build_leaf_sql(
     values: &[String],
     q: &mut QueryBuf,
     field_label: &str,
+    dialect: &dyn Dialect,
 ) -> Result<String, AppError> {
-    let category = pg::type_category_from_cast(pg_type.unwrap_or("text"));
+    let category = type_category_from_cast(pg_type.unwrap_or("text"));
     if !op_valid_for_category(op, category) {
         return Err(AppError::Validation(format!(
             "operator {} is not valid for {:?} field '{}' (type: {})",
@@ -223,7 +232,7 @@ fn build_leaf_sql(
         RsqlOp::Eq | RsqlOp::Neq | RsqlOp::Gt | RsqlOp::Ge | RsqlOp::Lt | RsqlOp::Le => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(v));
-            let ph = make_placeholder(n, cast);
+            let ph = make_placeholder(n as usize, cast, dialect);
             let cmp = match op {
                 RsqlOp::Eq => "=",
                 RsqlOp::Neq => "!=",
@@ -238,27 +247,43 @@ fn build_leaf_sql(
         RsqlOp::Like => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(v));
-            Ok(format!("{} LIKE ${}", qcol, n))
+            Ok(format!("{} LIKE {}", qcol, dialect.placeholder(n as usize)))
         }
         RsqlOp::Ilike => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(v));
-            Ok(format!("{} ILIKE ${}", qcol, n))
+            Ok(format!(
+                "{} ILIKE {}",
+                qcol,
+                dialect.placeholder(n as usize)
+            ))
         }
         RsqlOp::Contains => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("%{}%", v)));
-            Ok(format!("{} ILIKE ${}", qcol, n))
+            Ok(format!(
+                "{} ILIKE {}",
+                qcol,
+                dialect.placeholder(n as usize)
+            ))
         }
         RsqlOp::Starts => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("{}%", v)));
-            Ok(format!("{} ILIKE ${}", qcol, n))
+            Ok(format!(
+                "{} ILIKE {}",
+                qcol,
+                dialect.placeholder(n as usize)
+            ))
         }
         RsqlOp::Ends => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("%{}", v)));
-            Ok(format!("{} ILIKE ${}", qcol, n))
+            Ok(format!(
+                "{} ILIKE {}",
+                qcol,
+                dialect.placeholder(n as usize)
+            ))
         }
         RsqlOp::In => {
             if values.is_empty() {
@@ -271,7 +296,7 @@ fn build_leaf_sql(
                 .iter()
                 .map(|v| {
                     let n = q.push_param(Value::String(v.clone()));
-                    make_placeholder(n, cast)
+                    make_placeholder(n as usize, cast, dialect)
                 })
                 .collect();
             Ok(format!("{} IN ({})", qcol, phs.join(", ")))
@@ -287,7 +312,7 @@ fn build_leaf_sql(
                 .iter()
                 .map(|v| {
                     let n = q.push_param(Value::String(v.clone()));
-                    make_placeholder(n, cast)
+                    make_placeholder(n as usize, cast, dialect)
                 })
                 .collect();
             Ok(format!("{} NOT IN ({})", qcol, phs.join(", ")))
@@ -305,8 +330,8 @@ fn build_leaf_sql(
             Ok(format!(
                 "{} BETWEEN {} AND {}",
                 qcol,
-                make_placeholder(n1, cast),
-                make_placeholder(n2, cast)
+                make_placeholder(n1 as usize, cast, dialect),
+                make_placeholder(n2 as usize, cast, dialect)
             ))
         }
         #[allow(unreachable_patterns)]
@@ -329,6 +354,7 @@ pub fn rsql_to_sql(
     col_qualifier: Option<&str>,
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> Result<String, AppError> {
     match node {
         FilterNode::And(children) => {
@@ -342,6 +368,7 @@ pub fn rsql_to_sql(
                         col_qualifier,
                         filter_includes,
                         schema_override,
+                        dialect,
                     )
                 })
                 .collect();
@@ -358,6 +385,7 @@ pub fn rsql_to_sql(
                         col_qualifier,
                         filter_includes,
                         schema_override,
+                        dialect,
                     )
                 })
                 .collect();
@@ -407,6 +435,7 @@ pub fn rsql_to_sql(
                     values,
                     q,
                     field,
+                    dialect,
                 )?;
 
                 return Ok(format!(
@@ -427,7 +456,15 @@ pub fn rsql_to_sql(
                 None => quoted(field),
             };
 
-            build_leaf_sql(&qcol, col_info.pg_type.as_deref(), op, values, q, field)
+            build_leaf_sql(
+                &qcol,
+                col_info.pg_type.as_deref(),
+                op,
+                values,
+                q,
+                field,
+                dialect,
+            )
         }
     }
 }
@@ -470,13 +507,17 @@ fn build_order_by(
 }
 
 /// SELECT by primary key (single column PK only). Caller adds id as sole param.
-pub fn select_by_id(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
+pub fn select_by_id(
+    entity: &ResolvedEntity,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
     let cols = select_column_list(entity);
-    let ph = pk_placeholder(entity, 1);
+    let ph = pk_placeholder(entity, 1, dialect);
     q.sql = format!(
         "SELECT {} FROM {} WHERE {} = {}",
         cols,
@@ -500,6 +541,7 @@ pub fn select_list_with_includes(
     includes: &[IncludeSelect<'_>],
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -530,7 +572,6 @@ pub fn select_list_with_includes(
     for inc in includes {
         let rel_schema = resolve_schema(inc.related, schema_override);
         let rel_table = qualified_table(rel_schema, &inc.related.table_name);
-        let rel_cols = select_column_list(inc.related);
         let sub_from = format!(
             "{} WHERE {} = {}.{}",
             rel_table,
@@ -538,15 +579,15 @@ pub fn select_list_with_includes(
             MAIN_ALIAS,
             quoted(inc.our_key)
         );
+        let rel_col_exprs: Vec<String> = inc
+            .related
+            .columns
+            .iter()
+            .map(|c| dialect.quote_ident(&c.name))
+            .collect();
         let subquery = match inc.direction {
-            IncludeDirection::ToOne => format!(
-                "(SELECT row_to_json(sub) FROM (SELECT {} FROM {}) sub)",
-                rel_cols, sub_from
-            ),
-            IncludeDirection::ToMany => format!(
-                "(SELECT COALESCE(json_agg(row_to_json(sub)), '[]'::json) FROM (SELECT {} FROM {}) sub)",
-                rel_cols, sub_from
-            ),
+            IncludeDirection::ToOne => dialect.to_one_subquery(&rel_col_exprs, &sub_from),
+            IncludeDirection::ToMany => dialect.to_many_subquery(&rel_col_exprs, &sub_from),
         };
         select_parts.push(format!("{} AS {}", subquery, quoted(inc.name)));
     }
@@ -560,6 +601,7 @@ pub fn select_list_with_includes(
                 Some(&main_qualifier),
                 filter_includes,
                 schema_override,
+                dialect,
             )?;
             format!(" WHERE {}", frag)
         }
@@ -588,6 +630,7 @@ pub fn select_list_with_includes(
 /// `filter_includes` is needed when the filter contains dotted-field conditions
 /// (e.g. `transport_unit.bay=contains=bay23`) that generate EXISTS subqueries.
 /// Pass an empty slice when there are no such filters.
+#[allow(clippy::too_many_arguments)]
 pub fn select_list(
     entity: &ResolvedEntity,
     filter: Option<&FilterNode>,
@@ -596,6 +639,7 @@ pub fn select_list(
     offset: Option<u32>,
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -603,7 +647,15 @@ pub fn select_list(
 
     let where_clause = match filter {
         Some(node) => {
-            let frag = rsql_to_sql(node, entity, &mut q, None, filter_includes, schema_override)?;
+            let frag = rsql_to_sql(
+                node,
+                entity,
+                &mut q,
+                None,
+                filter_includes,
+                schema_override,
+                dialect,
+            )?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
@@ -627,6 +679,7 @@ pub fn select_by_column_in(
     column_name: &str,
     values: &[Value],
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -646,8 +699,8 @@ pub fn select_by_column_in(
                 .iter()
                 .find(|c| c.name == column_name)
                 .and_then(|c| c.pg_type.as_deref())
-                .map(|t| format!("${}::{}", n, t))
-                .unwrap_or_else(|| format!("${}", n))
+                .map(|t| dialect.cast_expr(&dialect.placeholder(n as usize), t))
+                .unwrap_or_else(|| dialect.placeholder(n as usize))
         })
         .collect();
     let cols = select_column_list(entity);
@@ -673,6 +726,7 @@ pub fn insert(
     schema_override: Option<&str>,
     rls_tenant_id: Option<&str>,
     caller_user_id: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -708,23 +762,29 @@ pub fn insert(
         let ph = c
             .pg_type
             .as_deref()
-            .map(|t| format!("${}::{}", param_num, t))
-            .unwrap_or_else(|| format!("${}", param_num));
+            .map(|t| dialect.cast_expr(&dialect.placeholder(param_num as usize), t))
+            .unwrap_or_else(|| dialect.placeholder(param_num as usize));
         cols.push(quoted(name));
         placeholders.push(ph);
     }
     if let Some(tid) = rls_tenant_id {
         let param_num = q.push_param(Value::String(tid.to_string()));
         cols.push(quoted("tenant_id"));
-        placeholders.push(format!("${}", param_num));
+        placeholders.push(dialect.placeholder(param_num as usize));
     }
-    let returning = select_column_list(entity);
+    let col_list = select_column_list(entity);
+    let ret = dialect.returning_clause(&col_list);
+    let suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", ret)
+    };
     q.sql = format!(
-        "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
+        "INSERT INTO {} ({}) VALUES ({}){}",
         table,
         cols.join(", "),
         placeholders.join(", "),
-        returning
+        suffix
     );
     q
 }
@@ -737,6 +797,7 @@ pub fn update(
     body: &HashMap<String, Value>,
     schema_override: Option<&str>,
     caller_user_id: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -767,20 +828,24 @@ pub fn update(
         let rhs = c
             .pg_type
             .as_deref()
-            .map(|t| format!("${}::{}", param_num, t))
-            .unwrap_or_else(|| format!("${}", param_num));
+            .map(|t| dialect.cast_expr(&dialect.placeholder(param_num as usize), t))
+            .unwrap_or_else(|| dialect.placeholder(param_num as usize));
         sets.push(format!("{} = {}", quoted(k), rhs));
     }
-    sets.push(format!("{} = NOW()", quoted("updated_at")));
+    sets.push(format!("{} = {}", quoted("updated_at"), dialect.now_fn()));
     if let Some(uid) = caller_user_id {
         if entity.columns.iter().any(|c| c.name == "updated_by") {
             let param_num = q.push_param(Value::String(uid.to_string()));
-            sets.push(format!("{} = ${}", quoted("updated_by"), param_num));
+            sets.push(format!(
+                "{} = {}",
+                quoted("updated_by"),
+                dialect.placeholder(param_num as usize)
+            ));
         }
     }
     if sets.is_empty() {
         let cols = select_column_list(entity);
-        let ph = pk_placeholder(entity, 1);
+        let ph = pk_placeholder(entity, 1, dialect);
         q.sql = format!(
             "SELECT {} FROM {} WHERE {} = {}",
             cols,
@@ -794,34 +859,50 @@ pub fn update(
     let set_clause = sets.join(", ");
     let id_param = q.params.len() + 1;
     q.params.push(id.clone());
-    let ph = pk_placeholder(entity, id_param as u32);
-    let returning = select_column_list(entity);
+    let ph = pk_placeholder(entity, id_param, dialect);
+    let col_list = select_column_list(entity);
+    let ret = dialect.returning_clause(&col_list);
+    let suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", ret)
+    };
     q.sql = format!(
-        "UPDATE {} SET {} WHERE {} = {} RETURNING {}",
+        "UPDATE {} SET {} WHERE {} = {}{}",
         table,
         set_clause,
         quoted(pk),
         ph,
-        returning
+        suffix
     );
     q
 }
 
 /// DELETE by id.
-pub fn delete(entity: &ResolvedEntity, schema_override: Option<&str>) -> QueryBuf {
+pub fn delete(
+    entity: &ResolvedEntity,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let returning = select_column_list(entity);
-    let ph = pk_placeholder(entity, 1);
+    let ph = pk_placeholder(entity, 1, dialect);
     q.params.push(Value::Null);
+    let col_list = select_column_list(entity);
+    let ret = dialect.returning_clause(&col_list);
+    let suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", ret)
+    };
     q.sql = format!(
-        "DELETE FROM {} WHERE {} = {} RETURNING {}",
+        "DELETE FROM {} WHERE {} = {}{}",
         table,
         quoted(pk),
         ph,
-        returning
+        suffix
     );
     q
 }
@@ -832,22 +913,29 @@ pub fn unarchive(
     entity: &ResolvedEntity,
     archive_field: &str,
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let returning = select_column_list(entity);
-    let ph = pk_placeholder(entity, 1);
+    let ph = pk_placeholder(entity, 1, dialect);
     q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    let col_list = select_column_list(entity);
+    let ret = dialect.returning_clause(&col_list);
+    let suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", ret)
+    };
     q.sql = format!(
-        "UPDATE {} SET {} = NULL WHERE {} = {} AND {} IS NOT NULL RETURNING {}",
+        "UPDATE {} SET {} = NULL WHERE {} = {} AND {} IS NOT NULL{}",
         table,
         quoted(archive_field),
         quoted(pk),
         ph,
         quoted(archive_field),
-        returning
+        suffix
     );
     q
 }
@@ -858,22 +946,30 @@ pub fn archive(
     entity: &ResolvedEntity,
     archive_field: &str,
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
 ) -> QueryBuf {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let returning = select_column_list(entity);
-    let ph = pk_placeholder(entity, 1);
+    let ph = pk_placeholder(entity, 1, dialect);
     q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    let col_list = select_column_list(entity);
+    let ret = dialect.returning_clause(&col_list);
+    let suffix = if ret.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", ret)
+    };
     q.sql = format!(
-        "UPDATE {} SET {} = NOW() WHERE {} = {} AND {} IS NULL RETURNING {}",
+        "UPDATE {} SET {} = {} WHERE {} = {} AND {} IS NULL{}",
         table,
         quoted(archive_field),
+        dialect.now_fn(),
         quoted(pk),
         ph,
         quoted(archive_field),
-        returning
+        suffix
     );
     q
 }

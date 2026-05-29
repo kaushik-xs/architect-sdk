@@ -4,8 +4,8 @@
 //! Or from this directory: `cargo run`
 
 use architect_sdk::{
-    common_routes_with_ready, ensure_database_exists, ensure_sys_tables, load_from_pool,
-    load_registry_from_pool, resolve, AppState, DEFAULT_PACKAGE_ID,
+    common_routes_with_ready, create_pool, ensure_database_exists, ensure_sys_tables,
+    load_from_pool, load_registry_from_pool, resolve, AppState, DEFAULT_PACKAGE_ID,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -21,14 +21,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/architect".into());
-    ensure_database_exists(&database_url).await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://architect.db".into());
 
-    ensure_sys_tables(&pool).await?;
+    ensure_database_exists(&database_url).await?;
+
+    // create_pool picks the right pool type for the compiled-in dialect automatically.
+    let pool = create_pool(&database_url, 5).await?;
+
+    let dialect = architect_sdk::db::active_dialect();
+    ensure_sys_tables(&pool, dialect.as_ref()).await?;
     let _registry = load_registry_from_pool(&pool).await?;
     let config = load_from_pool(&pool, DEFAULT_PACKAGE_ID).await?;
     let model = resolve(&config)?;
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage: None,
         event_client: architect_sdk::events::DecisionHubClient::from_env(),
         authrs_client: architect_sdk::authrs::AuthrsClient::from_env(),
+        dialect,
     };
 
     let app = common_routes_with_ready(state);

@@ -1,6 +1,8 @@
 //! Config ingestion handlers: POST/GET for each config type. X-Tenant-ID is required.
 
 use crate::config::{load_from_pool, resolve};
+use crate::db::pool::Pool;
+use crate::db::Dialect;
 use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::migration::apply_migrations;
@@ -11,7 +13,6 @@ use crate::store::{
 use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
-use sqlx::PgPool;
 
 fn require_tenant(state: &AppState, tenant_id_opt: &Option<String>) -> Result<(), AppError> {
     let tenant_id = tenant_id_opt
@@ -29,11 +30,12 @@ fn require_tenant(state: &AppState, tenant_id_opt: &Option<String>) -> Result<()
 /// When run_migrations is true and num_rows_written > 0, loads full config for that package and runs migrations.
 /// When run_migrations is false (e.g. package install), only writes to _sys_*; caller must run migrations once after all kinds are applied.
 pub(crate) async fn replace_config(
-    pool: &PgPool,
+    pool: &Pool,
     kind: &str,
     body: Vec<Value>,
     run_migrations: bool,
     package_id: &str,
+    dialect: Option<&dyn Dialect>,
 ) -> Result<(Vec<Value>, u64), AppError> {
     let table = sys_table_for_kind(kind)
         .ok_or_else(|| AppError::BadRequest(format!("unknown config kind: {}", kind)))?;
@@ -44,7 +46,7 @@ pub(crate) async fn replace_config(
         let config = load_from_pool(pool, package_id)
             .await
             .map_err(AppError::Config)?;
-        apply_migrations(pool, &config, None, None).await?;
+        apply_migrations(pool, &config, None, None, dialect.unwrap()).await?;
     }
     Ok((body, count))
 }
@@ -66,7 +68,7 @@ pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
 }
 
 pub(crate) async fn get_config(
-    pool: &PgPool,
+    pool: &Pool,
     kind: &str,
     package_id: &str,
 ) -> Result<Vec<Value>, AppError> {
@@ -93,8 +95,38 @@ macro_rules! config_handler {
             Json(body): Json<Vec<Value>>,
         ) -> Result<impl axum::response::IntoResponse, AppError> {
             require_tenant(&state, &tenant_id_opt)?;
-            let (out, num_written) =
-                replace_config(&state.pool, $kind, body, true, DEFAULT_PACKAGE_ID).await?;
+            // When columns are posted directly, reject asset/asset[] types if no storage.
+            if $kind == "columns" && state.storage.is_none() {
+                use crate::config::types::ColumnConfig;
+                use crate::db::{parse_canonical, CanonicalType};
+                let asset_cols: Vec<String> = body
+                    .iter()
+                    .filter_map(|v| serde_json::from_value::<ColumnConfig>(v.clone()).ok())
+                    .filter(|c| {
+                        matches!(
+                            parse_canonical(&c.type_),
+                            CanonicalType::Asset | CanonicalType::AssetArray
+                        )
+                    })
+                    .map(|c| c.name)
+                    .collect();
+                if !asset_cols.is_empty() {
+                    return Err(AppError::BadRequest(format!(
+                        "Column(s) [{}] use asset type but no storage provider is configured. \
+                         Set STORAGE_PROVIDER (s3 | azure | gcs | rustfs) before defining asset columns.",
+                        asset_cols.join(", ")
+                    )));
+                }
+            }
+            let (out, num_written) = replace_config(
+                &state.pool,
+                $kind,
+                body,
+                true,
+                DEFAULT_PACKAGE_ID,
+                Some(state.dialect.as_ref()),
+            )
+            .await?;
             if num_written > 0 {
                 reload_model(&state).await?;
             }

@@ -1,9 +1,13 @@
 //! PostgreSQL dialect: maps canonical types to DDL strings, SQL cast names, and type categories.
 //!
-//! All functions are free functions (no vtable, no allocation overhead) that the compiler
-//! inlines at call sites — zero runtime cost compared with writing Postgres strings directly.
+//! Free functions are kept for zero-overhead internal use. `PostgresDialect` implements the
+//! `Dialect` trait for use via `Arc<dyn Dialect>` in AppState.
 
+use super::dialect::Dialect;
 use super::types::{CanonicalType, TypeCategory, TypeSupport};
+
+/// Zero-sized marker for the PostgreSQL dialect.
+pub struct PostgresDialect;
 
 // ─── DDL type ────────────────────────────────────────────────────────────────
 
@@ -116,65 +120,120 @@ pub fn type_support(t: &CanonicalType) -> TypeSupport {
 
 // ─── Type category ────────────────────────────────────────────────────────────
 
-/// Classify a canonical type into a broad [`TypeCategory`] used by the RSQL query builder
-/// to validate which filter operators are legal for each column.
+/// Delegates to the shared impl in [`super::types`].
 pub fn type_category(t: &CanonicalType) -> TypeCategory {
-    match t {
-        CanonicalType::Text
-        | CanonicalType::Varchar(_)
-        | CanonicalType::Char(_)
-        | CanonicalType::Asset => TypeCategory::Text,
-
-        CanonicalType::SmallInt
-        | CanonicalType::Int
-        | CanonicalType::BigInt
-        | CanonicalType::Serial
-        | CanonicalType::BigSerial => TypeCategory::Int,
-
-        CanonicalType::Real | CanonicalType::Double | CanonicalType::Decimal(_) => {
-            TypeCategory::Float
-        }
-
-        CanonicalType::Boolean => TypeCategory::Bool,
-        CanonicalType::Uuid => TypeCategory::Uuid,
-        CanonicalType::Date => TypeCategory::Date,
-        CanonicalType::Timestamp | CanonicalType::TimestampNtz => TypeCategory::Timestamp,
-        CanonicalType::Time | CanonicalType::Timetz => TypeCategory::Time,
-        CanonicalType::Json | CanonicalType::Jsonb | CanonicalType::AssetArray => {
-            TypeCategory::Json
-        }
-        CanonicalType::Bytes => TypeCategory::Bytes,
-        CanonicalType::Array(_) | CanonicalType::Custom(_) => TypeCategory::Other,
-    }
+    super::types::type_category(t)
 }
 
-/// Classify a Postgres cast-name string (as stored in `ColumnInfo.pg_type`) into a
-/// [`TypeCategory`]. Used as a fallback when only the cast name is available (e.g. for
-/// synthetic audit columns whose `CanonicalType` is not stored).
+/// Delegates to the shared impl in [`super::types`].
 pub fn type_category_from_cast(cast: &str) -> TypeCategory {
-    let base = cast
-        .trim_end_matches("[]")
-        .split('(')
-        .next()
-        .unwrap_or(cast)
-        .trim()
-        .to_lowercase();
-    match base.as_str() {
-        "text" | "varchar" | "char" | "bpchar" | "citext" | "name" | "character varying"
-        | "character" => TypeCategory::Text,
-        "int2" | "int4" | "int8" | "integer" | "bigint" | "smallint" | "serial" | "bigserial"
-        | "smallserial" => TypeCategory::Int,
-        "float4" | "float8" | "numeric" | "decimal" | "real" | "money" | "double precision" => {
-            TypeCategory::Float
-        }
-        "bool" | "boolean" => TypeCategory::Bool,
-        "uuid" => TypeCategory::Uuid,
-        "date" => TypeCategory::Date,
-        "timestamp" | "timestamptz" | "timestamp with time zone"
-        | "timestamp without time zone" => TypeCategory::Timestamp,
-        "time" | "timetz" | "time with time zone" | "time without time zone" => TypeCategory::Time,
-        "json" | "jsonb" => TypeCategory::Json,
-        "bytea" => TypeCategory::Bytes,
-        _ => TypeCategory::Other,
+    super::types::type_category_from_cast(cast)
+}
+
+// ─── Dialect impl ─────────────────────────────────────────────────────────────
+
+impl Dialect for PostgresDialect {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn ddl_type(&self, t: &CanonicalType) -> String {
+        ddl_type(t)
+    }
+
+    fn cast_name(&self, t: &CanonicalType) -> Option<String> {
+        cast_name(t)
+    }
+
+    fn type_category(&self, t: &CanonicalType) -> TypeCategory {
+        type_category(t)
+    }
+
+    fn type_support(&self, t: &CanonicalType) -> TypeSupport {
+        type_support(t)
+    }
+
+    fn quote_ident(&self, s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
+    fn placeholder(&self, n: usize) -> String {
+        format!("${}", n)
+    }
+
+    fn cast_expr(&self, placeholder: &str, cast: &str) -> String {
+        format!("{}::{}", placeholder, cast)
+    }
+
+    fn now_fn(&self) -> &'static str {
+        "NOW()"
+    }
+
+    fn uuid_default_expr(&self) -> &'static str {
+        "gen_random_uuid()"
+    }
+
+    fn returning_clause(&self, cols: &str) -> String {
+        format!("RETURNING {}", cols)
+    }
+
+    fn upsert_conflict(&self, conflict_cols: &[&str], set_pairs: &str) -> String {
+        let cols = conflict_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("ON CONFLICT ({}) DO UPDATE SET {}", cols, set_pairs)
+    }
+
+    fn to_one_subquery(&self, col_exprs: &[String], from_clause: &str) -> String {
+        let cols = col_exprs.join(", ");
+        format!(
+            "(SELECT row_to_json(sub) FROM (SELECT {} FROM {}) sub)",
+            cols, from_clause
+        )
+    }
+
+    fn to_many_subquery(&self, col_exprs: &[String], from_clause: &str) -> String {
+        let cols = col_exprs.join(", ");
+        format!(
+            "(SELECT COALESCE(json_agg(row_to_json(sub)), '[]'::json) FROM (SELECT {} FROM {}) sub)",
+            cols, from_clause
+        )
+    }
+
+    fn sys_json_type(&self) -> &'static str {
+        "JSONB"
+    }
+
+    fn sys_timestamp_type(&self) -> &'static str {
+        "TIMESTAMPTZ"
+    }
+
+    fn sys_bigserial_type(&self) -> &'static str {
+        "BIGSERIAL"
+    }
+
+    fn audit_timestamp_type(&self) -> &'static str {
+        "TIMESTAMPTZ"
+    }
+
+    fn supports_rls(&self) -> bool {
+        true
+    }
+
+    fn supports_named_enum_types(&self) -> bool {
+        true
+    }
+
+    fn supports_index_include(&self) -> bool {
+        true
+    }
+
+    fn set_tenant_session_sql(&self, tenant_id: &str) -> Option<String> {
+        Some(format!(
+            "SET LOCAL app.tenant_id = '{}'",
+            tenant_id.replace('\'', "''")
+        ))
     }
 }
