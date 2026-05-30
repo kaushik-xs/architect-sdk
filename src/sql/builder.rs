@@ -1194,6 +1194,7 @@ mod versioning_tests {
             audit_log: false,
             parent_ref_column: None,
             versioning: None,
+            mcp: None,
         }
     }
 

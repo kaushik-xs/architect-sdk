@@ -108,6 +108,7 @@ fn notes_config() -> FullConfig {
             archive_field: None,
             events: vec![],
             parent_ref_column: None,
+            mcp: None,
         }],
         kv_stores: vec![],
     }
@@ -192,6 +193,7 @@ fn users_config() -> FullConfig {
             archive_field: None,
             events: vec![],
             parent_ref_column: None,
+            mcp: None,
         }],
         kv_stores: vec![],
     }

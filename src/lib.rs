@@ -14,6 +14,9 @@
 //!
 //! See the [repository](https://github.com/kaushik-xs/architect-sdk) for full examples.
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub mod authrs;
 pub mod case;
 pub mod config;

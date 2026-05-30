@@ -176,6 +176,7 @@ mod tests {
             archive_field: None,
             events: vec![],
             parent_ref_column: None,
+            mcp: None,
         }
     }
 

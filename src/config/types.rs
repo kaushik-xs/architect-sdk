@@ -272,6 +272,26 @@ pub struct EntityEventTrigger {
     pub condition: Option<EventCondition>,
 }
 
+/// Configuration for exposing a selected API entity as an MCP tool.
+/// Only takes effect when the `mcp` feature is enabled.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpEntityConfig {
+    /// Opt-in to MCP exposure. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Subset of the entity's REST operations to expose as MCP tools.
+    /// Defaults to all operations on the entity when omitted.
+    /// Valid values: "list", "read", "create", "update", "delete".
+    #[serde(default)]
+    pub operations: Vec<String>,
+    /// Prefix for generated tool names. Defaults to `path_segment`.
+    #[serde(default)]
+    pub tool_prefix: Option<String>,
+    /// Human-readable description injected into each tool's MCP description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiEntityConfig {
     pub entity_id: String,
@@ -294,6 +314,9 @@ pub struct ApiEntityConfig {
     /// `parent_id` in a second pass after all rows are inserted.
     #[serde(default)]
     pub parent_ref_column: Option<String>,
+    /// MCP tool exposure config. Only effective when the `mcp` feature is enabled.
+    #[serde(default)]
+    pub mcp: Option<McpEntityConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -87,7 +87,13 @@ mod pg_impl {
 
     impl sqlx::Type<Postgres> for BindValue {
         fn type_info() -> PgTypeInfo {
-            PgTypeInfo::with_name("TEXT")
+            // OID 705 = pg_catalog.unknown — lets PostgreSQL infer the type from
+            // the column/expression context, avoiding "text vs integer" cast errors.
+            PgTypeInfo::with_name("unknown")
+        }
+
+        fn compatible(_ty: &PgTypeInfo) -> bool {
+            true
         }
     }
 }

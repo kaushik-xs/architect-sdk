@@ -154,6 +154,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             audit_log: table.audit_log,
             parent_ref_column: api.parent_ref_column.clone(),
             versioning: table.versioning.clone(),
+            mcp: api.mcp.clone(),
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);
@@ -184,6 +185,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 audit_log: false,
                 parent_ref_column: None,
                 versioning: None,
+                mcp: None,
             };
             audit_entity
         })

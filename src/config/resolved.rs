@@ -1,6 +1,8 @@
 //! Resolved entity model: config validated and flattened for runtime use.
 
-use crate::config::types::{AssetColumnConfig, EntityEventTrigger, VersioningConfig};
+use crate::config::types::{
+    AssetColumnConfig, EntityEventTrigger, McpEntityConfig, VersioningConfig,
+};
 use crate::config::ValidationRule;
 use std::collections::{HashMap, HashSet};
 
@@ -78,6 +80,8 @@ pub struct ResolvedEntity {
     pub parent_ref_column: Option<String>,
     /// Row-level versioning config, carried from TableConfig.
     pub versioning: Option<VersioningConfig>,
+    /// MCP exposure config, carried from ApiEntityConfig. None when not set.
+    pub mcp: Option<McpEntityConfig>,
 }
 
 #[derive(Clone, Debug)]
