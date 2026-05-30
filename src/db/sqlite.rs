@@ -80,7 +80,9 @@ impl Dialect for SqliteDialect {
     }
 
     fn now_fn(&self) -> &'static str {
-        "datetime('now')"
+        // CURRENT_TIMESTAMP works as both a DDL column DEFAULT and inside DML expressions.
+        // datetime('now') is a function call and is rejected by SQLite as a DEFAULT value.
+        "CURRENT_TIMESTAMP"
     }
 
     fn uuid_default_expr(&self) -> &'static str {
@@ -142,6 +144,15 @@ impl Dialect for SqliteDialect {
 
     fn audit_timestamp_type(&self) -> &'static str {
         "TEXT"
+    }
+
+    fn supports_schemas(&self) -> bool {
+        false
+    }
+
+    fn default_now_plus_hours(&self, _hours: u32) -> Option<String> {
+        // SQLite has no constant-expression interval arithmetic; caller makes the column nullable.
+        None
     }
 
     fn supports_rls(&self) -> bool {

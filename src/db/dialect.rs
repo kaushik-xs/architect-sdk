@@ -97,6 +97,19 @@ pub trait Dialect: Send + Sync + 'static {
 
     // ── Multi-tenancy ─────────────────────────────────────────────────────────
 
+    /// Whether this dialect supports `CREATE SCHEMA` DDL.
+    /// Postgres: true. MySQL: false (uses databases). SQLite: false (no user-defined schemas).
+    fn supports_schemas(&self) -> bool {
+        true
+    }
+
+    /// DDL fragment for a column that holds a timestamp defaulting to N hours from now.
+    /// Returns `None` when the dialect has no constant-expression equivalent (SQLite).
+    /// Callers should make the column nullable and omit the DEFAULT when `None` is returned.
+    fn default_now_plus_hours(&self, hours: u32) -> Option<String> {
+        Some(format!("NOW() + INTERVAL '{} hours'", hours))
+    }
+
     /// Whether this dialect natively supports row-level security (CREATE POLICY etc.).
     fn supports_rls(&self) -> bool;
 

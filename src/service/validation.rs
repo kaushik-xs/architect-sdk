@@ -148,6 +148,240 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ValidationRule;
+    use serde_json::json;
+
+    fn rule(f: impl FnOnce(&mut ValidationRule)) -> ValidationRule {
+        let mut r = ValidationRule::default();
+        f(&mut r);
+        r
+    }
+
+    fn body(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn rules_map(pairs: &[(&str, ValidationRule)]) -> HashMap<String, ValidationRule> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    // --- required ---
+
+    #[test]
+    fn required_field_present_passes() {
+        let rules = rules_map(&[("name", rule(|r| r.required = Some(true)))]);
+        let b = body(&[("name", json!("Alice"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn required_field_missing_fails() {
+        let rules = rules_map(&[("name", rule(|r| r.required = Some(true)))]);
+        let b = body(&[]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    #[test]
+    fn required_field_null_fails() {
+        let rules = rules_map(&[("name", rule(|r| r.required = Some(true)))]);
+        let b = body(&[("name", json!(null))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    #[test]
+    fn optional_field_absent_passes() {
+        let rules = rules_map(&[("bio", rule(|_| {}))]);
+        let b = body(&[]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    // --- partial validation ---
+
+    #[test]
+    fn partial_skips_missing_required() {
+        let rules = rules_map(&[("name", rule(|r| r.required = Some(true)))]);
+        let b = body(&[]); // name absent — OK for PATCH
+        assert!(RequestValidator::validate_partial(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn partial_validates_present_field() {
+        let rules = rules_map(&[("email", rule(|r| r.format = Some("email".into())))]);
+        let b = body(&[("email", json!("not-an-email"))]);
+        assert!(RequestValidator::validate_partial(&b, &rules).is_err());
+    }
+
+    // --- format: email ---
+
+    #[test]
+    fn email_valid() {
+        let rules = rules_map(&[("email", rule(|r| r.format = Some("email".into())))]);
+        let b = body(&[("email", json!("user@example.com"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn email_invalid_no_at() {
+        let rules = rules_map(&[("email", rule(|r| r.format = Some("email".into())))]);
+        let b = body(&[("email", json!("notanemail"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- format: uuid ---
+
+    #[test]
+    fn uuid_valid() {
+        let rules = rules_map(&[("id", rule(|r| r.format = Some("uuid".into())))]);
+        let b = body(&[("id", json!("550e8400-e29b-41d4-a716-446655440000"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn uuid_invalid() {
+        let rules = rules_map(&[("id", rule(|r| r.format = Some("uuid".into())))]);
+        let b = body(&[("id", json!("not-a-uuid"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- max_length / min_length ---
+
+    #[test]
+    fn max_length_pass() {
+        let rules = rules_map(&[("bio", rule(|r| r.max_length = Some(10)))]);
+        let b = body(&[("bio", json!("hello"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn max_length_fail() {
+        let rules = rules_map(&[("bio", rule(|r| r.max_length = Some(3)))]);
+        let b = body(&[("bio", json!("toolong"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    #[test]
+    fn min_length_pass() {
+        let rules = rules_map(&[("code", rule(|r| r.min_length = Some(3)))]);
+        let b = body(&[("code", json!("abc"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn min_length_fail() {
+        let rules = rules_map(&[("code", rule(|r| r.min_length = Some(5)))]);
+        let b = body(&[("code", json!("hi"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- pattern ---
+
+    #[test]
+    fn pattern_match_passes() {
+        let rules = rules_map(&[("zip", rule(|r| r.pattern = Some(r"^\d{5}$".into())))]);
+        let b = body(&[("zip", json!("12345"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn pattern_no_match_fails() {
+        let rules = rules_map(&[("zip", rule(|r| r.pattern = Some(r"^\d{5}$".into())))]);
+        let b = body(&[("zip", json!("abc"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- allowed ---
+
+    #[test]
+    fn allowed_values_pass() {
+        let rules = rules_map(&[(
+            "status",
+            rule(|r| r.allowed = Some(vec![json!("active"), json!("inactive")])),
+        )]);
+        let b = body(&[("status", json!("active"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn allowed_values_fail() {
+        let rules = rules_map(&[(
+            "status",
+            rule(|r| r.allowed = Some(vec![json!("active"), json!("inactive")])),
+        )]);
+        let b = body(&[("status", json!("pending"))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- minimum / maximum ---
+
+    #[test]
+    fn minimum_passes() {
+        let rules = rules_map(&[("age", rule(|r| r.minimum = Some(0.0)))]);
+        let b = body(&[("age", json!(5))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn minimum_fails() {
+        let rules = rules_map(&[("age", rule(|r| r.minimum = Some(18.0)))]);
+        let b = body(&[("age", json!(10))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    #[test]
+    fn maximum_passes() {
+        let rules = rules_map(&[("score", rule(|r| r.maximum = Some(100.0)))]);
+        let b = body(&[("score", json!(99))]);
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    #[test]
+    fn maximum_fails() {
+        let rules = rules_map(&[("score", rule(|r| r.maximum = Some(100.0)))]);
+        let b = body(&[("score", json!(101))]);
+        assert!(RequestValidator::validate(&b, &rules).is_err());
+    }
+
+    // --- null value skips field-level checks ---
+
+    #[test]
+    fn null_value_skips_format_check() {
+        let rules = rules_map(&[("email", rule(|r| r.format = Some("email".into())))]);
+        let b = body(&[("email", json!(null))]);
+        // null is not required, and null skips format validation
+        assert!(RequestValidator::validate(&b, &rules).is_ok());
+    }
+
+    // --- validate_collecting ---
+
+    #[test]
+    fn collecting_returns_all_errors() {
+        let rules = rules_map(&[
+            ("name", rule(|r| r.required = Some(true))),
+            ("email", rule(|r| r.required = Some(true))),
+        ]);
+        let b = body(&[]);
+        let errors = RequestValidator::validate_collecting(&b, &rules);
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn collecting_returns_empty_on_success() {
+        let rules = rules_map(&[("name", rule(|r| r.required = Some(true)))]);
+        let b = body(&[("name", json!("Alice"))]);
+        let errors = RequestValidator::validate_collecting(&b, &rules);
+        assert!(errors.is_empty());
+    }
+}
+
 fn validate_format(col: &str, v: &Value, format: &str) -> Result<(), AppError> {
     match format.to_lowercase().as_str() {
         "email" => {
