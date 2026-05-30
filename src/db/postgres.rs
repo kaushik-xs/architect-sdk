@@ -51,12 +51,25 @@ pub fn ddl_type(t: &CanonicalType) -> String {
 // ─── Cast name ───────────────────────────────────────────────────────────────
 
 /// Return the Postgres type name used in `$n::type` parameter casts, or `None` when no cast
-/// is needed (e.g. integers bind directly without a cast).
+/// is needed (i.e. text/varchar/char columns, which match the TEXT OID we use for all params).
+///
+/// Because all `BindValue` parameters are sent with TEXT OID (25), PostgreSQL requires an
+/// explicit SQL cast (`$n::integer`, `$n::bigint`, etc.) for every non-text column type.
+/// Without it, PostgreSQL rejects the query with "expression is of type text" errors.
 ///
 /// This drives `ColumnInfo.pg_type` in the resolved model and is used throughout the query
 /// builder whenever a value needs an explicit type annotation in SQL.
 pub fn cast_name(t: &CanonicalType) -> Option<String> {
     let s = match t {
+        // Numeric types: must be cast since parameters arrive as TEXT.
+        CanonicalType::SmallInt => "smallint",
+        CanonicalType::Int => "integer",
+        CanonicalType::BigInt => "bigint",
+        CanonicalType::Real => "real",
+        CanonicalType::Double => "double precision",
+        CanonicalType::Decimal(_) => "numeric",
+        // Other non-text types that need explicit casts.
+        CanonicalType::Boolean => "boolean",
         CanonicalType::Uuid => "uuid",
         CanonicalType::Json | CanonicalType::Jsonb | CanonicalType::AssetArray => "jsonb",
         CanonicalType::Timestamp => "timestamptz",
@@ -64,11 +77,8 @@ pub fn cast_name(t: &CanonicalType) -> Option<String> {
         CanonicalType::Date => "date",
         CanonicalType::Time => "time",
         CanonicalType::Timetz => "timetz",
-        CanonicalType::Decimal(_) => "numeric",
-        CanonicalType::Boolean => "boolean",
         CanonicalType::Bytes => "bytea",
         // Arrays: cast to the element type followed by [].
-        // Fall back to the DDL type name for inner types that need no scalar cast (e.g. text, int).
         CanonicalType::Array(inner) => {
             let inner_cast = cast_name(inner).unwrap_or_else(|| ddl_type(inner).to_lowercase());
             return Some(format!("{}[]", inner_cast));
@@ -78,7 +88,8 @@ pub fn cast_name(t: &CanonicalType) -> Option<String> {
             return Some(s.clone());
         }
         CanonicalType::Custom(_) => return None,
-        // Text, numeric, serial types bind fine without an explicit cast.
+        // Text-compatible types (TEXT, VARCHAR, CHAR, SERIAL, BIGSERIAL, ASSET) bind fine
+        // as-is because the parameter OID is already TEXT.
         _ => return None,
     };
     Some(s.to_string())
