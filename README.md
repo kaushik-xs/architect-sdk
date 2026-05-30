@@ -94,6 +94,105 @@ Degraded types emit a `tracing::warn` at startup so operators know what feature 
 
 ---
 
+## Testing
+
+Run the unit test suite with:
+
+```bash
+cargo test
+```
+
+No database or network connection required — all tests are in-process.
+
+### Coverage
+
+Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **84 tests** (66 unit + 18 SQLite integration):
+
+```
+TOTAL   lines: 16.35%   functions: 23.21%   regions: 17.40%
+```
+
+Coverage nearly doubled after adding SQLite integration tests (was 8.15% lines / 14.02% functions). The remaining uncovered code is Axum HTTP handlers, OpenAPI generation, package ZIP processing, event publishing, and Authrs — all of which require a full HTTP stack or external services and are exercised through end-to-end testing.
+
+### Unit tests (no DB required)
+
+| File | Lines | Functions | Regions | Tests |
+|---|---|---|---|---|
+| `src/case.rs` | **93.41%** | **92.59%** | **94.90%** | 18 |
+| `src/service/validation.rs` | **95.71%** | **98.41%** | **96.28%** | 24 |
+| `src/config/validator.rs` | **86.00%** | **100.00%** | **83.73%** | 9 |
+| `src/sql/rsql.rs` | **85.49%** | **96.97%** | **87.28%** | 14 |
+
+### SQLite integration tests (in-memory DB, no Postgres needed)
+
+These tests run the full CRUD stack — migrations, SQL builder, `CrudService`, config resolution — against an in-memory SQLite database. They cover code paths that are unreachable from unit tests but do **not** cover Postgres-specific features (JSONB, RLS, named enum types, `INTERVAL` arithmetic).
+
+| File | Lines | Functions | Regions |
+|---|---|---|---|
+| `src/service/crud.rs` | **27.51%** | **42.37%** | **23.46%** |
+| `src/sql/builder.rs` | **32.22%** | **37.29%** | **33.71%** |
+| `src/store.rs` | **24.20%** | **14.29%** | **28.30%** |
+| `src/migration.rs` | **6.35%** | **9.78%** | **7.62%** |
+| `src/config/loader.rs` | **38.85%** | **48.28%** | **45.79%** |
+| `src/db/sqlite.rs` | **27.12%** | **37.04%** | **24.82%** |
+
+To regenerate coverage numbers and update this file automatically (requires `llvm` via Homebrew):
+
+```bash
+cargo install cargo-llvm-cov   # one-time
+brew install llvm              # one-time
+./scripts/update_coverage.sh
+```
+
+Pass `--dry-run` to print what would change without writing.
+
+#### `src/case.rs` — case conversion (18 tests)
+
+- `to_camel_case`: single underscore, multiple underscores, no underscore, leading/trailing underscore, empty string
+- `to_snake_case`: basic, multiple capitals, already snake, leading capital, empty string
+- Round-trip: `snake → camel → snake` produces the original
+- `object_keys_to_camel_case` / `object_keys_to_snake_case`: converts keys, leaves values unchanged
+- `value_keys_to_camel_case_recursive`: nested objects, arrays of objects, scalar no-op
+- `hashmap_keys_to_snake_case`: key conversion, value preservation
+
+#### `src/service/validation.rs` — request validation (24 tests)
+
+- **Required**: present → pass; absent → fail; explicit `null` → fail
+- **Optional**: absent field → pass (no rule triggered)
+- **Partial (PATCH)**: missing required field → pass; present invalid field → fail
+- **format `email`**: valid address passes; missing `@` fails
+- **format `uuid`**: valid RFC 4122 UUID passes; arbitrary string fails
+- **`max_length`** / **`min_length`**: boundary values, over/under
+- **`pattern`**: regex match passes; no match fails
+- **`allowed`**: value in list passes; value outside list fails
+- **`minimum`** / **`maximum`**: at boundary passes; beyond boundary fails
+- **Null passthrough**: `null` value skips all field-level checks (format, length, etc.)
+- **`validate_collecting`**: collects all errors; returns empty vec on success
+
+#### `src/config/validator.rs` — config referential integrity (9 tests)
+
+- Valid minimal config passes without error
+- Empty `schemas` list → `ConfigError::Validation`
+- `api_entity.entity_id` pointing to nonexistent table → `ConfigError::MissingReference`
+- Two `api_entities` sharing the same `path_segment` → `ConfigError::DuplicatePathSegment`
+- Column with `table_id` pointing to nonexistent table → `ConfigError::MissingReference`
+- Table `primary_key` naming a column not present in `columns` → `ConfigError::InvalidPrimaryKey`
+- Table `schema_id` pointing to nonexistent schema → `ConfigError::MissingReference`
+- `default_schema_id`: returns first schema's id; errors on empty config
+
+#### `tests/sqlite_integration.rs` — SQLite integration (18 tests)
+
+Uses `sqlite::memory:` — no external process needed.
+
+- **Migration**: `apply_migrations` creates app tables; `ensure_sys_tables` creates all `_sys_*` tables; both are idempotent
+- **CRUD (integer PK)**: create → read back, list returns all rows, update changes field, delete removes row, read nonexistent returns `None`, list with limit+offset returns correct pages
+- **CRUD (text PK)**: two users created and listed; update nonexistent returns `None`
+- **Sensitive columns**: `sensitive_columns` set is populated correctly on the resolved entity
+- **Config resolution**: `entity_by_path` map built; auto-appended audit timestamp columns; sensitive columns list populated
+- **Validation config**: validation rules (`required`, `max_length`) are wired onto the resolved entity
+
+---
+
 ## Usage
 
 ### 1. Minimal Server
