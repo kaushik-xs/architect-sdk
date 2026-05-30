@@ -39,11 +39,13 @@ pub async fn apply_migrations(
             ))
         })?;
 
-    if let Some(s) = schema_override {
-        let name = quote(s);
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", name))
-            .execute(pool)
-            .await?;
+    if dialect.supports_schemas() {
+        if let Some(s) = schema_override {
+            let name = quote(s);
+            sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", name))
+                .execute(pool)
+                .await?;
+        }
     }
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -55,7 +57,7 @@ pub async fn apply_migrations(
         });
 
     // When schema_override is set, we only create the override schema; otherwise create config schemas.
-    if schema_override.is_none() {
+    if schema_override.is_none() && dialect.supports_schemas() {
         for s in &config.schemas {
             let name = quote(&s.name);
             let comment = s

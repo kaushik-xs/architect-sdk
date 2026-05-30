@@ -21,6 +21,15 @@ TAG="v${NEW_VERSION}"
 
 echo "Bumping ${CURRENT} → ${NEW_VERSION} (${BUMP})"
 
+# Run coverage and update README before touching anything else.
+# Fail the release if tests don't pass.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo ""
+echo "── Running coverage ─────────────────────────────────────────────────────"
+bash "${SCRIPT_DIR}/update_coverage.sh"
+echo "── Coverage done ────────────────────────────────────────────────────────"
+echo ""
+
 # Update version in all Cargo.toml files in the workspace
 sed -i '' "s/^version = \"${CURRENT}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
 if [[ -f example_consumer/Cargo.toml ]]; then
@@ -29,7 +38,7 @@ fi
 
 cargo build --quiet 2>&1 | tail -5
 
-git add -A
+git add Cargo.toml README.md
 [[ -f example_consumer/Cargo.toml ]] && git add example_consumer/Cargo.toml
 git commit -m "chore: bump version to ${NEW_VERSION}"
 

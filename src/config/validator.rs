@@ -110,3 +110,164 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{
+        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, FullConfig, PrimaryKeyConfig,
+        SchemaConfig, TableConfig,
+    };
+
+    fn schema(id: &str) -> SchemaConfig {
+        SchemaConfig {
+            id: id.into(),
+            name: id.into(),
+            comment: None,
+        }
+    }
+
+    fn table(id: &str, schema_id: Option<&str>, pk: &str) -> TableConfig {
+        TableConfig {
+            id: id.into(),
+            schema_id: schema_id.map(Into::into),
+            name: id.into(),
+            comment: None,
+            primary_key: PrimaryKeyConfig::Single(pk.into()),
+            unique: vec![],
+            check: vec![],
+            audit_log: false,
+        }
+    }
+
+    fn column(id: &str, table_id: &str, name: &str) -> ColumnConfig {
+        ColumnConfig {
+            id: id.into(),
+            table_id: table_id.into(),
+            name: name.into(),
+            type_: ColumnTypeConfig::Simple("text".into()),
+            nullable: true,
+            default: None,
+            comment: None,
+            asset: None,
+        }
+    }
+
+    fn api_entity(table_id: &str, path: &str) -> ApiEntityConfig {
+        ApiEntityConfig {
+            entity_id: table_id.into(),
+            path_segment: path.into(),
+            operations: vec!["list".into()],
+            sensitive_columns: vec![],
+            validation: Default::default(),
+            archive_field: None,
+            events: vec![],
+            parent_ref_column: None,
+        }
+    }
+
+    fn minimal_config() -> FullConfig {
+        let mut c = FullConfig::default();
+        c.schemas.push(schema("s1"));
+        c.tables.push(table("t1", None, "id"));
+        c.columns.push(column("c1", "t1", "id"));
+        c.api_entities.push(api_entity("t1", "items"));
+        c
+    }
+
+    // --- happy path ---
+
+    #[test]
+    fn valid_config_passes() {
+        assert!(validate(&minimal_config()).is_ok());
+    }
+
+    // --- empty schemas ---
+
+    #[test]
+    fn no_schemas_fails() {
+        let mut c = minimal_config();
+        c.schemas.clear();
+        assert!(matches!(validate(&c), Err(ConfigError::Validation(_))));
+    }
+
+    // --- missing table for api_entity ---
+
+    #[test]
+    fn api_entity_missing_table_fails() {
+        let mut c = minimal_config();
+        c.api_entities[0].entity_id = "nonexistent".into();
+        assert!(matches!(
+            validate(&c),
+            Err(ConfigError::MissingReference { kind: "table", .. })
+        ));
+    }
+
+    // --- duplicate path segments ---
+
+    #[test]
+    fn duplicate_path_segment_fails() {
+        let mut c = minimal_config();
+        c.tables.push(table("t2", None, "id"));
+        c.columns.push(column("c2", "t2", "id"));
+        c.api_entities.push(api_entity("t2", "items")); // same path as t1
+        assert!(matches!(
+            validate(&c),
+            Err(ConfigError::DuplicatePathSegment(_))
+        ));
+    }
+
+    // --- column references nonexistent table ---
+
+    #[test]
+    fn column_missing_table_fails() {
+        let mut c = minimal_config();
+        c.columns.push(column("c99", "no_such_table", "name"));
+        assert!(matches!(
+            validate(&c),
+            Err(ConfigError::MissingReference { kind: "table", .. })
+        ));
+    }
+
+    // --- primary key column must exist ---
+
+    #[test]
+    fn pk_column_missing_fails() {
+        let mut c = FullConfig::default();
+        c.schemas.push(schema("s1"));
+        c.tables.push(table("t1", None, "id")); // pk="id" but no column "id"
+                                                // Add a column with a *different* name so the table itself passes the column table_id check
+        c.columns.push(column("c1", "t1", "not_id"));
+        c.api_entities.push(api_entity("t1", "items"));
+        assert!(matches!(
+            validate(&c),
+            Err(ConfigError::InvalidPrimaryKey { .. })
+        ));
+    }
+
+    // --- schema reference on table ---
+
+    #[test]
+    fn table_missing_schema_fails() {
+        let mut c = minimal_config();
+        c.tables[0].schema_id = Some("nonexistent_schema".into());
+        assert!(matches!(
+            validate(&c),
+            Err(ConfigError::MissingReference { kind: "schema", .. })
+        ));
+    }
+
+    // --- default_schema_id ---
+
+    #[test]
+    fn default_schema_id_returns_first() {
+        let c = minimal_config();
+        assert_eq!(default_schema_id(&c).unwrap(), "s1");
+    }
+
+    #[test]
+    fn default_schema_id_empty_fails() {
+        let c = FullConfig::default();
+        assert!(default_schema_id(&c).is_err());
+    }
+}

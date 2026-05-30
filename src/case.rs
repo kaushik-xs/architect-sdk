@@ -104,3 +104,152 @@ pub fn hashmap_keys_to_snake_case(map: &HashMap<String, Value>) -> HashMap<Strin
         .map(|(k, v)| (to_snake_case(k), v.clone()))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- to_camel_case ---
+
+    #[test]
+    fn camel_single_underscore() {
+        assert_eq!(to_camel_case("user_id"), "userId");
+    }
+
+    #[test]
+    fn camel_multiple_underscores() {
+        assert_eq!(to_camel_case("created_at_time"), "createdAtTime");
+    }
+
+    #[test]
+    fn camel_no_underscore() {
+        assert_eq!(to_camel_case("name"), "name");
+    }
+
+    #[test]
+    fn camel_leading_underscore() {
+        assert_eq!(to_camel_case("_private"), "Private");
+    }
+
+    #[test]
+    fn camel_empty() {
+        assert_eq!(to_camel_case(""), "");
+    }
+
+    #[test]
+    fn camel_trailing_underscore() {
+        // trailing underscore sets capitalize_next=true but no char follows — no crash
+        assert_eq!(to_camel_case("foo_"), "foo");
+    }
+
+    // --- to_snake_case ---
+
+    #[test]
+    fn snake_simple() {
+        assert_eq!(to_snake_case("userId"), "user_id");
+    }
+
+    #[test]
+    fn snake_multiple_caps() {
+        assert_eq!(to_snake_case("createdAt"), "created_at");
+    }
+
+    #[test]
+    fn snake_already_snake() {
+        assert_eq!(to_snake_case("user_id"), "user_id");
+    }
+
+    #[test]
+    fn snake_leading_cap() {
+        // Leading uppercase: no underscore prepended at index 0
+        assert_eq!(to_snake_case("UserName"), "user_name");
+    }
+
+    #[test]
+    fn snake_empty() {
+        assert_eq!(to_snake_case(""), "");
+    }
+
+    // --- round-trip ---
+
+    #[test]
+    fn round_trip_snake_to_camel_to_snake() {
+        let original = "order_line_item";
+        assert_eq!(to_snake_case(&to_camel_case(original)), original);
+    }
+
+    // --- object_keys_to_camel_case ---
+
+    #[test]
+    fn object_keys_camel_converts_keys() {
+        let mut map = json!({"user_id": 1, "created_at": "2024"})
+            .as_object()
+            .unwrap()
+            .clone();
+        object_keys_to_camel_case(&mut map);
+        assert!(map.contains_key("userId"));
+        assert!(map.contains_key("createdAt"));
+        assert!(!map.contains_key("user_id"));
+    }
+
+    #[test]
+    fn object_keys_snake_converts_keys() {
+        let mut map = json!({"userId": 1, "createdAt": "2024"})
+            .as_object()
+            .unwrap()
+            .clone();
+        object_keys_to_snake_case(&mut map);
+        assert!(map.contains_key("user_id"));
+        assert!(map.contains_key("created_at"));
+        assert!(!map.contains_key("userId"));
+    }
+
+    // --- value_keys_to_camel_case_recursive ---
+
+    #[test]
+    fn recursive_camel_nested_object() {
+        let mut v = json!({
+            "user_id": 1,
+            "address": { "zip_code": "12345" }
+        });
+        value_keys_to_camel_case_recursive(&mut v);
+        assert!(v.get("userId").is_some());
+        assert!(v.get("address").unwrap().get("zipCode").is_some());
+    }
+
+    #[test]
+    fn recursive_camel_array_of_objects() {
+        let mut v = json!([
+            { "first_name": "Alice" },
+            { "first_name": "Bob" }
+        ]);
+        value_keys_to_camel_case_recursive(&mut v);
+        let arr = v.as_array().unwrap();
+        assert!(arr[0].get("firstName").is_some());
+        assert!(arr[1].get("firstName").is_some());
+    }
+
+    #[test]
+    fn recursive_camel_scalar_is_noop() {
+        let mut v = json!(42);
+        value_keys_to_camel_case_recursive(&mut v);
+        assert_eq!(v, json!(42));
+    }
+
+    // --- hashmap_keys_to_snake_case ---
+
+    #[test]
+    fn hashmap_snake_keys() {
+        let map: HashMap<String, Value> = [
+            ("firstName".to_string(), json!("Alice")),
+            ("lastName".to_string(), json!("Smith")),
+        ]
+        .into_iter()
+        .collect();
+        let result = hashmap_keys_to_snake_case(&map);
+        assert!(result.contains_key("first_name"));
+        assert!(result.contains_key("last_name"));
+        assert_eq!(result["first_name"], json!("Alice"));
+    }
+}

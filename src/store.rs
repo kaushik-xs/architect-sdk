@@ -34,9 +34,11 @@ pub const DEFAULT_PACKAGE_ID: &str = "_default";
 /// Config tables have (id, package_id) as composite primary key; _sys_packages has id only.
 pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(), AppError> {
     let schema = architect_schema();
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
-        .execute(pool)
-        .await?;
+    if dialect.supports_schemas() {
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
+            .execute(pool)
+            .await?;
+    }
 
     for table in CONFIG_TABLES {
         let q_table = qualified_sys_table(table);
@@ -221,6 +223,14 @@ pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(),
 /// Create _sys_migration_plans and _sys_migration_audit tables if they don't exist.
 async fn ensure_migration_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(), AppError> {
     let q_plans = qualified_sys_table("_sys_migration_plans");
+    let expires_at_col = match dialect.default_now_plus_hours(24) {
+        Some(expr) => format!(
+            "expires_at {} NOT NULL DEFAULT {}",
+            dialect.sys_timestamp_type(),
+            expr
+        ),
+        None => format!("expires_at {}", dialect.sys_timestamp_type()),
+    };
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS {} (\
             id TEXT PRIMARY KEY, \
@@ -229,18 +239,17 @@ async fn ensure_migration_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(
             from_version TEXT, \
             to_version TEXT NOT NULL, \
             plan_json {} NOT NULL, \
-            zip_bytes BYTEA NOT NULL, \
+            zip_bytes BLOB NOT NULL, \
             status TEXT NOT NULL DEFAULT 'pending', \
             created_at {} NOT NULL DEFAULT {}, \
-            expires_at {} NOT NULL DEFAULT {} + INTERVAL '24 hours', \
+            {}, \
             applied_at {}\
         )",
         q_plans,
         dialect.sys_json_type(),
         dialect.sys_timestamp_type(),
         dialect.now_fn(),
-        dialect.sys_timestamp_type(),
-        dialect.now_fn(),
+        expires_at_col,
         dialect.sys_timestamp_type(),
     ))
     .execute(pool)
