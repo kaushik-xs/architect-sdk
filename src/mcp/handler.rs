@@ -45,10 +45,16 @@ pub struct ArchitectMcpServer {
     state: AppState,
     registry: Arc<ToolRegistry>,
     default_tenant_id: Option<String>,
+    /// Default user ID for authrs permission checks. Sourced from MCP_USER_ID env var.
+    default_user_id: Option<String>,
 }
 
 impl ArchitectMcpServer {
-    pub fn new(state: AppState, default_tenant_id: Option<String>) -> Self {
+    pub fn new(
+        state: AppState,
+        default_tenant_id: Option<String>,
+        default_user_id: Option<String>,
+    ) -> Self {
         let registry = {
             let model = state.model.read().expect("model lock poisoned");
             Arc::new(ToolRegistry::build(&model))
@@ -57,6 +63,7 @@ impl ArchitectMcpServer {
             state,
             registry,
             default_tenant_id,
+            default_user_id,
         }
     }
 }
@@ -100,6 +107,7 @@ impl ServerHandler for ArchitectMcpServer {
         let state = self.state.clone();
         let registry = self.registry.clone();
         let default_tenant = self.default_tenant_id.clone();
+        let default_user = self.default_user_id.clone();
 
         async move {
             let name = request.name.as_ref();
@@ -125,6 +133,14 @@ impl ServerHandler for ArchitectMcpServer {
                     )
                 })?;
 
+            // user_id: per-call arg takes precedence over MCP_USER_ID default.
+            // Optional when authrs is not configured; required when it is (enforced inside check_entity_permission_opt).
+            let user_id = args
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| default_user.clone());
+
             let entity = {
                 let model = state
                     .model
@@ -144,12 +160,20 @@ impl ServerHandler for ArchitectMcpServer {
             debug!(
                 tool = %name,
                 tenant = %tenant_id,
+                user = ?user_id,
                 operation = %spec.operation,
                 "MCP tool call"
             );
 
-            let result =
-                dispatch_operation(&state, &entity, &spec.operation, &tenant_id, &args).await;
+            let result = dispatch_operation(
+                &state,
+                &entity,
+                &spec.operation,
+                &tenant_id,
+                user_id.as_deref(),
+                &args,
+            )
+            .await;
 
             match result {
                 Ok(data) => {
@@ -166,13 +190,35 @@ impl ServerHandler for ArchitectMcpServer {
     }
 }
 
+/// Map an MCP operation name to the HTTP verb used by authrs action derivation.
+fn operation_to_http_verb(op: &str) -> &'static str {
+    match op {
+        "list" | "read" => "get",
+        "create" => "post",
+        "update" => "patch",
+        "delete" => "delete",
+        _ => "get",
+    }
+}
+
 async fn dispatch_operation(
     state: &AppState,
     entity: &ResolvedEntity,
     operation: &str,
     tenant_id: &str,
+    user_id: Option<&str>,
     args: &rmcp::model::JsonObject,
 ) -> Result<Value, AppError> {
+    // ── Permission check (no-op when authrs is not configured) ──────────────
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        Some(tenant_id),
+        user_id,
+        entity,
+        operation_to_http_verb(operation),
+    )
+    .await?;
+
     let (strategy, pool) = {
         let entry = state
             .tenant_registry
@@ -269,7 +315,7 @@ async fn dispatch_operation(
                 &body,
                 None,
                 rls_tenant,
-                None,
+                user_id,
                 state.dialect.as_ref(),
             )
             .await?;
@@ -289,7 +335,7 @@ async fn dispatch_operation(
                 &id_val,
                 &body,
                 None,
-                None,
+                user_id,
                 state.dialect.as_ref(),
             )
             .await?
@@ -324,6 +370,7 @@ async fn dispatch_operation(
 fn extract_body(args: &rmcp::model::JsonObject) -> HashMap<String, Value> {
     const RESERVED: &[&str] = &[
         "tenant_id",
+        "user_id",
         "id",
         "filter",
         "sort",
@@ -352,24 +399,29 @@ fn strip_sensitive(mut row: Value, entity: &ResolvedEntity) -> Value {
 /// - `stdio` (default): reads stdin / writes stdout (for Claude Desktop, Claude Code)
 /// - `http`: serves SSE/HTTP on `MCP_PORT` (default 3001)
 ///
-/// Set `MCP_TENANT_ID` for a default tenant on all tool calls.
+/// **Environment variables:**
+/// - `MCP_TENANT_ID` — default tenant for all tool calls (can be overridden per call)
+/// - `MCP_USER_ID`   — default user ID for authrs permission checks (can be overridden per call)
+/// - `MCP_PORT`      — HTTP transport port (default 3001)
 pub async fn serve(state: AppState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let default_tenant = std::env::var("MCP_TENANT_ID").ok();
+    let default_user = std::env::var("MCP_USER_ID").ok();
     let transport = std::env::var("MCP_TRANSPORT").unwrap_or_else(|_| "stdio".to_string());
 
     match transport.to_lowercase().as_str() {
-        "http" => serve_http(state, default_tenant).await,
-        _ => serve_stdio(state, default_tenant).await,
+        "http" => serve_http(state, default_tenant, default_user).await,
+        _ => serve_stdio(state, default_tenant, default_user).await,
     }
 }
 
 async fn serve_stdio(
     state: AppState,
     default_tenant: Option<String>,
+    default_user: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::{serve_server, transport::stdio};
 
-    let server = ArchitectMcpServer::new(state, default_tenant);
+    let server = ArchitectMcpServer::new(state, default_tenant, default_user);
     let running = serve_server(server, stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -378,6 +430,7 @@ async fn serve_stdio(
 async fn serve_http(
     state: AppState,
     default_tenant: Option<String>,
+    default_user: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -391,12 +444,14 @@ async fn serve_http(
 
     let state_clone = state.clone();
     let default_tenant_clone = default_tenant.clone();
+    let default_user_clone = default_user.clone();
 
     let service = StreamableHttpService::new(
         move || {
             Ok(ArchitectMcpServer::new(
                 state_clone.clone(),
                 default_tenant_clone.clone(),
+                default_user_clone.clone(),
             ))
         },
         Arc::new(LocalSessionManager::default()),

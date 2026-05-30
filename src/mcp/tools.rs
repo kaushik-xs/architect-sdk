@@ -132,6 +132,13 @@ fn base_properties() -> serde_json::Map<String, Value> {
             "description": "Tenant ID (overrides MCP_TENANT_ID env var when provided)"
         }),
     );
+    props.insert(
+        "user_id".into(),
+        json!({
+            "type": "string",
+            "description": "User ID for permission checks (overrides MCP_USER_ID env var when provided). Required when authrs is configured."
+        }),
+    );
     props
 }
 
