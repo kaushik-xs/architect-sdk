@@ -5,9 +5,9 @@ use crate::db::pool::{Connection, DbRow, Pool};
 use crate::db::Dialect;
 use crate::error::AppError;
 use crate::sql::{
-    archive, coerce_json_value_for_pg_array, delete, insert, select_by_column_in, select_by_id,
-    select_list, select_list_with_includes, unarchive, update, BindValue, FilterNode,
-    IncludeSelect, QueryBuf, SortSpec,
+    archive, coerce_json_value_for_pg_array, delete, insert, insert_history_snapshot,
+    prune_history, select_by_column_in, select_by_id, select_list, select_list_with_includes,
+    unarchive, update, BindValue, FilterNode, IncludeSelect, QueryBuf, SortSpec,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -173,6 +173,7 @@ impl CrudService {
 
     /// Update one row by id. Returns updated row.
     /// When caller_user_id is Some, updated_by is set to that value.
+    /// When entity has versioning enabled, a history snapshot is written atomically before the update.
     pub async fn update<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -182,14 +183,27 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let pre_row = if entity.audit_log {
+        let versioning_enabled = entity.versioning.as_ref().is_some_and(|v| v.enabled);
+
+        let pre_row = if entity.audit_log || versioning_enabled {
             let q = select_by_id(entity, schema_override, dialect);
             Self::query_one_exec(executor, &q.sql, std::slice::from_ref(id)).await?
         } else {
             None
         };
-        let q = update(entity, id, body, schema_override, caller_user_id, dialect);
-        let result = Self::execute_returning_one_exec(executor, &q).await?;
+
+        let result = if versioning_enabled {
+            // Write snapshot + update in a single transaction.
+            let snap_q = insert_history_snapshot(entity, "update", schema_override, dialect);
+            let upd_q = update(entity, id, body, schema_override, caller_user_id, dialect);
+            let keep = entity.versioning.as_ref().and_then(|v| v.keep_versions);
+            let prune_q = keep.map(|_| prune_history(entity, schema_override, dialect));
+            Self::run_versioned_update(executor, id, snap_q, upd_q, prune_q, keep).await?
+        } else {
+            let q = update(entity, id, body, schema_override, caller_user_id, dialect);
+            Self::execute_returning_one_exec(executor, &q).await?
+        };
+
         if entity.audit_log {
             if let Some(ref post_row) = result {
                 Self::insert_audit(
@@ -209,6 +223,7 @@ impl CrudService {
 
     /// Delete one row by id. Returns deleted row or None.
     /// When caller_user_id is Some, audit_by is set on the audit record.
+    /// When entity has versioning enabled, a history snapshot is written atomically before the delete.
     pub async fn delete<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -217,13 +232,18 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
-        let q = delete(entity, schema_override, dialect);
-        let result = Self::execute_returning_one_with_params_exec(
-            executor,
-            &q.sql,
-            std::slice::from_ref(id),
-        )
-        .await?;
+        let versioning_enabled = entity.versioning.as_ref().is_some_and(|v| v.enabled);
+
+        let result = if versioning_enabled {
+            let snap_q = insert_history_snapshot(entity, "delete", schema_override, dialect);
+            let del_q = delete(entity, schema_override, dialect);
+            Self::run_versioned_delete(executor, id, snap_q, del_q).await?
+        } else {
+            let q = delete(entity, schema_override, dialect);
+            Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
+                .await?
+        };
+
         if entity.audit_log {
             if let Some(ref deleted_row) = result {
                 Self::insert_audit(
@@ -631,6 +651,35 @@ impl CrudService {
         Ok((out, row_errors))
     }
 
+    /// Execute a history SELECT that returns multiple rows (used by list_history handler).
+    /// Binds: params[0] = pk value.
+    pub async fn query_history_many<'a>(
+        executor: &mut TenantExecutor<'a>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Value>, AppError> {
+        Self::query_many_exec(executor, sql, params).await
+    }
+
+    /// Execute a history SELECT that returns one row (used by read_history_version handler).
+    /// Binds: $1 = pk value, $2 = version (i64).
+    pub async fn query_history_one<'a>(
+        executor: &mut TenantExecutor<'a>,
+        sql: &str,
+        id: &Value,
+        version: i64,
+    ) -> Result<Option<Value>, AppError> {
+        tracing::debug!(sql = %sql, "history query");
+        let mut query = sqlx::query(sql);
+        query = query.bind(Self::to_sqlx_param(id));
+        query = query.bind(version);
+        let row = match executor.executor {
+            TenantExecutorInner::Pool(pool) => query.fetch_optional(pool).await?,
+            TenantExecutorInner::Conn(ref mut conn) => query.fetch_optional(&mut **conn).await?,
+        };
+        Ok(row.map(|r| row_to_json(&r)))
+    }
+
     async fn query_one_exec<'a>(
         executor: &mut TenantExecutor<'a>,
         sql: &str,
@@ -730,6 +779,140 @@ impl CrudService {
 
     fn to_sqlx_param(v: &Value) -> BindValue {
         BindValue::from_json(v).unwrap_or(BindValue::Null)
+    }
+
+    /// Snapshot + UPDATE in one transaction (versioning path for update).
+    async fn run_versioned_update<'a>(
+        executor: &mut TenantExecutor<'a>,
+        id: &Value,
+        snap_q: QueryBuf,
+        upd_q: QueryBuf,
+        prune_q: Option<QueryBuf>,
+        keep_versions: Option<i64>,
+    ) -> Result<Option<Value>, AppError> {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                // Snapshot (INSERT INTO _history SELECT ...)
+                let mut snap = sqlx::query(&snap_q.sql);
+                snap = snap.bind(Self::to_sqlx_param(&snap_q.params[0])); // operation
+                snap = snap.bind(Self::to_sqlx_param(id)); // pk
+                snap.execute(&mut *tx).await?;
+                // Update
+                let mut upd = sqlx::query(&upd_q.sql);
+                for p in &upd_q.params {
+                    upd = upd.bind(Self::to_sqlx_param(p));
+                }
+                let row = upd.fetch_optional(&mut *tx).await?.map(|r| row_to_json(&r));
+                // Prune
+                if let (Some(pq), Some(kv)) = (prune_q, keep_versions) {
+                    let mut pr = sqlx::query(&pq.sql);
+                    pr = pr.bind(Self::to_sqlx_param(id));
+                    pr = pr.bind(kv);
+                    pr.execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(row)
+            }
+            TenantExecutorInner::Conn(ref mut conn) => {
+                // On an RLS connection we can't open a nested transaction; use SAVEPOINT.
+                sqlx::query("SAVEPOINT sp_versioned_update")
+                    .execute(&mut **conn)
+                    .await?;
+                let snap_res = async {
+                    let mut snap = sqlx::query(&snap_q.sql);
+                    snap = snap.bind(Self::to_sqlx_param(&snap_q.params[0]));
+                    snap = snap.bind(Self::to_sqlx_param(id));
+                    snap.execute(&mut **conn).await?;
+                    let mut upd = sqlx::query(&upd_q.sql);
+                    for p in &upd_q.params {
+                        upd = upd.bind(Self::to_sqlx_param(p));
+                    }
+                    let row = upd
+                        .fetch_optional(&mut **conn)
+                        .await?
+                        .map(|r| row_to_json(&r));
+                    if let (Some(pq), Some(kv)) = (prune_q, keep_versions) {
+                        let mut pr = sqlx::query(&pq.sql);
+                        pr = pr.bind(Self::to_sqlx_param(id));
+                        pr = pr.bind(kv);
+                        pr.execute(&mut **conn).await?;
+                    }
+                    Ok::<_, sqlx::Error>(row)
+                }
+                .await;
+                match snap_res {
+                    Ok(row) => {
+                        sqlx::query("RELEASE SAVEPOINT sp_versioned_update")
+                            .execute(&mut **conn)
+                            .await?;
+                        Ok(row)
+                    }
+                    Err(e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT sp_versioned_update")
+                            .execute(&mut **conn)
+                            .await?;
+                        Err(AppError::Db(e))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshot + DELETE in one transaction (versioning path for delete).
+    async fn run_versioned_delete<'a>(
+        executor: &mut TenantExecutor<'a>,
+        id: &Value,
+        snap_q: QueryBuf,
+        del_q: QueryBuf,
+    ) -> Result<Option<Value>, AppError> {
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                let mut snap = sqlx::query(&snap_q.sql);
+                snap = snap.bind(Self::to_sqlx_param(&snap_q.params[0])); // operation
+                snap = snap.bind(Self::to_sqlx_param(id)); // pk
+                snap.execute(&mut *tx).await?;
+                let mut del = sqlx::query(&del_q.sql);
+                del = del.bind(Self::to_sqlx_param(id));
+                let row = del.fetch_optional(&mut *tx).await?.map(|r| row_to_json(&r));
+                tx.commit().await?;
+                Ok(row)
+            }
+            TenantExecutorInner::Conn(ref mut conn) => {
+                sqlx::query("SAVEPOINT sp_versioned_delete")
+                    .execute(&mut **conn)
+                    .await?;
+                let snap_res = async {
+                    let mut snap = sqlx::query(&snap_q.sql);
+                    snap = snap.bind(Self::to_sqlx_param(&snap_q.params[0]));
+                    snap = snap.bind(Self::to_sqlx_param(id));
+                    snap.execute(&mut **conn).await?;
+                    let mut del = sqlx::query(&del_q.sql);
+                    del = del.bind(Self::to_sqlx_param(id));
+                    let row = del
+                        .fetch_optional(&mut **conn)
+                        .await?
+                        .map(|r| row_to_json(&r));
+                    Ok::<_, sqlx::Error>(row)
+                }
+                .await;
+                match snap_res {
+                    Ok(row) => {
+                        sqlx::query("RELEASE SAVEPOINT sp_versioned_delete")
+                            .execute(&mut **conn)
+                            .await?;
+                        Ok(row)
+                    }
+                    Err(e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT sp_versioned_delete")
+                            .execute(&mut **conn)
+                            .await?;
+                        Err(AppError::Db(e))
+                    }
+                }
+            }
+        }
     }
 
     async fn insert_audit<'a>(

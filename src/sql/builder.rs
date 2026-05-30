@@ -940,6 +940,334 @@ pub fn unarchive(
     q
 }
 
+// ─── Row Versioning Builders ──────────────────────────────────────────────────
+
+/// INSERT INTO {table}_history: copy the current row from the main table before an update/delete.
+/// Uses a single INSERT ... SELECT so the snapshot is atomic and never goes through the app layer.
+/// Binds: $1 = operation text ("update" | "delete"), $2 = pk value.
+pub fn insert_history_snapshot(
+    entity: &ResolvedEntity,
+    operation: &str,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let main_table = qualified_table(schema, &entity.table_name);
+    let history_table = qualified_table(schema, &format!("{}_history", entity.table_name));
+    let pk = &entity.pk_columns[0];
+
+    // $1 = operation, $2 = pk id
+    let op_ph = dialect.placeholder(1);
+    let pk_ph = pk_placeholder(entity, 2, dialect);
+
+    let col_names: Vec<String> = entity.columns.iter().map(|c| quoted(&c.name)).collect();
+    let col_list = col_names.join(", ");
+
+    q.sql = format!(
+        "INSERT INTO {history} (\
+            \"_version\", \"_operation\", \"_recorded_at\", \"_valid_from\", \"_valid_to\", {cols}\
+        ) \
+        SELECT \
+            COALESCE(\"_version\", 1), {op_ph}, {now}, \"updated_at\", {now}, {cols} \
+        FROM {main} \
+        WHERE {pk_q} = {pk_ph}",
+        history = history_table,
+        cols = col_list,
+        op_ph = op_ph,
+        now = dialect.now_fn(),
+        main = main_table,
+        pk_q = quoted(pk),
+        pk_ph = pk_ph,
+    );
+    q.params.push(Value::String(operation.to_string()));
+    q.params.push(Value::Null); // placeholder; caller replaces with real id
+    q
+}
+
+/// SELECT all history rows for a given pk, ordered newest first.
+/// Binds: $1 = pk value.
+pub fn select_history_list(
+    entity: &ResolvedEntity,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let history_table = qualified_table(schema, &format!("{}_history", entity.table_name));
+    let pk = &entity.pk_columns[0];
+    let pk_ph = pk_placeholder(entity, 1, dialect);
+    q.sql = format!(
+        "SELECT * FROM {} WHERE {} = {} ORDER BY {} DESC",
+        history_table,
+        quoted(pk),
+        pk_ph,
+        quoted("_version")
+    );
+    q.params.push(Value::Null); // placeholder; caller passes real id
+    q
+}
+
+/// SELECT a specific version from history for a given pk.
+/// Binds: $1 = pk value, $2 = version (bigint).
+pub fn select_history_by_version(
+    entity: &ResolvedEntity,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let history_table = qualified_table(schema, &format!("{}_history", entity.table_name));
+    let pk = &entity.pk_columns[0];
+    let pk_ph = pk_placeholder(entity, 1, dialect);
+    let v_ph = dialect.placeholder(2);
+    q.sql = format!(
+        "SELECT * FROM {} WHERE {} = {} AND {} = {}",
+        history_table,
+        quoted(pk),
+        pk_ph,
+        quoted("_version"),
+        v_ph
+    );
+    q.params.push(Value::Null); // placeholder for pk
+    q.params.push(Value::Null); // placeholder for version
+    q
+}
+
+/// DELETE old history rows beyond keep_versions for a given pk.
+/// Binds: $1 = pk value, $2 = keep_versions (bigint).
+pub fn prune_history(
+    entity: &ResolvedEntity,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> QueryBuf {
+    let mut q = QueryBuf::new();
+    let schema = resolve_schema(entity, schema_override);
+    let history_table = qualified_table(schema, &format!("{}_history", entity.table_name));
+    let pk = &entity.pk_columns[0];
+    let pk_ph = pk_placeholder(entity, 1, dialect);
+    let keep_ph = dialect.placeholder(2);
+    q.sql = format!(
+        "DELETE FROM {tbl} WHERE {pk_q} = {pk_ph} \
+         AND \"_history_id\" NOT IN (\
+             SELECT \"_history_id\" FROM {tbl} WHERE {pk_q} = {pk_ph} \
+             ORDER BY \"_version\" DESC LIMIT {keep_ph}\
+         )",
+        tbl = history_table,
+        pk_q = quoted(pk),
+        pk_ph = pk_ph,
+        keep_ph = keep_ph,
+    );
+    q.params.push(Value::Null); // pk placeholder
+    q.params.push(Value::Null); // keep_versions placeholder
+    q
+}
+
+// ─── History builder unit tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod versioning_tests {
+    use super::*;
+    use crate::config::resolved::{ColumnInfo, PkType, ResolvedEntity};
+    use std::collections::{HashMap, HashSet};
+
+    struct PgDialect;
+    impl crate::db::Dialect for PgDialect {
+        fn name(&self) -> &'static str {
+            "postgres"
+        }
+        fn placeholder(&self, n: usize) -> String {
+            format!("${}", n)
+        }
+        fn quote_ident(&self, s: &str) -> String {
+            format!("\"{}\"", s)
+        }
+        fn ddl_type(&self, _: &crate::db::CanonicalType) -> String {
+            "TEXT".into()
+        }
+        fn cast_name(&self, _: &crate::db::CanonicalType) -> Option<String> {
+            None
+        }
+        fn type_category(&self, _: &crate::db::CanonicalType) -> crate::db::TypeCategory {
+            crate::db::TypeCategory::Text
+        }
+        fn type_support(&self, _: &crate::db::CanonicalType) -> crate::db::TypeSupport {
+            crate::db::TypeSupport::Native("text")
+        }
+        fn cast_expr(&self, expr: &str, _: &str) -> String {
+            expr.to_string()
+        }
+        fn now_fn(&self) -> &'static str {
+            "NOW()"
+        }
+        fn sys_timestamp_type(&self) -> &'static str {
+            "TIMESTAMPTZ"
+        }
+        fn audit_timestamp_type(&self) -> &'static str {
+            "TIMESTAMPTZ"
+        }
+        fn sys_bigserial_type(&self) -> &'static str {
+            "BIGSERIAL"
+        }
+        fn sys_json_type(&self) -> &'static str {
+            "JSONB"
+        }
+        fn uuid_default_expr(&self) -> &'static str {
+            "gen_random_uuid()"
+        }
+        fn returning_clause(&self, cols: &str) -> String {
+            format!("RETURNING {}", cols)
+        }
+        fn upsert_conflict(&self, _: &[&str], _: &str) -> String {
+            String::new()
+        }
+        fn to_one_subquery(&self, _col_exprs: &[String], from_clause: &str) -> String {
+            format!("(SELECT row_to_json(t) FROM ({}) t)", from_clause)
+        }
+        fn to_many_subquery(&self, _col_exprs: &[String], from_clause: &str) -> String {
+            format!("(SELECT json_agg(t) FROM ({}) t)", from_clause)
+        }
+        fn supports_schemas(&self) -> bool {
+            true
+        }
+        fn supports_rls(&self) -> bool {
+            true
+        }
+        fn supports_named_enum_types(&self) -> bool {
+            true
+        }
+        fn supports_index_include(&self) -> bool {
+            true
+        }
+        fn set_tenant_session_sql(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn make_entity() -> ResolvedEntity {
+        ResolvedEntity {
+            table_id: "t1".into(),
+            schema_name: "myschema".into(),
+            table_name: "users".into(),
+            path_segment: "users".into(),
+            pk_columns: vec!["id".into()],
+            pk_type: PkType::Uuid,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    pk_type: Some(PkType::Uuid),
+                    nullable: false,
+                    has_default: true,
+                    pg_type: Some("uuid".into()),
+                    is_asset: false,
+                    asset_is_array: false,
+                    asset_config: None,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    pk_type: None,
+                    nullable: true,
+                    has_default: false,
+                    pg_type: None,
+                    is_asset: false,
+                    asset_is_array: false,
+                    asset_config: None,
+                },
+                ColumnInfo {
+                    name: "updated_at".into(),
+                    pk_type: None,
+                    nullable: false,
+                    has_default: true,
+                    pg_type: Some("timestamptz".into()),
+                    is_asset: false,
+                    asset_is_array: false,
+                    asset_config: None,
+                },
+            ],
+            operations: vec![],
+            sensitive_columns: HashSet::new(),
+            includes: vec![],
+            validation: HashMap::new(),
+            events: vec![],
+            archive_field: None,
+            package_id: String::new(),
+            audit_log: false,
+            parent_ref_column: None,
+            versioning: None,
+        }
+    }
+
+    #[test]
+    fn insert_history_snapshot_inserts_into_history_table() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = insert_history_snapshot(&entity, "update", None, &d);
+        assert!(q.sql.contains("INSERT INTO"));
+        assert!(q.sql.contains("_history"));
+        assert!(q.sql.contains("_version"));
+        assert!(q.sql.contains("_operation"));
+        assert!(q.sql.contains("\"name\""));
+        assert_eq!(q.params[0], Value::String("update".into()));
+    }
+
+    #[test]
+    fn insert_history_snapshot_uses_select_not_application_values() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = insert_history_snapshot(&entity, "delete", None, &d);
+        assert!(q.sql.contains("SELECT"));
+        assert!(q.sql.contains("FROM"));
+    }
+
+    #[test]
+    fn select_history_list_orders_by_version_desc() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = select_history_list(&entity, None, &d);
+        assert!(q.sql.contains("ORDER BY"));
+        assert!(q.sql.contains("_version"));
+        assert!(q.sql.contains("DESC"));
+        assert_eq!(q.params.len(), 1);
+    }
+
+    #[test]
+    fn select_history_by_version_has_two_params() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = select_history_by_version(&entity, None, &d);
+        assert!(q.sql.contains("$1"));
+        assert!(q.sql.contains("$2"));
+        assert_eq!(q.params.len(), 2);
+    }
+
+    #[test]
+    fn prune_history_contains_limit() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = prune_history(&entity, None, &d);
+        assert!(q.sql.to_uppercase().contains("LIMIT"));
+        assert!(q.sql.contains("$2"));
+    }
+
+    #[test]
+    fn history_table_uses_entity_schema() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = select_history_list(&entity, None, &d);
+        assert!(q.sql.contains("\"myschema\""));
+        assert!(q.sql.contains("\"users_history\""));
+    }
+
+    #[test]
+    fn schema_override_is_respected() {
+        let entity = make_entity();
+        let d = PgDialect;
+        let q = select_history_list(&entity, Some("tenant1"), &d);
+        assert!(q.sql.contains("\"tenant1\""));
+        assert!(!q.sql.contains("\"myschema\""));
+    }
+}
+
 /// UPDATE by id: stamp archive_field with NOW() where it is currently NULL.
 /// Returns the updated row or None (record not found or already archived).
 pub fn archive(

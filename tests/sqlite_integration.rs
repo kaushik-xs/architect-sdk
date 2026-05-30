@@ -56,6 +56,7 @@ fn notes_config() -> FullConfig {
             unique: vec![],
             check: vec![],
             audit_log: false,
+            versioning: None,
         }],
         columns: vec![
             ColumnConfig {
@@ -130,6 +131,7 @@ fn users_config() -> FullConfig {
             unique: vec![],
             check: vec![],
             audit_log: false,
+            versioning: None,
         }],
         columns: vec![
             ColumnConfig {

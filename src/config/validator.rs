@@ -39,6 +39,18 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
                 id: sid.to_string(),
             });
         }
+        if let Some(ref v) = t.versioning {
+            if v.enabled {
+                if let Some(kv) = v.keep_versions {
+                    if kv < 1 {
+                        return Err(ConfigError::Validation(format!(
+                            "table '{}': versioning.keep_versions must be ≥ 1 (got {})",
+                            t.id, kv
+                        )));
+                    }
+                }
+            }
+        }
         let pk_cols = match &t.primary_key {
             PrimaryKeyConfig::Single(s) => vec![s.as_str()],
             PrimaryKeyConfig::Composite(v) => v.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -137,6 +149,7 @@ mod tests {
             unique: vec![],
             check: vec![],
             audit_log: false,
+            versioning: None,
         }
     }
 
@@ -255,6 +268,64 @@ mod tests {
             validate(&c),
             Err(ConfigError::MissingReference { kind: "schema", .. })
         ));
+    }
+
+    // --- versioning ---
+
+    #[test]
+    fn versioning_keep_versions_zero_fails() {
+        use crate::config::types::VersioningConfig;
+        let mut c = minimal_config();
+        c.tables[0].versioning = Some(VersioningConfig {
+            enabled: true,
+            keep_versions: Some(0),
+        });
+        assert!(matches!(validate(&c), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn versioning_keep_versions_negative_fails() {
+        use crate::config::types::VersioningConfig;
+        let mut c = minimal_config();
+        c.tables[0].versioning = Some(VersioningConfig {
+            enabled: true,
+            keep_versions: Some(-1),
+        });
+        assert!(matches!(validate(&c), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn versioning_keep_versions_one_passes() {
+        use crate::config::types::VersioningConfig;
+        let mut c = minimal_config();
+        c.tables[0].versioning = Some(VersioningConfig {
+            enabled: true,
+            keep_versions: Some(1),
+        });
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn versioning_keep_versions_none_passes() {
+        use crate::config::types::VersioningConfig;
+        let mut c = minimal_config();
+        c.tables[0].versioning = Some(VersioningConfig {
+            enabled: true,
+            keep_versions: None,
+        });
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn versioning_disabled_with_zero_keep_passes() {
+        // keep_versions validation skipped when enabled = false
+        use crate::config::types::VersioningConfig;
+        let mut c = minimal_config();
+        c.tables[0].versioning = Some(VersioningConfig {
+            enabled: false,
+            keep_versions: Some(0),
+        });
+        assert!(validate(&c).is_ok());
     }
 
     // --- default_schema_id ---

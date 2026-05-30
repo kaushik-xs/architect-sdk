@@ -12,7 +12,10 @@ use crate::events::spawn_events;
 use crate::extractors::tenant::TenantId;
 use crate::extractors::user::UserId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
-use crate::sql::{parse_rsql, parse_sort, FilterNode, IncludeSelect};
+use crate::sql::{
+    parse_rsql, parse_sort, select_history_by_version, select_history_list, FilterNode,
+    IncludeSelect,
+};
 use crate::state::AppState;
 use crate::storage::{compress, resolve_prefix, validate_asset_field};
 use crate::store::DEFAULT_PACKAGE_ID;
@@ -3510,6 +3513,175 @@ pub async fn archive_package(
             None,
         );
     }
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessOne {
+            data: row,
+            meta: None,
+        }),
+    ))
+}
+
+// ─── Row Versioning Handlers ──────────────────────────────────────────────────
+
+/// `GET /:path_segment/:id/history` — list all historical versions of a row, newest first.
+/// Returns 404 when the entity does not have versioning enabled.
+pub async fn list_history(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((path_segment, id_str)): Path<(String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    #[allow(unused_assignments)]
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
+            let mut conn = pool.acquire().await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
+            rls_conn = Some(conn);
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
+        }
+    };
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+
+    if !entity.versioning.as_ref().is_some_and(|v| v.enabled) {
+        return Err(AppError::NotFound(format!(
+            "versioning is not enabled for '{}'",
+            path_segment
+        )));
+    }
+
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
+
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let q = select_history_list(&entity, schema_override, state.dialect.as_ref());
+    let mut rows = crate::service::CrudService::query_history_many(
+        &mut executor,
+        &q.sql,
+        std::slice::from_ref(&id),
+    )
+    .await?;
+
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
+    }
+
+    let count = rows.len();
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount {
+                count: count as u64,
+            },
+        }),
+    ))
+}
+
+/// `GET /:path_segment/:id/history/:version` — fetch a specific version of a row.
+/// Returns 404 when the entity does not have versioning enabled, or when that version doesn't exist.
+pub async fn read_history_version(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((path_segment, id_str, version_str)): Path<(String, String, String)>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let version: i64 = version_str
+        .parse()
+        .map_err(|_| AppError::BadRequest("version must be an integer".into()))?;
+
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    #[allow(unused_assignments)]
+    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
+            let mut conn = pool.acquire().await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *conn).await?;
+            }
+            rls_conn = Some(conn);
+            (
+                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
+                None,
+            )
+        }
+    };
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+
+    if !entity.versioning.as_ref().is_some_and(|v| v.enabled) {
+        return Err(AppError::NotFound(format!(
+            "versioning is not enabled for '{}'",
+            path_segment
+        )));
+    }
+
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "get",
+    )
+    .await?;
+
+    let id = parse_id(&id_str, &entity.pk_type)?;
+    let q = select_history_by_version(&entity, schema_override, state.dialect.as_ref());
+    let mut row =
+        crate::service::CrudService::query_history_one(&mut executor, &q.sql, &id, version)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("{} version {} not found", id_str, version))
+            })?;
+
+    strip_sensitive_columns(&mut row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut row);
+
     Ok((
         axum::http::StatusCode::OK,
         Json(crate::response::SuccessOne {

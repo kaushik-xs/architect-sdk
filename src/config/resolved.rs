@@ -1,6 +1,6 @@
 //! Resolved entity model: config validated and flattened for runtime use.
 
-use crate::config::types::{AssetColumnConfig, EntityEventTrigger};
+use crate::config::types::{AssetColumnConfig, EntityEventTrigger, VersioningConfig};
 use crate::config::ValidationRule;
 use std::collections::{HashMap, HashSet};
 
@@ -76,6 +76,8 @@ pub struct ResolvedEntity {
     pub audit_log: bool,
     /// Natural-key column used to resolve `parentRef` in bulk create (e.g. `"location_id"`).
     pub parent_ref_column: Option<String>,
+    /// Row-level versioning config, carried from TableConfig.
+    pub versioning: Option<VersioningConfig>,
 }
 
 #[derive(Clone, Debug)]

@@ -51,6 +51,20 @@ pub struct TableConfig {
     /// is recorded there with the full row snapshot, action type, timestamp, and actor.
     #[serde(default)]
     pub audit_log: bool,
+    /// Row-level versioning: when enabled, a `{table}_history` table is created and a snapshot
+    /// of the row is written there before every UPDATE and DELETE.
+    #[serde(default)]
+    pub versioning: Option<VersioningConfig>,
+}
+
+/// Configuration for row-level versioning on a table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VersioningConfig {
+    pub enabled: bool,
+    /// Maximum number of historical versions to retain per row (None = keep all).
+    /// Must be ≥ 1 when set.
+    #[serde(default)]
+    pub keep_versions: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

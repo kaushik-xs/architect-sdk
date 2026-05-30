@@ -5,8 +5,9 @@
 use crate::handlers::asset::sign_asset;
 use crate::handlers::entity::{
     archive, archive_package, bulk_create, bulk_create_package, bulk_update, bulk_update_package,
-    create, create_package, delete as delete_handler, delete_package, list, list_package, read,
-    read_package, unarchive, unarchive_package, update, update_package,
+    create, create_package, delete as delete_handler, delete_package, list, list_history,
+    list_package, read, read_history_version, read_package, unarchive, unarchive_package, update,
+    update_package,
 };
 use crate::handlers::kv::{kv_delete, kv_get, kv_list_keys, kv_put};
 use crate::state::AppState;
@@ -24,6 +25,11 @@ pub fn entity_routes(state: AppState) -> Router {
         )
         .route("/:path_segment/:id/archive", post(archive))
         .route("/:path_segment/:id/unarchive", post(unarchive))
+        .route("/:path_segment/:id/history", get(list_history))
+        .route(
+            "/:path_segment/:id/history/:version",
+            get(read_history_version),
+        )
         .route("/package/:package_id/kv/:namespace", get(kv_list_keys))
         .route(
             "/package/:package_id/kv/:namespace/:key",

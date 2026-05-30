@@ -200,6 +200,24 @@ pub async fn apply_migrations(
             let _ = sqlx::query(&idx_sql).execute(pool).await;
         }
 
+        if t.versioning.as_ref().is_some_and(|v| v.enabled) {
+            let schema_raw = schema_override.unwrap_or(&schema.name);
+            let pk_col = match &t.primary_key {
+                PrimaryKeyConfig::Single(s) => s.clone(),
+                PrimaryKeyConfig::Composite(v) => v[0].clone(),
+            };
+            let history_ddl = history_table_ddl(schema_raw, &t.name, &pk_col, cols, dialect);
+            // history_table_ddl embeds a comment line for the index; execute CREATE TABLE only
+            let create_only = history_ddl
+                .lines()
+                .take_while(|l| !l.trim_start().starts_with("-- index:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            sqlx::query(create_only.trim()).execute(pool).await?;
+            let idx_sql = history_index_ddl(schema_raw, &t.name, &pk_col);
+            let _ = sqlx::query(&idx_sql).execute(pool).await;
+        }
+
         if let Some(col) = rls_tenant_column {
             if dialect.supports_rls() {
                 if !config_col_names.contains(col) {
@@ -438,6 +456,12 @@ pub async fn revert_migrations(
         if t.audit_log {
             let audit_full = format!("{}.{}", schema_name, quote(&format!("{}_audit", t.name)));
             let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {} CASCADE", audit_full))
+                .execute(pool)
+                .await;
+        }
+        if t.versioning.as_ref().is_some_and(|v| v.enabled) {
+            let history_full = format!("{}.{}", schema_name, quote(&format!("{}_history", t.name)));
+            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {} CASCADE", history_full))
                 .execute(pool)
                 .await;
         }
@@ -896,21 +920,79 @@ pub fn compute_migration_plan(
                 risk_detail: None,
             });
         }
+        if new_table.versioning.as_ref().is_some_and(|v| v.enabled) {
+            let pk_col = match &new_table.primary_key {
+                PrimaryKeyConfig::Single(s) => s.clone(),
+                PrimaryKeyConfig::Composite(v) => v[0].clone(),
+            };
+            // Split history DDL into CREATE TABLE and index
+            let history_create = format!(
+                "CREATE TABLE IF NOT EXISTS {}.{} (\n  {}\n)",
+                quote(&schema),
+                quote(&format!("{}_history", new_table.name)),
+                {
+                    let full_ddl =
+                        history_table_ddl(&schema, &new_table.name, &pk_col, cols, dialect);
+                    full_ddl
+                        .lines()
+                        .skip(1) // skip CREATE TABLE line
+                        .take_while(|l| !l.trim_start().starts_with("-- index:"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim_end_matches(['\n', ',', ')'])
+                        .to_string()
+                        + "\n)"
+                }
+            );
+            steps.push(MigrationStep {
+                step: 0,
+                operation: MigrationOperation::CreateTable,
+                schema: schema.clone(),
+                table: Some(format!("{}_history", new_table.name)),
+                object: format!("{}_history", new_table.name),
+                object_type: "table".into(),
+                description: format!(
+                    "Create history table \"{}\".\"{}_history\" (versioning)",
+                    schema, new_table.name
+                ),
+                ddl: Some(history_create),
+                safety: MigrationSafety::Safe,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            });
+            steps.push(MigrationStep {
+                step: 0,
+                operation: MigrationOperation::CreateIndex,
+                schema: schema.clone(),
+                table: Some(format!("{}_history", new_table.name)),
+                object: format!("{}_history_{}_idx", new_table.name, pk_col),
+                object_type: "index".into(),
+                description: format!(
+                    "Create index on history table \"{}\".\"{}\" ({pk_col}, _version DESC)",
+                    schema, new_table.name
+                ),
+                ddl: Some(history_index_ddl(&schema, &new_table.name, &pk_col)),
+                safety: MigrationSafety::Safe,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            });
+        }
     }
 
-    // Existing tables that gained audit_log
+    // Existing tables that gained audit_log or versioning
     for new_table in &new.tables {
         if added_table_ids.contains(new_table.id.as_str()) {
             continue;
         }
         if let Some(old_table) = old_tables.get(new_table.id.as_str()) {
+            let sid = new_table.schema_id.as_deref().unwrap_or(default_new_sid);
+            let schema = schema_name_for(sid, &new_schemas);
+            let cols = cols_by_table
+                .get(new_table.id.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
             if !old_table.audit_log && new_table.audit_log {
-                let sid = new_table.schema_id.as_deref().unwrap_or(default_new_sid);
-                let schema = schema_name_for(sid, &new_schemas);
-                let cols = cols_by_table
-                    .get(new_table.id.as_str())
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
                 let audit_ddl = audit_table_ddl(&schema, &new_table.name, cols, dialect);
                 steps.push(MigrationStep {
                     step: 0,
@@ -924,6 +1006,54 @@ pub fn compute_migration_plan(
                         schema, new_table.name
                     ),
                     ddl: Some(audit_ddl),
+                    safety: MigrationSafety::Safe,
+                    risk: MigrationRisk::None,
+                    risk_detail: None,
+                });
+            }
+
+            let old_versioning_enabled = old_table.versioning.as_ref().is_some_and(|v| v.enabled);
+            let new_versioning_enabled = new_table.versioning.as_ref().is_some_and(|v| v.enabled);
+            if !old_versioning_enabled && new_versioning_enabled {
+                let pk_col = match &new_table.primary_key {
+                    PrimaryKeyConfig::Single(s) => s.clone(),
+                    PrimaryKeyConfig::Composite(v) => v[0].clone(),
+                };
+                let history_ddl =
+                    history_table_ddl(&schema, &new_table.name, &pk_col, cols, dialect);
+                let create_only = history_ddl
+                    .lines()
+                    .take_while(|l| !l.trim_start().starts_with("-- index:"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                steps.push(MigrationStep {
+                    step: 0,
+                    operation: MigrationOperation::CreateTable,
+                    schema: schema.clone(),
+                    table: Some(format!("{}_history", new_table.name)),
+                    object: format!("{}_history", new_table.name),
+                    object_type: "table".into(),
+                    description: format!(
+                        "Enable versioning: create \"{}\".\"{}_history\"",
+                        schema, new_table.name
+                    ),
+                    ddl: Some(create_only.trim().to_string()),
+                    safety: MigrationSafety::Safe,
+                    risk: MigrationRisk::None,
+                    risk_detail: None,
+                });
+                steps.push(MigrationStep {
+                    step: 0,
+                    operation: MigrationOperation::CreateIndex,
+                    schema: schema.clone(),
+                    table: Some(format!("{}_history", new_table.name)),
+                    object: format!("{}_history_{}_idx", new_table.name, pk_col),
+                    object_type: "index".into(),
+                    description: format!(
+                        "Create history index on \"{}\".\"{}\"",
+                        schema, new_table.name
+                    ),
+                    ddl: Some(history_index_ddl(&schema, &new_table.name, &pk_col)),
                     safety: MigrationSafety::Safe,
                     risk: MigrationRisk::None,
                     risk_detail: None,
@@ -1598,6 +1728,93 @@ pub async fn execute_migration_plan(
         warned,
         warnings,
     })
+}
+
+/// Build CREATE TABLE DDL for the `{table}_history` companion table used by row versioning.
+/// All source columns are replicated with their types but as nullable and without any constraints
+/// (no NOT NULL, no UNIQUE, no FK, no CHECK). Five versioning metadata columns are prepended.
+pub fn history_table_ddl(
+    schema_name: &str,
+    table_name: &str,
+    pk_col: &str,
+    source_cols: &[&ColumnConfig],
+    dialect: &dyn Dialect,
+) -> String {
+    let history_name = format!("{}_history", table_name);
+    let history_full = format!("{}.{}", quote(schema_name), quote(&history_name));
+
+    let mut col_defs: Vec<String> = Vec::new();
+    col_defs.push(format!(
+        "{} {} NOT NULL DEFAULT {}",
+        quote("_history_id"),
+        "UUID",
+        dialect.uuid_default_expr()
+    ));
+    col_defs.push(format!("{} BIGINT NOT NULL", quote("_version")));
+    col_defs.push(format!("{} TEXT NOT NULL", quote("_operation")));
+    col_defs.push(format!(
+        "{} {} NOT NULL DEFAULT {}",
+        quote("_recorded_at"),
+        dialect.audit_timestamp_type(),
+        dialect.now_fn()
+    ));
+    col_defs.push(format!(
+        "{} {}",
+        quote("_valid_from"),
+        dialect.audit_timestamp_type()
+    ));
+    col_defs.push(format!(
+        "{} {}",
+        quote("_valid_to"),
+        dialect.audit_timestamp_type()
+    ));
+
+    let config_col_names: HashSet<&str> = source_cols.iter().map(|c| c.name.as_str()).collect();
+    for c in source_cols {
+        let typ = dialect.ddl_type(&parse_canonical(&c.type_));
+        col_defs.push(format!("{} {}", quote(&c.name), typ));
+    }
+    let audit_ts = dialect.audit_timestamp_type();
+    for (name, typ) in [
+        ("created_at", audit_ts),
+        ("updated_at", audit_ts),
+        ("archived_at", audit_ts),
+        ("created_by", "TEXT"),
+        ("updated_by", "TEXT"),
+    ] {
+        if !config_col_names.contains(name) {
+            col_defs.push(format!("{} {}", quote(name), typ));
+        }
+    }
+    col_defs.push(format!("PRIMARY KEY ({})", quote("_history_id")));
+
+    let history_full_quoted = format!("{}.{}", quote(schema_name), quote(&history_name));
+    let idx_sql = format!(
+        "-- index: CREATE INDEX IF NOT EXISTS {} ON {} ({}, {})",
+        quote(&format!("{}_history_{}_idx", table_name, pk_col)),
+        history_full_quoted,
+        quote(pk_col),
+        quote("_version")
+    );
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (\n  {}\n)\n{}",
+        history_full,
+        col_defs.join(",\n  "),
+        idx_sql
+    )
+}
+
+/// Build just the index DDL for the `{table}_history` table (separate from CREATE TABLE).
+fn history_index_ddl(schema_name: &str, table_name: &str, pk_col: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {}.{} ({}, {} DESC)",
+        quote(&format!("{}_history_{}_idx", table_name, pk_col)),
+        quote(schema_name),
+        quote(&format!("{}_history", table_name)),
+        quote(pk_col),
+        quote("_version")
+    )
 }
 
 /// Build CREATE TABLE DDL for the `{table}_audit` companion table.
