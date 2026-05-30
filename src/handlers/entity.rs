@@ -133,7 +133,10 @@ async fn enrich_with_parent_ref<'a>(
             }
         }
     };
-    let uuid_to_ref: HashMap<String, String> = db_rows.into_iter().map(|(id, r)| (id.to_string(), r)).collect();
+    let uuid_to_ref: HashMap<String, String> = db_rows
+        .into_iter()
+        .map(|(id, r)| (id.to_string(), r))
+        .collect();
 
     // Inject parent_ref into each row.
     for row in rows.iter_mut() {
