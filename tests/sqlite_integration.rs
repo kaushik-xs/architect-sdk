@@ -223,7 +223,7 @@ async fn migration_creates_app_table() {
     let dialect = active_dialect();
     let config = notes_config();
 
-    apply_migrations(&pool, &config, None, None, dialect.as_ref())
+    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
         .await
         .expect("apply_migrations");
 
@@ -241,11 +241,11 @@ async fn migration_is_idempotent() {
     let dialect = active_dialect();
     let config = notes_config();
 
-    apply_migrations(&pool, &config, None, None, dialect.as_ref())
+    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
         .await
         .expect("first apply");
     // Running twice must not error (CREATE TABLE IF NOT EXISTS)
-    apply_migrations(&pool, &config, None, None, dialect.as_ref())
+    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
         .await
         .expect("second apply should be idempotent");
 }
@@ -255,7 +255,7 @@ async fn migration_is_idempotent() {
 async fn notes_executor(pool: &SqlitePool) -> (SqlitePool, architect_sdk::config::ResolvedModel) {
     let dialect = active_dialect();
     let config = notes_config();
-    apply_migrations(pool, &config, None, None, dialect.as_ref())
+    apply_migrations(pool, &config, None, None, dialect.as_ref(), &HashMap::new())
         .await
         .unwrap();
     let model = resolve(&config).unwrap();
@@ -463,7 +463,7 @@ async fn crud_list_with_limit_and_offset() {
 async fn users_executor(pool: &SqlitePool) -> architect_sdk::config::ResolvedModel {
     let dialect = active_dialect();
     let config = users_config();
-    apply_migrations(pool, &config, None, None, dialect.as_ref())
+    apply_migrations(pool, &config, None, None, dialect.as_ref(), &HashMap::new())
         .await
         .unwrap();
     resolve(&config).unwrap()
