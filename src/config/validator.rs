@@ -91,14 +91,19 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
     }
 
     for r in &config.relationships {
-        let from_sid = r.from_schema_id.as_str();
-        let to_sid = r.to_schema_id.as_str();
+        let from_sid = r.from_schema_id.as_deref().unwrap_or(default_sid);
+        // For cross-package relationships the to_* side lives in another package's config;
+        // skip local referential checks for it and only validate the from_* side.
+        let is_cross_package = r.to_package_id.is_some();
+        let local_to_sid = r.to_schema_id.as_deref().unwrap_or(default_sid);
+        let to_side_valid = is_cross_package
+            || (schema_ids.contains(local_to_sid)
+                && table_ids.contains(r.to_table_id.as_str())
+                && column_ids.contains(r.to_column_id.as_str()));
         if !schema_ids.contains(from_sid)
-            || !schema_ids.contains(to_sid)
             || !table_ids.contains(r.from_table_id.as_str())
-            || !table_ids.contains(r.to_table_id.as_str())
             || !column_ids.contains(r.from_column_id.as_str())
-            || !column_ids.contains(r.to_column_id.as_str())
+            || !to_side_valid
         {
             return Err(ConfigError::MissingReference {
                 kind: "relationship",

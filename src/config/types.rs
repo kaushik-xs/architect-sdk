@@ -188,10 +188,19 @@ impl IndexConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelationshipConfig {
     pub id: String,
-    pub from_schema_id: String,
+    /// Defaults to the owning package's schema when absent.
+    #[serde(default)]
+    pub from_schema_id: Option<String>,
     pub from_table_id: String,
     pub from_column_id: String,
-    pub to_schema_id: String,
+    /// When set, this relationship crosses into another installed package.
+    /// The `to_schema_id` and `to_table_id` are resolved from that package's config.
+    #[serde(default)]
+    pub to_package_id: Option<String>,
+    /// Defaults to the owning package's schema when absent (or to the target package's schema
+    /// for cross-package relationships).
+    #[serde(default)]
+    pub to_schema_id: Option<String>,
     pub to_table_id: String,
     pub to_column_id: String,
     #[serde(default)]

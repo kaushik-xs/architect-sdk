@@ -143,13 +143,21 @@ fn inject_schema_id(body: &mut [Value], schema_id: &str) {
 fn inject_relationship_schema_ids(body: &mut [Value], schema_id: &str) {
     for rec in body.iter_mut() {
         if let Some(obj) = rec.as_object_mut() {
+            // Always default from_schema_id to this package's schema.
             if !obj.contains_key("from_schema_id") {
                 obj.insert(
                     "from_schema_id".into(),
                     Value::String(schema_id.to_string()),
                 );
             }
-            if !obj.contains_key("to_schema_id") {
+            // Only default to_schema_id when this is NOT a cross-package relationship.
+            // Cross-package rels carry their own to_schema_id resolved at migration time.
+            let is_cross_package = obj
+                .get("to_package_id")
+                .and_then(Value::as_str)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if !is_cross_package && !obj.contains_key("to_schema_id") {
                 obj.insert("to_schema_id".into(), Value::String(schema_id.to_string()));
             }
         }
@@ -217,6 +225,7 @@ async fn apply_ddl_to_pool(
     to_version: &str,
     rls_tenant_column: Option<&str>,
     dialect: &dyn Dialect,
+    cross_package_configs: &std::collections::HashMap<String, FullConfig>,
 ) -> TenantMigrationOutcome {
     match plan {
         // Upgrade path: execute the pre-computed diff plan.
@@ -259,7 +268,7 @@ async fn apply_ddl_to_pool(
         }
         // Fresh install path: apply the full schema.
         None => {
-            match apply_migrations(migration_pool, config, None, rls_tenant_column, dialect).await {
+            match apply_migrations(migration_pool, config, None, rls_tenant_column, dialect, cross_package_configs).await {
                 Ok(()) => TenantMigrationOutcome {
                     target: target.to_string(),
                     strategy: strategy.to_string(),
@@ -302,12 +311,35 @@ async fn broadcast_ddl(
 ) -> Vec<TenantMigrationOutcome> {
     let mut outcomes = Vec::new();
 
+    // Load all other installed packages so cross-package FK resolution works.
+    let cross_package_configs: std::collections::HashMap<String, FullConfig> = {
+        match list_package_ids(config_pool).await {
+            Ok(ids) => {
+                let mut map = std::collections::HashMap::new();
+                for pid in ids {
+                    if pid == package_id {
+                        continue;
+                    }
+                    match load_from_pool(config_pool, &pid).await {
+                        Ok(cfg) => { map.insert(pid, cfg); }
+                        Err(e) => tracing::warn!(pkg = %pid, error = %e, "could not load cross-package config for FK resolution"),
+                    }
+                }
+                map
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list packages for cross-package FK resolution");
+                std::collections::HashMap::new()
+            }
+        }
+    };
+
     // Compute the migration plan once for upgrades (pure function, no DB calls).
     // `_rls_tenant_column` is intentionally ignored by compute_migration_plan, so
     // the same plan is valid for both RLS and Database targets.
     let plan: Option<MigrationPlan> = match old_config {
         Some(old) => {
-            match compute_migration_plan(old, config, None, None, state.dialect.as_ref()) {
+            match compute_migration_plan(old, config, None, None, state.dialect.as_ref(), &cross_package_configs) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::error!(error = %e, "could not compute migration plan for broadcast");
@@ -338,6 +370,7 @@ async fn broadcast_ddl(
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
             state.dialect.as_ref(),
+            &cross_package_configs,
         )
         .await;
         outcomes.push(outcome);
@@ -376,6 +409,7 @@ async fn broadcast_ddl(
             to_version,
             Some(crate::migration::RLS_TENANT_COLUMN),
             state.dialect.as_ref(),
+            &cross_package_configs,
         )
         .await;
         outcomes.push(outcome);
@@ -409,6 +443,7 @@ async fn broadcast_ddl(
             to_version,
             None,
             state.dialect.as_ref(),
+            &cross_package_configs,
         )
         .await;
         outcomes.push(outcome);
@@ -498,6 +533,24 @@ pub async fn install_package(
     let config_pool = ctx.config_pool();
     // migration_pool and schema_override are no longer used directly — broadcast_ddl handles all targets.
     let package_cache_key = ctx.package_cache_key().to_string();
+
+    // Check that all declared dependency packages are already installed.
+    if let Some(deps) = manifest_obj.get("dependencies").and_then(Value::as_array) {
+        let installed_ids: std::collections::HashSet<String> =
+            list_package_ids(config_pool).await?.into_iter().collect();
+        let missing: Vec<&str> = deps
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|dep| !installed_ids.contains(*dep))
+            .collect();
+        if !missing.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "package '{}' depends on [{}] which are not installed; install them first",
+                id,
+                missing.join(", ")
+            )));
+        }
+    }
 
     let incoming_version = manifest_obj
         .get("version")
@@ -653,6 +706,31 @@ pub async fn uninstall_package(
         return Err(AppError::NotFound(format!(
             "package not found: {}",
             package_id
+        )));
+    }
+
+    // Block uninstall if another installed package declares this one as a dependency.
+    let all_packages = list_packages(config_pool).await?;
+    let dependents: Vec<String> = all_packages
+        .iter()
+        .filter(|row| row.id != package_id)
+        .filter(|row| {
+            row.payload
+                .get("dependencies")
+                .and_then(Value::as_array)
+                .map(|deps| {
+                    deps.iter()
+                        .any(|d| d.as_str() == Some(package_id.as_str()))
+                })
+                .unwrap_or(false)
+        })
+        .map(|row| row.id.clone())
+        .collect();
+    if !dependents.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "cannot uninstall '{}': packages [{}] depend on it; uninstall them first",
+            package_id,
+            dependents.join(", ")
         )));
     }
 
@@ -971,6 +1049,7 @@ pub async fn preview_migration_handler(
         ctx.schema_override(),
         ctx.rls_tenant_column(),
         state.dialect.as_ref(),
+        &std::collections::HashMap::new(),
     )
     .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
 
@@ -1227,7 +1306,7 @@ pub async fn bootstrap_tenant_handler(
     let pool = get_or_create_tenant_pool(&state, tenant_id, database_url).await?;
 
     // apply_migrations is idempotent: safe on both an empty DB and an already-migrated one.
-    apply_migrations(&pool, &config, None, None, state.dialect.as_ref()).await?;
+    apply_migrations(&pool, &config, None, None, state.dialect.as_ref(), &std::collections::HashMap::new()).await?;
 
     // Populate the model cache for this tenant so entity routes resolve without a reload.
     let model = crate::config::resolve(&config)

@@ -46,7 +46,7 @@ pub(crate) async fn replace_config(
         let config = load_from_pool(pool, package_id)
             .await
             .map_err(AppError::Config)?;
-        apply_migrations(pool, &config, None, None, dialect.unwrap()).await?;
+        apply_migrations(pool, &config, None, None, dialect.unwrap(), &std::collections::HashMap::new()).await?;
     }
     Ok((body, count))
 }
