@@ -840,6 +840,12 @@ pub async fn list_packages_handler(
             .get("schema")
             .and_then(Value::as_str)
             .map(String::from);
+        let dependencies: Vec<&str> = pkg
+            .payload
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
 
         items.push(json!({
             "id": pkg.id,
@@ -848,6 +854,7 @@ pub async fn list_packages_handler(
             "schema": schema,
             "installedVersion": pkg.version,
             "updatedAt": pkg.updated_at,
+            "dependencies": dependencies,
             "stats": {
                 "schemas": schemas,
                 "enums": enums,
