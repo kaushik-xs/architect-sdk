@@ -1,8 +1,17 @@
 //! Config validation: referential integrity and API consistency.
 
+use crate::config::types::ColumnTypeConfig;
 use crate::config::{FullConfig, PrimaryKeyConfig};
 use crate::error::ConfigError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// The raw, user-authored type string for a column (before canonicalization).
+fn raw_type_str(t: &ColumnTypeConfig) -> &str {
+    match t {
+        ColumnTypeConfig::Simple(s) => s.as_str(),
+        ColumnTypeConfig::Parameterized { name, .. } => name.as_str(),
+    }
+}
 
 /// Default schema id when configs omit schema_id (manifest-driven schema).
 pub fn default_schema_id(config: &FullConfig) -> Result<&str, ConfigError> {
@@ -80,6 +89,52 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
         }
     }
 
+    // Validate schema-qualified enum-typed columns. A column type like
+    // `manufacturing_essential.material_unit` must reference an enum that this config actually
+    // defines under that schema. The common failure is a typo in the schema prefix (e.g.
+    // `manufactring_essential.material_unit`): the enum name is real but the qualified name is
+    // wrong, so `CREATE TABLE` later fails with "type ... does not exist", leaving a partial
+    // install. We catch it here, before any DDL or `_sys_*` writes.
+    let schema_name_by_id: HashMap<&str, &str> = config
+        .schemas
+        .iter()
+        .map(|s| (s.id.as_str(), s.name.as_str()))
+        .collect();
+    let mut enum_qnames: HashSet<String> = HashSet::new();
+    let mut enum_names: HashSet<&str> = HashSet::new();
+    for e in &config.enums {
+        let sid = e.schema_id.as_deref().unwrap_or(default_sid);
+        let sname = schema_name_by_id.get(sid).copied().unwrap_or(sid);
+        enum_qnames.insert(format!("{}.{}", sname, e.name));
+        enum_names.insert(e.name.as_str());
+    }
+    for c in &config.columns {
+        // Strip a trailing array marker so `schema.enum[]` is checked as `schema.enum`.
+        let base = raw_type_str(&c.type_).trim();
+        let base = base.strip_suffix("[]").unwrap_or(base).trim();
+        if let Some((_, type_part)) = base.rsplit_once('.') {
+            // Only flag types whose bare name matches a known enum: any other dotted type is an
+            // external/native type (e.g. `public.citext`) we cannot validate locally.
+            if enum_names.contains(type_part) && !enum_qnames.contains(base) {
+                let expected: Vec<String> = enum_qnames
+                    .iter()
+                    .filter(|q| q.ends_with(&format!(".{}", type_part)))
+                    .cloned()
+                    .collect();
+                return Err(ConfigError::Validation(format!(
+                    "column '{}' (table '{}') has type '{}', but no enum is defined with that \
+                     qualified name. Enum '{}' exists under a different schema — expected [{}]. \
+                     Check the schema prefix for a typo.",
+                    c.name,
+                    c.table_id,
+                    raw_type_str(&c.type_),
+                    type_part,
+                    expected.join(", "),
+                )));
+            }
+        }
+    }
+
     for idx in &config.indexes {
         let sid = idx.schema_id.as_deref().unwrap_or(default_sid);
         if !schema_ids.contains(sid) || !table_ids.contains(idx.table_id.as_str()) {
@@ -132,7 +187,7 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::config::types::{
-        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, FullConfig, PrimaryKeyConfig,
+        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, EnumConfig, FullConfig, PrimaryKeyConfig,
         SchemaConfig, TableConfig,
     };
 
@@ -141,6 +196,23 @@ mod tests {
             id: id.into(),
             name: id.into(),
             comment: None,
+        }
+    }
+
+    fn enum_def(id: &str, schema_id: Option<&str>, name: &str) -> EnumConfig {
+        EnumConfig {
+            id: id.into(),
+            schema_id: schema_id.map(Into::into),
+            name: name.into(),
+            values: vec!["a".into(), "b".into()],
+            comment: None,
+        }
+    }
+
+    fn typed_column(id: &str, table_id: &str, name: &str, ty: &str) -> ColumnConfig {
+        ColumnConfig {
+            type_: ColumnTypeConfig::Simple(ty.into()),
+            ..column(id, table_id, name)
         }
     }
 
@@ -331,6 +403,47 @@ mod tests {
             enabled: false,
             keep_versions: Some(0),
         });
+        assert!(validate(&c).is_ok());
+    }
+
+    // --- enum-typed column schema-prefix validation ---
+
+    #[test]
+    fn enum_column_correct_schema_passes() {
+        // schema "s1" has name "s1"; enum defined under it; column references "s1.status".
+        let mut c = minimal_config();
+        c.enums.push(enum_def("e1", None, "status"));
+        c.columns
+            .push(typed_column("c2", "t1", "state", "s1.status"));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn enum_column_typo_schema_prefix_fails() {
+        // enum "status" exists under "s1", but column references it under a typo'd schema.
+        let mut c = minimal_config();
+        c.enums.push(enum_def("e1", None, "status"));
+        c.columns
+            .push(typed_column("c2", "t1", "state", "s_typo.status"));
+        assert!(matches!(validate(&c), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn enum_array_column_typo_schema_prefix_fails() {
+        // Array marker is stripped before the check, so "s_typo.status[]" is still caught.
+        let mut c = minimal_config();
+        c.enums.push(enum_def("e1", None, "status"));
+        c.columns
+            .push(typed_column("c2", "t1", "state", "s_typo.status[]"));
+        assert!(matches!(validate(&c), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn dotted_external_type_passes() {
+        // A dotted type whose bare name is not a defined enum (e.g. an extension type) is skipped.
+        let mut c = minimal_config();
+        c.columns
+            .push(typed_column("c2", "t1", "name2", "public.citext"));
         assert!(validate(&c).is_ok());
     }
 

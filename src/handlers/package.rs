@@ -130,6 +130,34 @@ fn config_apply_order() -> Vec<&'static str> {
 /// Schema id used when manifest provides the schema name (no separate schemas.json).
 const DEFAULT_SCHEMA_ID: &str = "default";
 
+/// Build a `FullConfig` from the in-memory, per-kind config bodies read from the zip — the same
+/// shape `load_from_pool` produces, but without a round trip through the architect DB. Lets the
+/// installer validate and apply DDL before persisting anything.
+fn assemble_config(bodies: &[(&'static str, Vec<Value>)]) -> Result<FullConfig, AppError> {
+    fn de<T: serde::de::DeserializeOwned>(
+        bodies: &[(&'static str, Vec<Value>)],
+        kind: &str,
+    ) -> Result<Vec<T>, AppError> {
+        let arr = bodies
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        serde_json::from_value(Value::Array(arr))
+            .map_err(|e| AppError::BadRequest(format!("invalid {}: {}", kind, e)))
+    }
+    Ok(FullConfig {
+        schemas: de(bodies, "schemas")?,
+        enums: de(bodies, "enums")?,
+        tables: de(bodies, "tables")?,
+        columns: de(bodies, "columns")?,
+        indexes: de(bodies, "indexes")?,
+        relationships: de(bodies, "relationships")?,
+        api_entities: de(bodies, "api_entities")?,
+        kv_stores: de(bodies, "kv_stores")?,
+    })
+}
+
 fn inject_schema_id(body: &mut [Value], schema_id: &str) {
     for rec in body.iter_mut() {
         if let Some(obj) = rec.as_object_mut() {
@@ -600,17 +628,19 @@ pub async fn install_package(
         None
     };
 
-    let schemas_body = vec![serde_json::json!({
+    let schemas_body: Vec<Value> = vec![serde_json::json!({
         "id": DEFAULT_SCHEMA_ID,
         "name": schema_name
     })];
 
+    // Read and normalize every config kind from the zip into memory FIRST. Nothing is written to
+    // the architect DB or any tenant DB until the whole package validates and its DDL succeeds, so
+    // a bad package can never leave behind orphan `_sys_*` rows or half-created tables.
     let apply_order = config_apply_order();
-    let mut applied = Vec::with_capacity(apply_order.len());
+    let mut bodies: Vec<(&'static str, Vec<Value>)> = Vec::with_capacity(apply_order.len());
     for kind in &apply_order {
         let body: Vec<Value> = if *kind == "schemas" {
-            serde_json::from_value(Value::Array(schemas_body.clone()))
-                .map_err(|e| AppError::BadRequest(format!("schemas body: {}", e)))?
+            schemas_body.clone()
         } else {
             let mut body = read_kind_from_zip(&mut archive, kind)?;
             match *kind {
@@ -620,15 +650,15 @@ pub async fn install_package(
             }
             body
         };
-        replace_config(config_pool, kind, body, false, id, None).await?;
-        applied.push((*kind).to_string());
+        bodies.push((*kind, body));
     }
 
-    upsert_package(config_pool, id, &manifest_value).await?;
-
-    let config = load_from_pool(config_pool, id)
-        .await
-        .map_err(AppError::Config)?;
+    // Assemble and fully validate the config in memory (schema/type/reference checks, including
+    // enum schema-prefix typos) before touching any database.
+    let config = assemble_config(&bodies)?;
+    let new_model = resolve(&config)
+        .map_err(AppError::Config)?
+        .with_package_id(id);
 
     // Reject the install if the package contains asset columns but no storage is configured.
     reject_asset_columns_without_storage(&config, &state.storage)?;
@@ -648,15 +678,39 @@ pub async fn install_package(
     )
     .await;
 
+    // For a fresh install, abort if schema creation failed on any tenant — do NOT persist config,
+    // so the package is never recorded as installed when its tables do not exist. (Upgrades keep
+    // the prior best-effort behavior: the old version is already live and recorded.)
+    if !is_upgrade {
+        let failures: Vec<String> = tenant_outcomes
+            .iter()
+            .filter(|o| o.status == "failed")
+            .map(|o| format!("{}: {}", o.target, o.error.clone().unwrap_or_default()))
+            .collect();
+        if !failures.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "package '{}' installation failed during schema creation; no configuration was \
+                 saved. Errors: {}",
+                id,
+                failures.join("; ")
+            )));
+        }
+    }
+
+    // Schema creation succeeded — now persist the config to the architect DB.
+    let mut applied = Vec::with_capacity(bodies.len());
+    for (kind, body) in bodies {
+        replace_config(config_pool, kind, body, false, id, None).await?;
+        applied.push(kind.to_string());
+    }
+    upsert_package(config_pool, id, &manifest_value).await?;
+
     let migration_warnings: Vec<String> = tenant_outcomes
         .iter()
         .flat_map(|o| o.warnings.iter().cloned())
         .collect();
 
-    // Rebuild the in-memory ResolvedModel once and populate every tenant cache slot.
-    let new_model = resolve(&config)
-        .map_err(AppError::Config)?
-        .with_package_id(id);
+    // Populate the in-memory ResolvedModel for every tenant cache slot.
     {
         let mut model_guard = state
             .model
