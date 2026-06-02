@@ -345,10 +345,7 @@ pub async fn apply_migrations(
     }
 
     for rel in &config.relationships {
-        let from_sid = rel
-            .from_schema_id
-            .as_deref()
-            .unwrap_or(default_sid);
+        let from_sid = rel.from_schema_id.as_deref().unwrap_or(default_sid);
         let from_schema = schemas_by_id.get(from_sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
                 kind: "schema",
@@ -365,82 +362,80 @@ pub async fn apply_migrations(
             })?;
 
         // Resolve the target schema and table — either from a cross-package config or this config.
-        let (to_schema_name_owned, to_table_name, to_col_name) =
-            if let Some(pkg_id) = rel.to_package_id.as_deref() {
-                let foreign = cross_package_configs.get(pkg_id).ok_or_else(|| {
+        let (to_schema_name_owned, to_table_name, to_col_name) = if let Some(pkg_id) =
+            rel.to_package_id.as_deref()
+        {
+            let foreign = cross_package_configs.get(pkg_id).ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "cross_package",
+                    id: pkg_id.to_string(),
+                })
+            })?;
+            let foreign_tables: HashMap<_, _> =
+                foreign.tables.iter().map(|t| (t.id.as_str(), t)).collect();
+            let foreign_schemas: HashMap<_, _> =
+                foreign.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+            let to_tbl = foreign_tables
+                .get(rel.to_table_id.as_str())
+                .ok_or_else(|| {
                     AppError::Config(crate::error::ConfigError::MissingReference {
-                        kind: "cross_package",
-                        id: pkg_id.to_string(),
-                    })
-                })?;
-                let foreign_tables: HashMap<_, _> =
-                    foreign.tables.iter().map(|t| (t.id.as_str(), t)).collect();
-                let foreign_schemas: HashMap<_, _> =
-                    foreign.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
-                let to_tbl = foreign_tables
-                    .get(rel.to_table_id.as_str())
-                    .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
                         kind: "table",
                         id: rel.to_table_id.clone(),
-                    }))?;
-                let foreign_default_sid =
-                    foreign.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
-                let to_sid = rel
-                    .to_schema_id
-                    .as_deref()
-                    .unwrap_or(foreign_default_sid);
-                let to_schema = foreign_schemas
-                    .get(to_sid)
-                    .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
-                        kind: "schema",
-                        id: to_sid.to_string(),
-                    }))?;
-                let col_name = foreign
-                    .columns
-                    .iter()
-                    .find(|c| c.id == rel.to_column_id)
-                    .map(|c| c.name.clone())
-                    .ok_or_else(|| AppError::Config(crate::error::ConfigError::MissingReference {
+                    })
+                })?;
+            let foreign_default_sid = foreign.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+            let to_sid = rel.to_schema_id.as_deref().unwrap_or(foreign_default_sid);
+            let to_schema = foreign_schemas.get(to_sid).ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "schema",
+                    id: to_sid.to_string(),
+                })
+            })?;
+            let col_name = foreign
+                .columns
+                .iter()
+                .find(|c| c.id == rel.to_column_id)
+                .map(|c| c.name.clone())
+                .ok_or_else(|| {
+                    AppError::Config(crate::error::ConfigError::MissingReference {
                         kind: "column",
                         id: rel.to_column_id.clone(),
-                    }))?;
-                // Cross-package FKs always use the real schema name (no schema_override — the
-                // target package lives in its own schema, not the tenant override).
-                (to_schema.name.clone(), to_tbl.name.clone(), col_name)
-            } else {
-                let to_sid = rel
-                    .to_schema_id
-                    .as_deref()
-                    .unwrap_or(default_sid);
-                let to_schema = schemas_by_id.get(to_sid).ok_or_else(|| {
-                    AppError::Config(crate::error::ConfigError::MissingReference {
-                        kind: "schema",
-                        id: to_sid.to_string(),
                     })
                 })?;
-                let to_table = tables_by_id.get(rel.to_table_id.as_str()).ok_or_else(|| {
+            // Cross-package FKs always use the real schema name (no schema_override — the
+            // target package lives in its own schema, not the tenant override).
+            (to_schema.name.clone(), to_tbl.name.clone(), col_name)
+        } else {
+            let to_sid = rel.to_schema_id.as_deref().unwrap_or(default_sid);
+            let to_schema = schemas_by_id.get(to_sid).ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "schema",
+                    id: to_sid.to_string(),
+                })
+            })?;
+            let to_table = tables_by_id.get(rel.to_table_id.as_str()).ok_or_else(|| {
+                AppError::Config(crate::error::ConfigError::MissingReference {
+                    kind: "table",
+                    id: rel.to_table_id.clone(),
+                })
+            })?;
+            let col_name = config
+                .columns
+                .iter()
+                .find(|c| c.id == rel.to_column_id)
+                .map(|c| c.name.clone())
+                .ok_or_else(|| {
                     AppError::Config(crate::error::ConfigError::MissingReference {
-                        kind: "table",
-                        id: rel.to_table_id.clone(),
+                        kind: "column",
+                        id: rel.to_column_id.clone(),
                     })
                 })?;
-                let col_name = config
-                    .columns
-                    .iter()
-                    .find(|c| c.id == rel.to_column_id)
-                    .map(|c| c.name.clone())
-                    .ok_or_else(|| {
-                        AppError::Config(crate::error::ConfigError::MissingReference {
-                            kind: "column",
-                            id: rel.to_column_id.clone(),
-                        })
-                    })?;
-                (
-                    schema_override.unwrap_or(&to_schema.name).to_string(),
-                    to_table.name.clone(),
-                    col_name,
-                )
-            };
+            (
+                schema_override.unwrap_or(&to_schema.name).to_string(),
+                to_table.name.clone(),
+                col_name,
+            )
+        };
 
         let from_schema_name = schema_override.unwrap_or(&from_schema.name);
         let from_col = config
@@ -1528,10 +1523,7 @@ pub fn compute_migration_plan(
     // ── 6. Foreign keys ──────────────────────────────────────────────────────
     for old_rel in &old.relationships {
         if !new_rels.contains_key(old_rel.id.as_str()) {
-            let from_sid_fallback = old_rel
-                .from_schema_id
-                .as_deref()
-                .unwrap_or(default_old_sid);
+            let from_sid_fallback = old_rel.from_schema_id.as_deref().unwrap_or(default_old_sid);
             let from_schema = old_schemas
                 .get(from_sid_fallback)
                 .map(|s| s.name.as_str())
@@ -1574,10 +1566,7 @@ pub fn compute_migration_plan(
         {
             continue;
         }
-        let from_sid = new_rel
-            .from_schema_id
-            .as_deref()
-            .unwrap_or(default_new_sid);
+        let from_sid = new_rel.from_schema_id.as_deref().unwrap_or(default_new_sid);
         let from_schema = match new_schemas.get(from_sid) {
             Some(s) => s,
             None => continue,
@@ -1627,10 +1616,7 @@ pub fn compute_migration_plan(
                     None => continue,
                 }
             } else {
-                let to_sid = new_rel
-                    .to_schema_id
-                    .as_deref()
-                    .unwrap_or(default_new_sid);
+                let to_sid = new_rel.to_schema_id.as_deref().unwrap_or(default_new_sid);
                 let to_schema = match new_schemas.get(to_sid) {
                     Some(s) => s,
                     None => continue,
@@ -1646,9 +1632,7 @@ pub fn compute_migration_plan(
                     .map(|c| c.name.clone())
                     .unwrap_or_else(|| new_rel.to_column_id.clone());
                 (
-                    schema_override
-                        .unwrap_or(&to_schema.name)
-                        .to_string(),
+                    schema_override.unwrap_or(&to_schema.name).to_string(),
                     to_table.name.clone(),
                     col,
                 )

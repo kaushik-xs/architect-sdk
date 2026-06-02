@@ -223,9 +223,16 @@ async fn migration_creates_app_table() {
     let dialect = active_dialect();
     let config = notes_config();
 
-    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
-        .await
-        .expect("apply_migrations");
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("apply_migrations");
 
     // Table should exist — SELECT returns 0 rows, not an error
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM \"main\".\"notes\"")
@@ -241,13 +248,27 @@ async fn migration_is_idempotent() {
     let dialect = active_dialect();
     let config = notes_config();
 
-    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
-        .await
-        .expect("first apply");
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("first apply");
     // Running twice must not error (CREATE TABLE IF NOT EXISTS)
-    apply_migrations(&pool, &config, None, None, dialect.as_ref(), &HashMap::new())
-        .await
-        .expect("second apply should be idempotent");
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("second apply should be idempotent");
 }
 
 // ── CrudService: notes (serial / integer PK) ─────────────────────────────────

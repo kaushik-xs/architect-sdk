@@ -268,7 +268,16 @@ async fn apply_ddl_to_pool(
         }
         // Fresh install path: apply the full schema.
         None => {
-            match apply_migrations(migration_pool, config, None, rls_tenant_column, dialect, cross_package_configs).await {
+            match apply_migrations(
+                migration_pool,
+                config,
+                None,
+                rls_tenant_column,
+                dialect,
+                cross_package_configs,
+            )
+            .await
+            {
                 Ok(()) => TenantMigrationOutcome {
                     target: target.to_string(),
                     strategy: strategy.to_string(),
@@ -321,8 +330,12 @@ async fn broadcast_ddl(
                         continue;
                     }
                     match load_from_pool(config_pool, &pid).await {
-                        Ok(cfg) => { map.insert(pid, cfg); }
-                        Err(e) => tracing::warn!(pkg = %pid, error = %e, "could not load cross-package config for FK resolution"),
+                        Ok(cfg) => {
+                            map.insert(pid, cfg);
+                        }
+                        Err(e) => {
+                            tracing::warn!(pkg = %pid, error = %e, "could not load cross-package config for FK resolution")
+                        }
                     }
                 }
                 map
@@ -339,7 +352,14 @@ async fn broadcast_ddl(
     // the same plan is valid for both RLS and Database targets.
     let plan: Option<MigrationPlan> = match old_config {
         Some(old) => {
-            match compute_migration_plan(old, config, None, None, state.dialect.as_ref(), &cross_package_configs) {
+            match compute_migration_plan(
+                old,
+                config,
+                None,
+                None,
+                state.dialect.as_ref(),
+                &cross_package_configs,
+            ) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::error!(error = %e, "could not compute migration plan for broadcast");
@@ -718,10 +738,7 @@ pub async fn uninstall_package(
             row.payload
                 .get("dependencies")
                 .and_then(Value::as_array)
-                .map(|deps| {
-                    deps.iter()
-                        .any(|d| d.as_str() == Some(package_id.as_str()))
-                })
+                .map(|deps| deps.iter().any(|d| d.as_str() == Some(package_id.as_str())))
                 .unwrap_or(false)
         })
         .map(|row| row.id.clone())
@@ -1313,7 +1330,15 @@ pub async fn bootstrap_tenant_handler(
     let pool = get_or_create_tenant_pool(&state, tenant_id, database_url).await?;
 
     // apply_migrations is idempotent: safe on both an empty DB and an already-migrated one.
-    apply_migrations(&pool, &config, None, None, state.dialect.as_ref(), &std::collections::HashMap::new()).await?;
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        state.dialect.as_ref(),
+        &std::collections::HashMap::new(),
+    )
+    .await?;
 
     // Populate the model cache for this tenant so entity routes resolve without a reload.
     let model = crate::config::resolve(&config)
