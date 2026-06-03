@@ -1285,10 +1285,8 @@ mod versioning_tests {
     #[test]
     fn coerce_array_splits_comma_separated_string() {
         // multipart sends a single field as one comma-separated string.
-        let v = coerce_json_value_for_pg_array(
-            Value::String("id1, id2".to_string()),
-            Some("uuid[]"),
-        );
+        let v =
+            coerce_json_value_for_pg_array(Value::String("id1, id2".to_string()), Some("uuid[]"));
         assert_eq!(v, Value::String("{\"id1\",\"id2\"}".to_string()));
     }
 
