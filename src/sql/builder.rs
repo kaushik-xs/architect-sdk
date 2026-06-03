@@ -110,8 +110,22 @@ pub fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Valu
             out.push('}');
             Value::String(out)
         }
-        // For convenience, treat scalar JSON values as single-element arrays so that
-        // clients can send `"id"` instead of `["id"]` for uuid[] and other array columns.
+        // multipart/form-data sends every field as a scalar string, so an array column
+        // arrives as a single comma-separated string (e.g. "id1, id2"). Split it into
+        // elements — trimming whitespace and dropping empties — so it binds as a real
+        // array. A string with no comma becomes a single-element array (clients can send
+        // `"id"` instead of `["id"]`). JSON clients send a proper `Value::Array` and hit
+        // the arm above, so their comma-containing values are never split.
+        Value::String(s) => {
+            let items: Vec<Value> = s
+                .split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| Value::String(part.to_string()))
+                .collect();
+            coerce_json_value_for_pg_array(Value::Array(items), pg_type)
+        }
+        // Other scalar JSON values (number, bool) → single-element array for convenience.
         other => coerce_json_value_for_pg_array(Value::Array(vec![other]), pg_type),
     }
 }
@@ -1266,6 +1280,47 @@ mod versioning_tests {
         let q = select_history_list(&entity, Some("tenant1"), &d);
         assert!(q.sql.contains("\"tenant1\""));
         assert!(!q.sql.contains("\"myschema\""));
+    }
+
+    #[test]
+    fn coerce_array_splits_comma_separated_string() {
+        // multipart sends a single field as one comma-separated string.
+        let v = coerce_json_value_for_pg_array(
+            Value::String("id1, id2".to_string()),
+            Some("uuid[]"),
+        );
+        assert_eq!(v, Value::String("{\"id1\",\"id2\"}".to_string()));
+    }
+
+    #[test]
+    fn coerce_array_single_string_is_one_element() {
+        let v = coerce_json_value_for_pg_array(Value::String("id1".to_string()), Some("uuid[]"));
+        assert_eq!(v, Value::String("{\"id1\"}".to_string()));
+    }
+
+    #[test]
+    fn coerce_array_drops_empty_segments() {
+        let v = coerce_json_value_for_pg_array(
+            Value::String("id1, , id2,".to_string()),
+            Some("text[]"),
+        );
+        assert_eq!(v, Value::String("{\"id1\",\"id2\"}".to_string()));
+    }
+
+    #[test]
+    fn coerce_array_json_array_is_not_split() {
+        // JSON clients send a real array; a comma inside an element is preserved.
+        let v = coerce_json_value_for_pg_array(
+            Value::Array(vec![Value::String("a,b".to_string())]),
+            Some("text[]"),
+        );
+        assert_eq!(v, Value::String("{\"a,b\"}".to_string()));
+    }
+
+    #[test]
+    fn coerce_array_noop_for_non_array_column() {
+        let v = coerce_json_value_for_pg_array(Value::String("id1, id2".to_string()), Some("uuid"));
+        assert_eq!(v, Value::String("id1, id2".to_string()));
     }
 }
 
