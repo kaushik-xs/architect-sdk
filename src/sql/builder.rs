@@ -130,18 +130,20 @@ pub fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Valu
     }
 }
 
-/// Placeholder for PK in WHERE (e.g. $1 or $1::uuid) so bound text is cast when column is UUID.
+/// Placeholder for PK in WHERE (e.g. $1, $1::uuid, $1::bigint) so the bound value — which
+/// always travels over the wire as TEXT — is cast to the column type. Without this, a numeric
+/// PK comparison fails with `operator does not exist: bigint = text`.
 fn pk_placeholder(entity: &ResolvedEntity, param_num: usize, dialect: &dyn Dialect) -> String {
     let ph = dialect.placeholder(param_num);
-    match &entity.pk_type {
-        PkType::Uuid => {
-            if let Some(cast) = dialect.cast_name(&crate::db::CanonicalType::Uuid) {
-                dialect.cast_expr(&ph, &cast)
-            } else {
-                ph
-            }
-        }
-        _ => ph,
+    let canonical = match &entity.pk_type {
+        PkType::Uuid => crate::db::CanonicalType::Uuid,
+        PkType::BigInt => crate::db::CanonicalType::BigInt,
+        PkType::Int => crate::db::CanonicalType::Int,
+        PkType::Text => return ph,
+    };
+    match dialect.cast_name(&canonical) {
+        Some(cast) => dialect.cast_expr(&ph, &cast),
+        None => ph,
     }
 }
 
@@ -1319,6 +1321,52 @@ mod versioning_tests {
     fn coerce_array_noop_for_non_array_column() {
         let v = coerce_json_value_for_pg_array(Value::String("id1, id2".to_string()), Some("uuid"));
         assert_eq!(v, Value::String("id1, id2".to_string()));
+    }
+
+    #[cfg(feature = "postgres")]
+    fn entity_with_pk(pk_type: PkType) -> ResolvedEntity {
+        let mut e = make_entity();
+        e.pk_type = pk_type;
+        e
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn select_by_id_casts_uuid_pk() {
+        let d = crate::db::PostgresDialect;
+        let q = select_by_id(&entity_with_pk(PkType::Uuid), None, &d);
+        assert!(q.sql.contains("\"id\" = $1::uuid"), "got: {}", q.sql);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn select_by_id_casts_bigint_pk() {
+        // Auto-number (BIGSERIAL) PKs resolve to PkType::BigInt; bound values arrive as TEXT,
+        // so the placeholder must be cast or Postgres errors with `bigint = text`.
+        let d = crate::db::PostgresDialect;
+        let q = select_by_id(&entity_with_pk(PkType::BigInt), None, &d);
+        assert!(q.sql.contains("\"id\" = $1::bigint"), "got: {}", q.sql);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn select_by_id_casts_int_pk() {
+        let d = crate::db::PostgresDialect;
+        let q = select_by_id(&entity_with_pk(PkType::Int), None, &d);
+        assert!(q.sql.contains("\"id\" = $1::integer"), "got: {}", q.sql);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn select_by_id_leaves_text_pk_uncast() {
+        let d = crate::db::PostgresDialect;
+        let q = select_by_id(&entity_with_pk(PkType::Text), None, &d);
+        assert!(q.sql.contains("\"id\" = $1"), "got: {}", q.sql);
+        assert!(
+            !q.sql.contains("$1::"),
+            "text PK should not be cast: {}",
+            q.sql
+        );
     }
 }
 
