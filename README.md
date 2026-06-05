@@ -106,10 +106,10 @@ No database or network connection required — all tests are in-process.
 
 ### Coverage
 
-Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **107 tests** (89 unit + 18 SQLite integration):
+Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **112 tests** (94 unit + 18 SQLite integration):
 
 ```
-TOTAL   lines: 20.38%   functions: 25.80%   regions: 21.18%
+TOTAL   lines: 23.48%   functions: 28.69%   regions: 24.22%
 ```
 
 Coverage nearly doubled after adding SQLite integration tests (was 8.15% lines / 14.02% functions). The remaining uncovered code is Axum HTTP handlers, OpenAPI generation, package ZIP processing, event publishing, and Authrs — all of which require a full HTTP stack or external services and are exercised through end-to-end testing.
@@ -132,7 +132,7 @@ These tests run the full CRUD stack — migrations, SQL builder, `CrudService`, 
 | `src/service/crud.rs` | **22.81%** | **33.33%** | **18.62%** |
 | `src/sql/builder.rs` | **47.87%** | **45.63%** | **50.22%** |
 | `src/store.rs` | **24.20%** | **14.29%** | **28.30%** |
-| `src/migration.rs` | **21.23%** | **23.53%** | **19.36%** |
+| `src/migration.rs` | **39.13%** | **45.06%** | **36.72%** |
 | `src/config/loader.rs` | **38.96%** | **48.28%** | **46.03%** |
 | `src/db/sqlite.rs` | **29.66%** | **40.74%** | **26.95%** |
 
