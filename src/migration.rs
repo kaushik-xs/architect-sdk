@@ -1446,6 +1446,14 @@ pub fn compute_migration_plan(
                     risk: MigrationRisk::None,
                     risk_detail: None,
                 });
+                steps.extend(companion_column_steps(
+                    &schema,
+                    table,
+                    &CompanionColumnOp::Rename {
+                        old: &old_col.name,
+                        new: &new_col.name,
+                    },
+                ));
             }
 
             // Type change
@@ -1466,6 +1474,14 @@ pub fn compute_migration_plan(
                     risk: MigrationRisk::MayFail,
                     risk_detail: Some(format!("USING {}::{} cast may fail for incompatible values. Provide a custom USING expression if needed.", col_name, new_type)),
                 });
+                steps.extend(companion_column_steps(
+                    &schema,
+                    table,
+                    &CompanionColumnOp::AlterType {
+                        name: col_name.as_str(),
+                        ty: &new_type,
+                    },
+                ));
             }
 
             // Nullability: nullable → NOT NULL
@@ -1635,6 +1651,14 @@ pub fn compute_migration_plan(
                 risk: MigrationRisk::None,
                 risk_detail: None,
             });
+            steps.extend(companion_column_steps(
+                &schema,
+                table,
+                &CompanionColumnOp::Add {
+                    name: &new_col.name,
+                    ty: &new_type,
+                },
+            ));
         }
     }
 
@@ -2171,6 +2195,120 @@ fn history_index_ddl(schema_name: &str, table_name: &str, pk_col: &str) -> Strin
     )
 }
 
+/// A structural column change that must be mirrored onto companion (`_audit`/`_history`) tables.
+enum CompanionColumnOp<'a> {
+    /// A new column was added to the source table.
+    Add { name: &'a str, ty: &'a str },
+    /// A source column was renamed.
+    Rename { old: &'a str, new: &'a str },
+    /// A source column's type changed.
+    AlterType { name: &'a str, ty: &'a str },
+}
+
+/// Companion-table suffixes that are enabled for a table (`audit`, `history`).
+fn enabled_companion_suffixes(table: &TableConfig) -> Vec<&'static str> {
+    let mut suffixes = Vec::new();
+    if table.audit_log {
+        suffixes.push("audit");
+    }
+    if table.versioning.as_ref().is_some_and(|v| v.enabled) {
+        suffixes.push("history");
+    }
+    suffixes
+}
+
+/// Generate ALTER steps that keep the `{table}_audit` / `{table}_history` companion tables in
+/// schema-sync with their source table when a column is added, renamed, or retyped.
+///
+/// Companion tables replicate source columns as **nullable with no constraints**, so only
+/// structural changes propagate here. Nullability and default changes on the source column are
+/// intentionally NOT mirrored — companion rows are historical snapshots that must stay nullable.
+fn companion_column_steps(
+    schema: &str,
+    table: &TableConfig,
+    op: &CompanionColumnOp<'_>,
+) -> Vec<MigrationStep> {
+    let mut steps = Vec::new();
+    for suffix in enabled_companion_suffixes(table) {
+        let companion = format!("{}_{}", table.name, suffix);
+        let full = format!("{}.{}", quote(schema), quote(&companion));
+        let (operation, object, ddl, description, safety, risk, risk_detail) = match op {
+            CompanionColumnOp::Add { name, ty } => (
+                MigrationOperation::AddColumn,
+                name.to_string(),
+                // IF NOT EXISTS guards against collisions with synthetic columns the companion
+                // table may already carry (e.g. created_at/updated_by).
+                format!(
+                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
+                    full,
+                    quote(name),
+                    ty
+                ),
+                format!(
+                    "Sync {} table: add column \"{}\" to \"{}\".\"{}\"",
+                    suffix, name, schema, companion
+                ),
+                MigrationSafety::Safe,
+                MigrationRisk::None,
+                None,
+            ),
+            CompanionColumnOp::Rename { old, new } => (
+                MigrationOperation::RenameColumn,
+                new.to_string(),
+                format!(
+                    "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                    full,
+                    quote(old),
+                    quote(new)
+                ),
+                format!(
+                    "Sync {} table: rename column \"{}\" → \"{}\" on \"{}\".\"{}\"",
+                    suffix, old, new, schema, companion
+                ),
+                MigrationSafety::Safe,
+                MigrationRisk::None,
+                None,
+            ),
+            CompanionColumnOp::AlterType { name, ty } => (
+                MigrationOperation::AlterColumnType,
+                name.to_string(),
+                format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}",
+                    full,
+                    quote(name),
+                    ty,
+                    quote(name),
+                    ty
+                ),
+                format!(
+                    "Sync {} table: change type of \"{}\".\"{}\".\"{}\" → {}",
+                    suffix, schema, companion, name, ty
+                ),
+                MigrationSafety::BestEffort,
+                MigrationRisk::MayFail,
+                Some(format!(
+                    "USING {}::{} cast may fail for incompatible values in the {} table.",
+                    name, ty, suffix
+                )),
+            ),
+        };
+        steps.push(MigrationStep {
+            step: 0,
+            operation,
+            schema: schema.to_string(),
+            table: Some(companion.clone()),
+            object,
+            object_type: "column".into(),
+            description,
+            ddl: Some(ddl),
+            safety,
+            risk,
+            risk_detail,
+        });
+    }
+    steps
+}
+
 /// Build CREATE TABLE DDL for the `{table}_audit` companion table.
 /// All source columns are replicated as nullable with no constraints, plus five audit metadata
 /// columns prepended: audit_id (PK), audit_action, audit_at, audit_by, changed_fields.
@@ -2374,5 +2512,141 @@ mod enum_recreate_tests {
             *sql.last().unwrap(),
             r#"DROP TYPE IF EXISTS "app"."order_status__arch_old""#
         );
+    }
+}
+
+#[cfg(test)]
+mod companion_sync_tests {
+    use super::*;
+    use crate::db::sqlite::SqliteDialect;
+
+    fn schema(id: &str, name: &str) -> SchemaConfig {
+        SchemaConfig {
+            id: id.into(),
+            name: name.into(),
+            comment: None,
+        }
+    }
+
+    fn table(id: &str, name: &str, audit: bool, versioning: bool) -> TableConfig {
+        TableConfig {
+            id: id.into(),
+            schema_id: Some("s1".into()),
+            name: name.into(),
+            comment: None,
+            primary_key: PrimaryKeyConfig::Single("id".into()),
+            unique: vec![],
+            check: vec![],
+            audit_log: audit,
+            versioning: versioning.then(|| VersioningConfig {
+                enabled: true,
+                keep_versions: None,
+            }),
+        }
+    }
+
+    fn col(id: &str, name: &str, ty: &str) -> ColumnConfig {
+        ColumnConfig {
+            id: id.into(),
+            table_id: "t1".into(),
+            name: name.into(),
+            type_: ColumnTypeConfig::Simple(ty.into()),
+            nullable: true,
+            default: None,
+            comment: None,
+            asset: None,
+        }
+    }
+
+    fn base(audit: bool, versioning: bool) -> FullConfig {
+        let mut cfg = FullConfig::default();
+        cfg.schemas = vec![schema("s1", "app")];
+        cfg.tables = vec![table("t1", "orders", audit, versioning)];
+        cfg.columns = vec![col("c0", "id", "uuid"), col("c1", "status", "text")];
+        cfg
+    }
+
+    fn plan(old: &FullConfig, new: &FullConfig) -> Vec<String> {
+        let dialect = SqliteDialect;
+        compute_migration_plan(old, new, None, None, &dialect, &HashMap::new())
+            .unwrap()
+            .steps
+            .into_iter()
+            .filter_map(|s| s.ddl)
+            .collect()
+    }
+
+    #[test]
+    fn add_column_syncs_audit_and_history() {
+        let old = base(true, true);
+        let mut new = base(true, true);
+        new.columns.push(col("c2", "note", "text"));
+
+        let sql = plan(&old, &new);
+        assert!(sql
+            .iter()
+            .any(|s| s == r#"ALTER TABLE "app"."orders" ADD COLUMN "note" TEXT"#));
+        assert!(sql.iter().any(
+            |s| s == r#"ALTER TABLE "app"."orders_audit" ADD COLUMN IF NOT EXISTS "note" TEXT"#
+        ));
+        assert!(sql
+            .iter()
+            .any(|s| s
+                == r#"ALTER TABLE "app"."orders_history" ADD COLUMN IF NOT EXISTS "note" TEXT"#));
+    }
+
+    #[test]
+    fn rename_column_syncs_companions() {
+        let old = base(true, true);
+        let mut new = base(true, true);
+        new.columns[1].name = "state".into();
+
+        let sql = plan(&old, &new);
+        assert!(sql
+            .iter()
+            .any(|s| s == r#"ALTER TABLE "app"."orders_audit" RENAME COLUMN "status" TO "state""#));
+        assert!(sql.iter().any(
+            |s| s == r#"ALTER TABLE "app"."orders_history" RENAME COLUMN "status" TO "state""#
+        ));
+    }
+
+    #[test]
+    fn alter_type_syncs_companions() {
+        let old = base(true, false);
+        let mut new = base(true, false);
+        new.columns[1].type_ = ColumnTypeConfig::Simple("integer".into());
+
+        let sql = plan(&old, &new);
+        assert!(sql.iter().any(|s| s
+            == r#"ALTER TABLE "app"."orders_audit" ALTER COLUMN "status" TYPE INTEGER USING "status"::INTEGER"#));
+        // versioning disabled → no history sync
+        assert!(!sql.iter().any(|s| s.contains("orders_history")));
+    }
+
+    #[test]
+    fn no_companion_steps_when_features_disabled() {
+        let old = base(false, false);
+        let mut new = base(false, false);
+        new.columns.push(col("c2", "note", "text"));
+
+        let sql = plan(&old, &new);
+        assert!(sql
+            .iter()
+            .any(|s| s == r#"ALTER TABLE "app"."orders" ADD COLUMN "note" TEXT"#));
+        assert!(!sql.iter().any(|s| s.contains("orders_audit")));
+        assert!(!sql.iter().any(|s| s.contains("orders_history")));
+    }
+
+    #[test]
+    fn nullability_change_does_not_touch_companions() {
+        let old = base(true, true);
+        let mut new = base(true, true);
+        new.columns[1].nullable = false;
+
+        let sql = plan(&old, &new);
+        // Main table gets SET NOT NULL, companions are untouched (snapshots stay nullable).
+        assert!(sql.iter().any(|s| s.contains("SET NOT NULL")));
+        assert!(!sql.iter().any(|s| s.contains("orders_audit")));
+        assert!(!sql.iter().any(|s| s.contains("orders_history")));
     }
 }
