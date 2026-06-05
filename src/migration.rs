@@ -680,6 +680,265 @@ fn default_str(d: &ColumnDefaultConfig) -> String {
     }
 }
 
+/// A column whose type is (an array of) a given enum — i.e. one that must be recast when the
+/// enum type is rebuilt.
+struct EnumColumnRef {
+    schema: String,
+    table: String,
+    column: String,
+    default: Option<String>,
+    is_array: bool,
+}
+
+/// If `t` is a custom enum reference (`schema.name`, bare `name`, or an array of one), return
+/// `(enum_name, is_array)` where `enum_name` is the unqualified type name. None for built-in types.
+fn enum_type_name(t: &crate::db::CanonicalType) -> Option<(String, bool)> {
+    use crate::db::CanonicalType;
+    let unqualified = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+    match t {
+        CanonicalType::Custom(s) => Some((unqualified(s), false)),
+        CanonicalType::Array(inner) => match inner.as_ref() {
+            CanonicalType::Custom(s) => Some((unqualified(s), true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Find every column in `new` whose type is `new_enum` (or an array of it), resolved to its live
+/// table/schema name. Used to drive the recast steps of an enum rebuild.
+fn enum_dependent_columns(
+    new_enum: &EnumConfig,
+    new: &FullConfig,
+    new_tables: &HashMap<&str, &TableConfig>,
+    new_schemas: &HashMap<&str, &SchemaConfig>,
+    schema_override: Option<&str>,
+) -> Vec<EnumColumnRef> {
+    let default_sid = new.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+    let mut out = Vec::new();
+    for c in &new.columns {
+        let Some((tyname, is_array)) = enum_type_name(&parse_canonical(&c.type_)) else {
+            continue;
+        };
+        if tyname != new_enum.name {
+            continue;
+        }
+        let Some(table) = new_tables.get(c.table_id.as_str()) else {
+            continue;
+        };
+        let tsid = table.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schema_override.map(String::from).unwrap_or_else(|| {
+            new_schemas
+                .get(tsid)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| tsid.to_string())
+        });
+        out.push(EnumColumnRef {
+            schema,
+            table: table.name.clone(),
+            column: c.name.clone(),
+            default: c.default.as_ref().map(default_str),
+            is_array,
+        });
+    }
+    out
+}
+
+/// PostgreSQL cannot drop a value from an enum in place, so when one is removed the type must be
+/// rebuilt: rename the live type aside, create it afresh with the reduced value set, recast every
+/// dependent column through a text cast, then drop the old type. Steps are emitted as `BestEffort`
+/// — a recast that fails because a row still holds a removed value is surfaced as a warning rather
+/// than aborting the whole upgrade. Each statement is a separate step because `execute_migration_plan`
+/// runs them individually (the extended protocol forbids multiple statements per query).
+fn recreate_enum_steps(
+    steps: &mut Vec<MigrationStep>,
+    schema: &str,
+    new_enum: &EnumConfig,
+    removed: &[&str],
+    dependents: &[EnumColumnRef],
+) {
+    let type_q = format!("{}.{}", quote(schema), quote(&new_enum.name));
+    let tmp_name = format!("{}__arch_old", new_enum.name);
+    let values: Vec<String> = new_enum
+        .values
+        .iter()
+        .map(|v| format!("'{}'", v.replace('\'', "''")))
+        .collect();
+
+    // 0. Informational summary of the destructive rebuild (no DDL).
+    steps.push(MigrationStep {
+        step: 0,
+        operation: MigrationOperation::RemoveEnumValue,
+        schema: schema.to_string(),
+        table: None,
+        object: format!("{}:{}", new_enum.name, removed.join(",")),
+        object_type: "enum".into(),
+        description: format!(
+            "Rebuild enum \"{}\".\"{}\" to remove value(s): {}",
+            schema,
+            new_enum.name,
+            removed.join(", ")
+        ),
+        ddl: None,
+        safety: MigrationSafety::WarnOnly,
+        risk: MigrationRisk::ManualActionRequired,
+        risk_detail: Some(format!(
+            "PostgreSQL cannot drop enum values in place. The type is rebuilt and {} dependent \
+             column(s) are recast via a text cast. Any existing row holding a removed value ({}) \
+             will make its recast fail — reassign those rows first.",
+            dependents.len(),
+            removed.join(", ")
+        )),
+    });
+
+    // 1. Rename the live type aside.
+    steps.push(MigrationStep {
+        step: 0,
+        operation: MigrationOperation::DropEnum,
+        schema: schema.to_string(),
+        table: None,
+        object: new_enum.name.clone(),
+        object_type: "enum".into(),
+        description: format!(
+            "Rename enum \"{}\".\"{}\" to \"{}\" before rebuild",
+            schema, new_enum.name, tmp_name
+        ),
+        ddl: Some(format!(
+            "ALTER TYPE {} RENAME TO {}",
+            type_q,
+            quote(&tmp_name)
+        )),
+        safety: MigrationSafety::BestEffort,
+        risk: MigrationRisk::None,
+        risk_detail: None,
+    });
+
+    // 2. Create the type afresh with the reduced value set (folds in any added values too).
+    steps.push(MigrationStep {
+        step: 0,
+        operation: MigrationOperation::CreateEnum,
+        schema: schema.to_string(),
+        table: None,
+        object: new_enum.name.clone(),
+        object_type: "enum".into(),
+        description: format!(
+            "Recreate enum \"{}\".\"{}\" with {} value(s)",
+            schema,
+            new_enum.name,
+            new_enum.values.len()
+        ),
+        ddl: Some(format!(
+            "CREATE TYPE {} AS ENUM ({})",
+            type_q,
+            values.join(", ")
+        )),
+        safety: MigrationSafety::BestEffort,
+        risk: MigrationRisk::None,
+        risk_detail: None,
+    });
+
+    // 3. Recast every dependent column from the renamed type onto the rebuilt one. A column with a
+    //    default must drop it first (the default still references the renamed type) and restore it after.
+    for dep in dependents {
+        let table_q = format!("{}.{}", quote(&dep.schema), quote(&dep.table));
+        let col_q = quote(&dep.column);
+
+        if dep.default.is_some() {
+            steps.push(MigrationStep {
+                step: 0,
+                operation: MigrationOperation::DropDefault,
+                schema: dep.schema.clone(),
+                table: Some(dep.table.clone()),
+                object: dep.column.clone(),
+                object_type: "column".into(),
+                description: format!(
+                    "Drop default on {}.{} before enum recast",
+                    dep.table, dep.column
+                ),
+                ddl: Some(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT",
+                    table_q, col_q
+                )),
+                safety: MigrationSafety::BestEffort,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            });
+        }
+
+        let (col_type, using) = if dep.is_array {
+            (
+                format!("{}[]", type_q),
+                format!("{}::text[]::{}[]", col_q, type_q),
+            )
+        } else {
+            (type_q.clone(), format!("{}::text::{}", col_q, type_q))
+        };
+        steps.push(MigrationStep {
+            step: 0,
+            operation: MigrationOperation::AlterColumnType,
+            schema: dep.schema.clone(),
+            table: Some(dep.table.clone()),
+            object: dep.column.clone(),
+            object_type: "column".into(),
+            description: format!(
+                "Recast {}.{} onto rebuilt enum \"{}\"",
+                dep.table, dep.column, new_enum.name
+            ),
+            ddl: Some(format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}",
+                table_q, col_q, col_type, using
+            )),
+            safety: MigrationSafety::BestEffort,
+            risk: MigrationRisk::MayFail,
+            risk_detail: Some(format!(
+                "Cast fails if any row holds a removed value ({}).",
+                removed.join(", ")
+            )),
+        });
+
+        if let Some(def) = &dep.default {
+            steps.push(MigrationStep {
+                step: 0,
+                operation: MigrationOperation::SetDefault,
+                schema: dep.schema.clone(),
+                table: Some(dep.table.clone()),
+                object: dep.column.clone(),
+                object_type: "column".into(),
+                description: format!(
+                    "Restore default on {}.{} after enum recast",
+                    dep.table, dep.column
+                ),
+                ddl: Some(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {}",
+                    table_q, col_q, def
+                )),
+                safety: MigrationSafety::BestEffort,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            });
+        }
+    }
+
+    // 4. Drop the renamed original type.
+    steps.push(MigrationStep {
+        step: 0,
+        operation: MigrationOperation::DropEnum,
+        schema: schema.to_string(),
+        table: None,
+        object: tmp_name.clone(),
+        object_type: "enum".into(),
+        description: format!("Drop superseded enum \"{}\".\"{}\"", schema, tmp_name),
+        ddl: Some(format!(
+            "DROP TYPE IF EXISTS {}.{}",
+            quote(schema),
+            quote(&tmp_name)
+        )),
+        safety: MigrationSafety::BestEffort,
+        risk: MigrationRisk::None,
+        risk_detail: None,
+    });
+}
+
 // ─── compute_migration_plan ──────────────────────────────────────────────────
 
 /// Diff two package configs and produce an ordered list of migration steps.
@@ -767,56 +1026,55 @@ pub fn compute_migration_plan(
         if let Some(old_enum) = old_enums.get(new_enum.id.as_str()) {
             let old_vals: HashSet<&str> = old_enum.values.iter().map(String::as_str).collect();
             let new_vals: HashSet<&str> = new_enum.values.iter().map(String::as_str).collect();
-            for val in new_enum
-                .values
-                .iter()
-                .map(String::as_str)
-                .filter(|v| !old_vals.contains(v))
-            {
-                steps.push(MigrationStep {
-                    step: 0,
-                    operation: MigrationOperation::AddEnumValue,
-                    schema: schema.clone(),
-                    table: None,
-                    object: format!("{}:{}", new_enum.name, val),
-                    object_type: "enum_value".into(),
-                    description: format!(
-                        "Add value '{}' to enum \"{}\".\"{}\"",
-                        val, schema, new_enum.name
-                    ),
-                    ddl: Some(format!(
-                        "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}'",
-                        quote(&schema),
-                        quote(&new_enum.name),
-                        val.replace('\'', "''")
-                    )),
-                    safety: MigrationSafety::Safe,
-                    risk: MigrationRisk::None,
-                    risk_detail: None,
-                });
-            }
-            for val in old_enum
+            let removed: Vec<&str> = old_enum
                 .values
                 .iter()
                 .map(String::as_str)
                 .filter(|v| !new_vals.contains(v))
-            {
-                steps.push(MigrationStep {
-                    step: 0,
-                    operation: MigrationOperation::RemoveEnumValue,
-                    schema: schema.clone(),
-                    table: None,
-                    object: format!("{}:{}", new_enum.name, val),
-                    object_type: "enum_value".into(),
-                    description: format!("Enum value '{}' removed from config on \"{}\".\"{}\"", val, schema, new_enum.name),
-                    ddl: None,
-                    safety: MigrationSafety::WarnOnly,
-                    risk: MigrationRisk::ManualActionRequired,
-                    risk_detail: Some(format!(
-                        "PostgreSQL does not support removing enum values. '{}' was removed from config but NOT from the database type. Recreate the type manually if needed.",
-                        val
-                    )),
-                });
+                .collect();
+
+            if removed.is_empty() {
+                // Purely additive — append each new value in place (cheap, non-destructive).
+                for val in new_enum
+                    .values
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|v| !old_vals.contains(v))
+                {
+                    steps.push(MigrationStep {
+                        step: 0,
+                        operation: MigrationOperation::AddEnumValue,
+                        schema: schema.clone(),
+                        table: None,
+                        object: format!("{}:{}", new_enum.name, val),
+                        object_type: "enum_value".into(),
+                        description: format!(
+                            "Add value '{}' to enum \"{}\".\"{}\"",
+                            val, schema, new_enum.name
+                        ),
+                        ddl: Some(format!(
+                            "ALTER TYPE {}.{} ADD VALUE IF NOT EXISTS '{}'",
+                            quote(&schema),
+                            quote(&new_enum.name),
+                            val.replace('\'', "''")
+                        )),
+                        safety: MigrationSafety::Safe,
+                        risk: MigrationRisk::None,
+                        risk_detail: None,
+                    });
+                }
+            } else {
+                // One or more values removed. PostgreSQL has no DROP VALUE, so rebuild the type and
+                // recast every dependent column. Added values (if any) are folded into the rebuilt
+                // value list, so no separate ADD VALUE step is needed.
+                let dependents = enum_dependent_columns(
+                    new_enum,
+                    new,
+                    &new_tables,
+                    &new_schemas,
+                    schema_override,
+                );
+                recreate_enum_steps(&mut steps, &schema, new_enum, &removed, &dependents);
             }
         } else {
             let values: Vec<String> = new_enum
@@ -1970,4 +2228,151 @@ fn audit_table_ddl(
         audit_full,
         col_defs.join(",\n  ")
     )
+}
+
+#[cfg(test)]
+mod enum_recreate_tests {
+    use super::*;
+
+    fn schema(id: &str, name: &str) -> SchemaConfig {
+        SchemaConfig {
+            id: id.into(),
+            name: name.into(),
+            comment: None,
+        }
+    }
+
+    fn table(id: &str, name: &str, schema_id: &str) -> TableConfig {
+        TableConfig {
+            id: id.into(),
+            schema_id: Some(schema_id.into()),
+            name: name.into(),
+            comment: None,
+            primary_key: PrimaryKeyConfig::Single("id".into()),
+            unique: vec![],
+            check: vec![],
+            audit_log: false,
+            versioning: None,
+        }
+    }
+
+    fn col(id: &str, table_id: &str, name: &str, ty: &str, default: Option<&str>) -> ColumnConfig {
+        ColumnConfig {
+            id: id.into(),
+            table_id: table_id.into(),
+            name: name.into(),
+            type_: ColumnTypeConfig::Simple(ty.into()),
+            nullable: true,
+            default: default.map(|d| ColumnDefaultConfig::Literal(d.into())),
+            comment: None,
+            asset: None,
+        }
+    }
+
+    fn enum_cfg(id: &str, name: &str, schema_id: &str, values: &[&str]) -> EnumConfig {
+        EnumConfig {
+            id: id.into(),
+            schema_id: Some(schema_id.into()),
+            name: name.into(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+            comment: None,
+        }
+    }
+
+    fn ddls(steps: &[MigrationStep]) -> Vec<String> {
+        steps.iter().filter_map(|s| s.ddl.clone()).collect()
+    }
+
+    #[test]
+    fn finds_scalar_and_array_dependent_columns() {
+        let mut cfg = FullConfig::default();
+        cfg.schemas = vec![schema("s1", "app")];
+        cfg.tables = vec![table("t_orders", "orders", "s1")];
+        cfg.columns = vec![
+            col(
+                "c1",
+                "t_orders",
+                "status",
+                "order_status",
+                Some("'pending'"),
+            ),
+            col("c2", "t_orders", "tags", "order_status[]", None),
+            col("c3", "t_orders", "name", "text", None), // not an enum
+        ];
+        let e = enum_cfg("e1", "order_status", "s1", &["pending", "shipped"]);
+        let new_tables: HashMap<&str, &TableConfig> =
+            cfg.tables.iter().map(|t| (t.id.as_str(), t)).collect();
+        let new_schemas: HashMap<&str, &SchemaConfig> =
+            cfg.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+
+        let deps = enum_dependent_columns(&e, &cfg, &new_tables, &new_schemas, None);
+        assert_eq!(deps.len(), 2);
+        let scalar = deps.iter().find(|d| d.column == "status").unwrap();
+        assert_eq!(scalar.schema, "app");
+        assert_eq!(scalar.table, "orders");
+        assert!(!scalar.is_array);
+        assert_eq!(scalar.default.as_deref(), Some("'pending'"));
+        let arr = deps.iter().find(|d| d.column == "tags").unwrap();
+        assert!(arr.is_array);
+        assert!(arr.default.is_none());
+    }
+
+    #[test]
+    fn recreate_sequence_emits_rename_create_recast_drop() {
+        let e = enum_cfg("e1", "order_status", "s1", &["pending", "shipped"]);
+        let deps = vec![
+            EnumColumnRef {
+                schema: "app".into(),
+                table: "orders".into(),
+                column: "status".into(),
+                default: Some("'pending'".into()),
+                is_array: false,
+            },
+            EnumColumnRef {
+                schema: "app".into(),
+                table: "orders".into(),
+                column: "tags".into(),
+                default: None,
+                is_array: true,
+            },
+        ];
+        let mut steps = Vec::new();
+        recreate_enum_steps(&mut steps, "app", &e, &["cancelled"], &deps);
+        let sql = ddls(&steps);
+
+        // Leading informational step carries no DDL.
+        assert!(matches!(steps[0].safety, MigrationSafety::WarnOnly));
+        assert!(steps[0].ddl.is_none());
+
+        // Rename → create → (drop default, recast, set default) → recast array → drop old.
+        assert_eq!(
+            sql[0],
+            r#"ALTER TYPE "app"."order_status" RENAME TO "order_status__arch_old""#
+        );
+        assert_eq!(
+            sql[1],
+            r#"CREATE TYPE "app"."order_status" AS ENUM ('pending', 'shipped')"#
+        );
+        assert_eq!(
+            sql[2],
+            r#"ALTER TABLE "app"."orders" ALTER COLUMN "status" DROP DEFAULT"#
+        );
+        assert_eq!(
+            sql[3],
+            r#"ALTER TABLE "app"."orders" ALTER COLUMN "status" TYPE "app"."order_status" USING "status"::text::"app"."order_status""#
+        );
+        assert_eq!(
+            sql[4],
+            r#"ALTER TABLE "app"."orders" ALTER COLUMN "status" SET DEFAULT 'pending'"#
+        );
+        // Array column: no default, single recast with array casts.
+        assert_eq!(
+            sql[5],
+            r#"ALTER TABLE "app"."orders" ALTER COLUMN "tags" TYPE "app"."order_status"[] USING "tags"::text[]::"app"."order_status"[]"#
+        );
+        assert_eq!(
+            *sql.last().unwrap(),
+            r#"DROP TYPE IF EXISTS "app"."order_status__arch_old""#
+        );
+    }
 }
