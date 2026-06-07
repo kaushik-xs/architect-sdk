@@ -142,6 +142,10 @@ impl Dialect for SqliteDialect {
         "INTEGER"
     }
 
+    fn sys_bytes_type(&self) -> &'static str {
+        "BLOB"
+    }
+
     fn audit_timestamp_type(&self) -> &'static str {
         "TEXT"
     }

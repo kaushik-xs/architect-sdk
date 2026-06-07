@@ -239,7 +239,7 @@ async fn ensure_migration_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(
             from_version TEXT, \
             to_version TEXT NOT NULL, \
             plan_json {} NOT NULL, \
-            zip_bytes BLOB NOT NULL, \
+            zip_bytes {} NOT NULL, \
             status TEXT NOT NULL DEFAULT 'pending', \
             created_at {} NOT NULL DEFAULT {}, \
             {}, \
@@ -247,6 +247,7 @@ async fn ensure_migration_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(
         )",
         q_plans,
         dialect.sys_json_type(),
+        dialect.sys_bytes_type(),
         dialect.sys_timestamp_type(),
         dialect.now_fn(),
         expires_at_col,

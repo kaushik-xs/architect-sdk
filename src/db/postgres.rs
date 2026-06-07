@@ -227,6 +227,10 @@ impl Dialect for PostgresDialect {
         "BIGSERIAL"
     }
 
+    fn sys_bytes_type(&self) -> &'static str {
+        "BYTEA"
+    }
+
     fn audit_timestamp_type(&self) -> &'static str {
         "TIMESTAMPTZ"
     }

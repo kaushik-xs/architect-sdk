@@ -1125,6 +1125,9 @@ mod versioning_tests {
         fn sys_bigserial_type(&self) -> &'static str {
             "BIGSERIAL"
         }
+        fn sys_bytes_type(&self) -> &'static str {
+            "BYTEA"
+        }
         fn sys_json_type(&self) -> &'static str {
             "JSONB"
         }

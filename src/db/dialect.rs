@@ -92,6 +92,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// e.g. "BIGSERIAL", "BIGINT AUTO_INCREMENT", "INTEGER".
     fn sys_bigserial_type(&self) -> &'static str;
 
+    /// DDL type for a raw binary payload column (e.g. "BYTEA", "BLOB").
+    fn sys_bytes_type(&self) -> &'static str;
+
     /// Timestamp type used in audit table columns (no DEFAULT — values supplied explicitly).
     fn audit_timestamp_type(&self) -> &'static str;
 

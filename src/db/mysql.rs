@@ -137,6 +137,10 @@ impl Dialect for MySqlDialect {
         "BIGINT AUTO_INCREMENT"
     }
 
+    fn sys_bytes_type(&self) -> &'static str {
+        "BLOB"
+    }
+
     fn audit_timestamp_type(&self) -> &'static str {
         "DATETIME(6)"
     }
