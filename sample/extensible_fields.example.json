@@ -1,0 +1,9 @@
+{
+  "_comment": "Example per-tenant extensible-fields registry for the `users` entity. This file is NOT loaded by the SDK — it documents the body you would send to the admin API: PUT /api/v1/users/extensible-fields (with X-Tenant-ID). Keys map extensible column name -> field definitions. The `users.attributes` column is flagged \"extensible\": true in columns.json.",
+  "attributes": [
+    { "key": "plan",        "type": "text",    "filterable": true,  "sortable": true, "allowed": ["free", "pro", "enterprise"] },
+    { "key": "seatCount",   "type": "int",     "filterable": true,  "sortable": true, "min": 1 },
+    { "key": "trialEndsAt", "type": "timestamp", "filterable": true, "sortable": true },
+    { "key": "internalNote","type": "text",    "filterable": false, "sortable": false }
+  ]
+}

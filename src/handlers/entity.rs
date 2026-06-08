@@ -9,6 +9,9 @@ use crate::config::{
 };
 use crate::error::{AppError, BulkFieldError};
 use crate::events::spawn_events;
+use crate::extensible_fields::{
+    load_registry, validate_extensible_fields, ExtensibleRegistry, ValidateMode,
+};
 use crate::extractors::tenant::TenantId;
 use crate::extractors::user::UserId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
@@ -1281,6 +1284,73 @@ fn collect_dotted_prefixes_rec(node: &FilterNode, out: &mut Vec<String>) {
     }
 }
 
+/// Load the per-tenant extensible-fields registry for an entity, or `None` when the entity has no
+/// extensible columns or no tenant is in scope. The registry lives in `_sys_kv_data` on the
+/// config pool (`state.pool`), independent of the tenant's data pool.
+pub async fn load_extensible_registry(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    tenant_id: Option<&str>,
+) -> Result<Option<ExtensibleRegistry>, AppError> {
+    if entity.extensible_columns.is_empty() {
+        return Ok(None);
+    }
+    let tenant_id = match tenant_id.filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let key = (
+        tenant_id.to_string(),
+        entity.package_id.clone(),
+        entity.path_segment.clone(),
+    );
+
+    // Read-through cache: serve a non-expired entry without touching the config DB.
+    if let Ok(cache) = state.extensible_cache.read() {
+        if let Some(entry) = cache.get(&key) {
+            if entry.loaded_at.elapsed() < crate::extensible_fields::REGISTRY_CACHE_TTL {
+                return Ok(Some(entry.registry.clone()));
+            }
+        }
+    }
+
+    let reg = load_registry(
+        &state.pool,
+        state.dialect.as_ref(),
+        tenant_id,
+        &entity.package_id,
+        &entity.path_segment,
+    )
+    .await?;
+
+    if let Ok(mut cache) = state.extensible_cache.write() {
+        cache.insert(
+            key,
+            crate::extensible_fields::CachedRegistry {
+                registry: reg.clone(),
+                loaded_at: std::time::Instant::now(),
+            },
+        );
+    }
+    Ok(Some(reg))
+}
+
+/// Remove a tenant's cached registry so the next load reflects a just-written change.
+pub fn evict_extensible_registry(
+    state: &AppState,
+    tenant_id: &str,
+    package_id: &str,
+    path_segment: &str,
+) {
+    if let Ok(mut cache) = state.extensible_cache.write() {
+        cache.remove(&(
+            tenant_id.to_string(),
+            package_id.to_string(),
+            path_segment.to_string(),
+        ));
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
@@ -1414,6 +1484,8 @@ pub async fn list(
         .cloned()
         .collect();
 
+    let ext_registry = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?;
+
     let mut rows = if include_names.is_empty() {
         CrudService::list(
             &mut executor,
@@ -1425,6 +1497,7 @@ pub async fn list(
             &filter_include_selects,
             schema_override,
             state.dialect.as_ref(),
+            ext_registry.as_ref(),
         )
         .await?
     } else {
@@ -1449,6 +1522,7 @@ pub async fn list(
             &filter_include_selects,
             schema_override,
             state.dialect.as_ref(),
+            ext_registry.as_ref(),
         )
         .await?;
         post_process_include_columns(&mut rows, &resolved_data);
@@ -1558,6 +1632,9 @@ pub async fn create(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&body, &entity, &reg, ValidateMode::Full)?;
+    }
     let mut row = CrudService::create(
         &mut executor,
         &entity,
@@ -1794,6 +1871,9 @@ pub async fn update(
     }
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&body, &entity, &reg, ValidateMode::Partial)?;
+    }
 
     // Pre-fetch the current DB row when needed:
     //   • entity has asset columns + storage configured → hard-delete dropped files after update
@@ -2039,6 +2119,23 @@ pub async fn bulk_create(
             });
         }
     }
+    // Per-item extensible-field validation (same Full semantics as the collecting validator above).
+    if let Some(ref reg) =
+        load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?
+    {
+        for (index, item) in items.iter().enumerate() {
+            if let Err(e) = validate_extensible_fields(item, &entity, reg, ValidateMode::Full) {
+                all_errors.push(BulkFieldError {
+                    index,
+                    field: "extensibleFields".into(),
+                    message: match e {
+                        AppError::Validation(m) => m,
+                        other => other.to_string(),
+                    },
+                });
+            }
+        }
+    }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
@@ -2169,6 +2266,23 @@ pub async fn bulk_update(
                 field: to_camel_case(&field),
                 message,
             });
+        }
+    }
+    // Per-item extensible-field validation (same Full semantics as the collecting validator above).
+    if let Some(ref reg) =
+        load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?
+    {
+        for (index, item) in items.iter().enumerate() {
+            if let Err(e) = validate_extensible_fields(item, &entity, reg, ValidateMode::Full) {
+                all_errors.push(BulkFieldError {
+                    index,
+                    field: "extensibleFields".into(),
+                    message: match e {
+                        AppError::Validation(m) => m,
+                        other => other.to_string(),
+                    },
+                });
+            }
         }
     }
     if !all_errors.is_empty() {
@@ -2342,6 +2456,8 @@ pub async fn list_package(
         .cloned()
         .collect();
 
+    let ext_registry = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?;
+
     let mut rows = if include_names.is_empty() {
         CrudService::list(
             &mut executor,
@@ -2353,6 +2469,7 @@ pub async fn list_package(
             &filter_include_selects,
             schema_override,
             state.dialect.as_ref(),
+            ext_registry.as_ref(),
         )
         .await?
     } else {
@@ -2377,6 +2494,7 @@ pub async fn list_package(
             &filter_include_selects,
             schema_override,
             state.dialect.as_ref(),
+            ext_registry.as_ref(),
         )
         .await?;
         post_process_include_columns(&mut rows, &resolved_data);
@@ -2486,6 +2604,9 @@ pub async fn create_package(
     }
 
     RequestValidator::validate(&body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&body, &entity, &reg, ValidateMode::Full)?;
+    }
     let mut row = CrudService::create(
         &mut executor,
         &entity,
@@ -2723,6 +2844,9 @@ pub async fn update_package(
     }
 
     RequestValidator::validate_partial(&body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&body, &entity, &reg, ValidateMode::Partial)?;
+    }
 
     // Pre-read for asset hard-delete on PATCH.
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
@@ -2968,6 +3092,23 @@ pub async fn bulk_create_package(
             });
         }
     }
+    // Per-item extensible-field validation (same Full semantics as the collecting validator above).
+    if let Some(ref reg) =
+        load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?
+    {
+        for (index, item) in items.iter().enumerate() {
+            if let Err(e) = validate_extensible_fields(item, &entity, reg, ValidateMode::Full) {
+                all_errors.push(BulkFieldError {
+                    index,
+                    field: "extensibleFields".into(),
+                    message: match e {
+                        AppError::Validation(m) => m,
+                        other => other.to_string(),
+                    },
+                });
+            }
+        }
+    }
     if !all_errors.is_empty() {
         return Err(AppError::BulkValidation(all_errors));
     }
@@ -3102,6 +3243,23 @@ pub async fn bulk_update_package(
                 field: to_camel_case(&field),
                 message,
             });
+        }
+    }
+    // Per-item extensible-field validation (same Full semantics as the collecting validator above).
+    if let Some(ref reg) =
+        load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await?
+    {
+        for (index, item) in items.iter().enumerate() {
+            if let Err(e) = validate_extensible_fields(item, &entity, reg, ValidateMode::Full) {
+                all_errors.push(BulkFieldError {
+                    index,
+                    field: "extensibleFields".into(),
+                    message: match e {
+                        AppError::Validation(m) => m,
+                        other => other.to_string(),
+                    },
+                });
+            }
         }
     }
     if !all_errors.is_empty() {

@@ -1,8 +1,9 @@
 //! Builds parameterized INSERT, SELECT, UPDATE, DELETE from resolved entity.
 
 use crate::config::{IncludeDirection, PkType, ResolvedEntity};
-use crate::db::{type_category_from_cast, Dialect, TypeCategory};
+use crate::db::{type_category_from_cast, CanonicalType, Dialect, TypeCategory};
 use crate::error::AppError;
+use crate::extensible_fields::ExtensibleRegistry;
 use crate::sql::rsql::{FilterNode, RsqlOp, SortSpec};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -200,6 +201,30 @@ fn op_valid_for_category(op: &RsqlOp, category: TypeCategory) -> bool {
     }
 }
 
+/// Dialect-independent SQL type name for a canonical type, suitable for both RSQL
+/// operator-category classification (via `type_category_from_cast`) and Postgres placeholder
+/// casts. Returns `None` for text-like types (which need no cast). Used for extensible-field keys
+/// whose declared type comes from the KV registry rather than `ColumnInfo.pg_type`.
+fn canonical_cast_str(t: &CanonicalType) -> Option<&'static str> {
+    match t {
+        CanonicalType::SmallInt => Some("smallint"),
+        CanonicalType::Int | CanonicalType::Serial => Some("integer"),
+        CanonicalType::BigInt | CanonicalType::BigSerial => Some("bigint"),
+        CanonicalType::Real => Some("real"),
+        CanonicalType::Double => Some("double precision"),
+        CanonicalType::Decimal(_) => Some("numeric"),
+        CanonicalType::Boolean => Some("boolean"),
+        CanonicalType::Uuid => Some("uuid"),
+        CanonicalType::Json | CanonicalType::Jsonb => Some("jsonb"),
+        CanonicalType::Timestamp => Some("timestamptz"),
+        CanonicalType::TimestampNtz => Some("timestamp"),
+        CanonicalType::Date => Some("date"),
+        CanonicalType::Time => Some("time"),
+        CanonicalType::Timetz => Some("timetz"),
+        _ => None,
+    }
+}
+
 fn make_placeholder(n: usize, cast: Option<&str>, dialect: &dyn Dialect) -> String {
     let ph = dialect.placeholder(n);
     match cast {
@@ -268,38 +293,26 @@ fn build_leaf_sql(
         RsqlOp::Ilike => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(v));
-            Ok(format!(
-                "{} ILIKE {}",
-                qcol,
-                dialect.placeholder(n as usize)
-            ))
+            let ph = dialect.placeholder(n as usize);
+            Ok(dialect.case_insensitive_like(qcol, &ph))
         }
         RsqlOp::Contains => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("%{}%", v)));
-            Ok(format!(
-                "{} ILIKE {}",
-                qcol,
-                dialect.placeholder(n as usize)
-            ))
+            let ph = dialect.placeholder(n as usize);
+            Ok(dialect.case_insensitive_like(qcol, &ph))
         }
         RsqlOp::Starts => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("{}%", v)));
-            Ok(format!(
-                "{} ILIKE {}",
-                qcol,
-                dialect.placeholder(n as usize)
-            ))
+            let ph = dialect.placeholder(n as usize);
+            Ok(dialect.case_insensitive_like(qcol, &ph))
         }
         RsqlOp::Ends => {
             let v = values.first().cloned().unwrap_or_default();
             let n = q.push_param(Value::String(format!("%{}", v)));
-            Ok(format!(
-                "{} ILIKE {}",
-                qcol,
-                dialect.placeholder(n as usize)
-            ))
+            let ph = dialect.placeholder(n as usize);
+            Ok(dialect.case_insensitive_like(qcol, &ph))
         }
         RsqlOp::In => {
             if values.is_empty() {
@@ -363,6 +376,7 @@ fn build_leaf_sql(
 ///
 /// `filter_includes` supplies the related-entity metadata needed to generate
 /// EXISTS subqueries for dotted-field filters like `transport_unit.bay=contains=bay23`.
+#[allow(clippy::too_many_arguments)]
 pub fn rsql_to_sql(
     node: &FilterNode,
     entity: &ResolvedEntity,
@@ -371,6 +385,7 @@ pub fn rsql_to_sql(
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
     dialect: &dyn Dialect,
+    registry: Option<&ExtensibleRegistry>,
 ) -> Result<String, AppError> {
     match node {
         FilterNode::And(children) => {
@@ -385,6 +400,7 @@ pub fn rsql_to_sql(
                         filter_includes,
                         schema_override,
                         dialect,
+                        registry,
                     )
                 })
                 .collect();
@@ -402,16 +418,48 @@ pub fn rsql_to_sql(
                         filter_includes,
                         schema_override,
                         dialect,
+                        registry,
                     )
                 })
                 .collect();
             Ok(format!("({})", parts?.join(" OR ")))
         }
         FilterNode::Leaf { field, op, values } => {
-            // Dotted field (e.g. "transport_unit.bay"): generate EXISTS subquery
+            // Dotted field: first check for a extensible-fields bag (`<extensible_col>.<key>`),
+            // then fall back to related-entity include semantics (`<include>.<field>`).
             if let Some(dot_pos) = field.find('.') {
-                let include_name = &field[..dot_pos];
-                let sub_field = &field[dot_pos + 1..];
+                let head = &field[..dot_pos];
+                let key = &field[dot_pos + 1..];
+
+                if entity.extensible_columns.iter().any(|c| c == head) {
+                    let def = registry.and_then(|r| r.field(head, key)).ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "unknown extensible field '{}' (not declared in the registry)",
+                            field
+                        ))
+                    })?;
+                    if !def.filterable {
+                        return Err(AppError::Validation(format!(
+                            "extensible field '{}' is not filterable",
+                            field
+                        )));
+                    }
+                    let canonical = def.canonical();
+                    // The canonical cast string drives both operator-category validation and the
+                    // Postgres placeholder cast. It is dialect-independent on purpose: MySQL/SQLite
+                    // `cast_name` is always None, which would otherwise misclassify a numeric
+                    // extensible field as text and reject `=gt=`.
+                    let cf_cast = canonical_cast_str(&canonical);
+                    let base_col = match col_qualifier {
+                        Some(pfx) => format!("{}{}", pfx, quoted(head)),
+                        None => quoted(head),
+                    };
+                    let json_expr = dialect.json_extract_typed(&base_col, key, &canonical);
+                    return build_leaf_sql(&json_expr, cf_cast, op, values, q, field, dialect);
+                }
+
+                let include_name = head;
+                let sub_field = key;
 
                 let inc = filter_includes
                     .iter()
@@ -486,39 +534,63 @@ pub fn rsql_to_sql(
 }
 
 /// Build ORDER BY clause from sort specs, falling back to pk ASC when empty.
-/// Unknown column names are silently skipped.
+///
+/// A sort field may be a plain column, or a extensible-field key via the `<extensible_col>.<key>`
+/// syntax — resolved against the per-tenant `registry` and emitted as a typed JSON extraction.
+/// Unknown plain columns are silently skipped (back-compatible); a extensible-field sort that is
+/// unknown or not sortable is a hard error.
 fn build_order_by(
     sort: &[SortSpec],
     entity: &ResolvedEntity,
     col_qualifier: Option<&str>,
-) -> String {
+    dialect: &dyn Dialect,
+    registry: Option<&ExtensibleRegistry>,
+) -> Result<String, AppError> {
     let pk = &entity.pk_columns[0];
     let col_names: std::collections::HashSet<&str> =
         entity.columns.iter().map(|c| c.name.as_str()).collect();
 
-    let parts: Vec<String> = sort
-        .iter()
-        .filter(|s| col_names.contains(s.field.as_str()))
-        .map(|s| {
-            let qcol = match col_qualifier {
-                Some(pfx) => format!("{}{}", pfx, quoted(&s.field)),
-                None => quoted(&s.field),
-            };
-            if s.desc {
-                format!("{} DESC", qcol)
-            } else {
-                format!("{} ASC", qcol)
+    let dir = |desc: bool| if desc { "DESC" } else { "ASC" };
+    let qualify = |name: &str| match col_qualifier {
+        Some(pfx) => format!("{}{}", pfx, quoted(name)),
+        None => quoted(name),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for s in sort {
+        // Custom-field sort: `<extensible_col>.<key>`.
+        if let Some(dot_pos) = s.field.find('.') {
+            let head = &s.field[..dot_pos];
+            let key = &s.field[dot_pos + 1..];
+            if entity.extensible_columns.iter().any(|c| c == head) {
+                let def = registry.and_then(|r| r.field(head, key)).ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "unknown extensible field '{}' in sort (not declared in the registry)",
+                        s.field
+                    ))
+                })?;
+                if !def.sortable {
+                    return Err(AppError::Validation(format!(
+                        "extensible field '{}' is not sortable",
+                        s.field
+                    )));
+                }
+                let canonical = def.canonical();
+                let json_expr = dialect.json_extract_typed(&qualify(head), key, &canonical);
+                parts.push(format!("{} {}", json_expr, dir(s.desc)));
+                continue;
             }
-        })
-        .collect();
+            // Not a extensible-fields column: fall through and let the plain-column filter drop it.
+        }
+        if col_names.contains(s.field.as_str()) {
+            parts.push(format!("{} {}", qualify(&s.field), dir(s.desc)));
+        }
+    }
 
     if parts.is_empty() {
-        match col_qualifier {
-            Some(pfx) => format!(" ORDER BY {}{}", pfx, quoted(pk)),
-            None => format!(" ORDER BY {}", quoted(pk)),
-        }
+        Ok(format!(" ORDER BY {}", qualify(pk)))
     } else {
-        format!(" ORDER BY {}", parts.join(", "))
+        Ok(format!(" ORDER BY {}", parts.join(", ")))
     }
 }
 
@@ -558,6 +630,7 @@ pub fn select_list_with_includes(
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
     dialect: &dyn Dialect,
+    registry: Option<&ExtensibleRegistry>,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -618,12 +691,13 @@ pub fn select_list_with_includes(
                 filter_includes,
                 schema_override,
                 dialect,
+                registry,
             )?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
     };
-    let order_clause = build_order_by(sort, entity, Some(&main_qualifier));
+    let order_clause = build_order_by(sort, entity, Some(&main_qualifier), dialect, registry)?;
     let limit_clause = limit
         .map(|n| format!(" LIMIT {}", n.min(1000)))
         .unwrap_or_default();
@@ -656,6 +730,7 @@ pub fn select_list(
     filter_includes: &[IncludeSelect<'_>],
     schema_override: Option<&str>,
     dialect: &dyn Dialect,
+    registry: Option<&ExtensibleRegistry>,
 ) -> Result<QueryBuf, AppError> {
     let mut q = QueryBuf::new();
     let schema = resolve_schema(entity, schema_override);
@@ -671,12 +746,13 @@ pub fn select_list(
                 filter_includes,
                 schema_override,
                 dialect,
+                registry,
             )?;
             format!(" WHERE {}", frag)
         }
         None => String::new(),
     };
-    let order_clause = build_order_by(sort, entity, None);
+    let order_clause = build_order_by(sort, entity, None, dialect, registry)?;
     let limit_clause = limit
         .map(|n| format!(" LIMIT {}", n.min(1000)))
         .unwrap_or_default();
@@ -1161,6 +1237,20 @@ mod versioning_tests {
         fn set_tenant_session_sql(&self, _: &str) -> Option<String> {
             None
         }
+        fn json_extract_text(&self, col: &str, key: &str) -> String {
+            format!("({} ->> '{}')", col, key.replace('\'', "''"))
+        }
+        fn json_extract_typed(
+            &self,
+            col: &str,
+            key: &str,
+            _t: &crate::db::CanonicalType,
+        ) -> String {
+            self.json_extract_text(col, key)
+        }
+        fn case_insensitive_like(&self, col: &str, placeholder: &str) -> String {
+            format!("{} ILIKE {}", col, placeholder)
+        }
     }
 
     fn make_entity() -> ResolvedEntity {
@@ -1214,6 +1304,7 @@ mod versioning_tests {
             parent_ref_column: None,
             versioning: None,
             mcp: None,
+            extensible_columns: vec![],
         }
     }
 
@@ -1370,6 +1461,135 @@ mod versioning_tests {
             "text PK should not be cast: {}",
             q.sql
         );
+    }
+
+    fn entity_with_bag() -> ResolvedEntity {
+        let mut e = make_entity();
+        e.extensible_columns = vec!["attributes".into()];
+        e
+    }
+
+    fn ext_registry() -> ExtensibleRegistry {
+        ExtensibleRegistry::from_value(serde_json::json!({
+            "attributes": [
+                {"key": "warrantyMonths", "type": "int"},
+                {"key": "energyRating", "type": "text"},
+                {"key": "notes", "type": "text", "filterable": false, "sortable": false}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn rsql_filters_and_sorts_on_extensible_field() {
+        use crate::sql::rsql::{parse_rsql, parse_sort};
+        let d = crate::db::PostgresDialect;
+        let e = entity_with_bag();
+        let reg = ext_registry();
+        let filter = parse_rsql("attributes.warrantyMonths=ge=12").unwrap();
+        let sort = parse_sort("-attributes.warrantyMonths");
+        let q = select_list(
+            &e,
+            Some(&filter),
+            &sort,
+            Some(10),
+            Some(0),
+            &[],
+            None,
+            &d,
+            Some(&reg),
+        )
+        .unwrap();
+        assert!(
+            q.sql
+                .contains("(\"attributes\" ->> 'warrantyMonths')::integer >= $1::integer"),
+            "got: {}",
+            q.sql
+        );
+        assert!(
+            q.sql
+                .contains("ORDER BY (\"attributes\" ->> 'warrantyMonths')::integer DESC"),
+            "got: {}",
+            q.sql
+        );
+        assert_eq!(q.params.len(), 1);
+    }
+
+    #[test]
+    fn rsql_text_extensible_field_uses_case_insensitive_like() {
+        let d = PgDialect;
+        let e = entity_with_bag();
+        let reg = ext_registry();
+        let filter = crate::sql::rsql::parse_rsql("attributes.energyRating=contains=plus").unwrap();
+        let q = select_list(
+            &e,
+            Some(&filter),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &d,
+            Some(&reg),
+        )
+        .unwrap();
+        assert!(
+            q.sql
+                .contains("(\"attributes\" ->> 'energyRating') ILIKE $1"),
+            "got: {}",
+            q.sql
+        );
+    }
+
+    #[test]
+    fn rsql_unknown_extensible_field_is_rejected() {
+        let d = PgDialect;
+        let e = entity_with_bag();
+        let reg = ext_registry();
+        let filter = crate::sql::rsql::parse_rsql("attributes.bogus==1").unwrap();
+        let r = select_list(
+            &e,
+            Some(&filter),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &d,
+            Some(&reg),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn rsql_non_filterable_extensible_field_is_rejected() {
+        let d = PgDialect;
+        let e = entity_with_bag();
+        let reg = ext_registry();
+        let filter = crate::sql::rsql::parse_rsql("attributes.notes==hi").unwrap();
+        let r = select_list(
+            &e,
+            Some(&filter),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &d,
+            Some(&reg),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn sort_on_non_sortable_extensible_field_is_rejected() {
+        let d = PgDialect;
+        let e = entity_with_bag();
+        let reg = ext_registry();
+        let sort = crate::sql::rsql::parse_sort("attributes.notes");
+        let r = select_list(&e, None, &sort, None, None, &[], None, &d, Some(&reg));
+        assert!(r.is_err());
     }
 }
 

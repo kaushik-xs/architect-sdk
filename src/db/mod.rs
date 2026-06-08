@@ -16,8 +16,8 @@ pub mod types;
 
 pub use dialect::Dialect;
 pub use types::{
-    active_cast_name, parse_canonical, type_category_from_cast, CanonicalType, TypeCategory,
-    TypeSupport,
+    active_cast_name, parse_canonical, type_category, type_category_from_cast, CanonicalType,
+    TypeCategory, TypeSupport,
 };
 
 #[cfg(feature = "postgres")]

@@ -8,6 +8,22 @@ use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 pub struct SqliteDialect;
 
+/// Target type for a SQLite `CAST(... AS <type>)` over a JSON-extracted value. The CAST gives
+/// the expression numeric affinity, which forces the (text-bound) parameter to numeric so
+/// comparisons and ORDER BY are numeric rather than lexical. Text-like types need no cast.
+fn sqlite_cast(t: &CanonicalType) -> Option<&'static str> {
+    match t {
+        CanonicalType::SmallInt
+        | CanonicalType::Int
+        | CanonicalType::BigInt
+        | CanonicalType::Serial
+        | CanonicalType::BigSerial
+        | CanonicalType::Boolean => Some("INTEGER"),
+        CanonicalType::Real | CanonicalType::Double | CanonicalType::Decimal(_) => Some("REAL"),
+        _ => None,
+    }
+}
+
 impl Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
@@ -128,6 +144,23 @@ impl Dialect for SqliteDialect {
             "(SELECT COALESCE(json_group_array(json_object({})), '[]') FROM {})",
             pairs, from_clause
         )
+    }
+
+    fn json_extract_text(&self, col: &str, key: &str) -> String {
+        format!("{}->>'$.{}'", col, key.replace('\'', "''"))
+    }
+
+    fn json_extract_typed(&self, col: &str, key: &str, t: &CanonicalType) -> String {
+        let base = self.json_extract_text(col, key);
+        match sqlite_cast(t) {
+            Some(cast) => format!("CAST({} AS {})", base, cast),
+            None => base,
+        }
+    }
+
+    fn case_insensitive_like(&self, col: &str, placeholder: &str) -> String {
+        // SQLite LIKE is case-insensitive for ASCII by default.
+        format!("{} LIKE {}", col, placeholder)
     }
 
     fn sys_json_type(&self) -> &'static str {

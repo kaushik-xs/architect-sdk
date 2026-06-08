@@ -129,6 +129,7 @@ pub async fn kv_put(
     validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
     let d = state.dialect.as_ref();
+    let now = d.now_fn();
     let (p1, p2, p3, p4, p5) = (
         d.placeholder(1),
         d.placeholder(2),
@@ -136,22 +137,42 @@ pub async fn kv_put(
         d.placeholder(4),
         d.placeholder(5),
     );
-    let set_pairs = format!("value = {p5}, updated_at = {}", d.now_fn());
-    let conflict = d.upsert_conflict(&["tenant_id", "package_id", "namespace", "key"], &set_pairs);
-    let sql = format!(
-        "INSERT INTO {tbl} (tenant_id, package_id, namespace, key, value, updated_at) \
-         VALUES ({p1}, {p2}, {p3}, {p4}, {p5}, {now}) {conflict}",
+
+    // UPDATE-then-INSERT rather than an ON CONFLICT upsert: the upsert form would reuse a
+    // placeholder in the SET clause, which breaks on positional-placeholder dialects
+    // (SQLite/MySQL `?`) by introducing an unbound parameter — the conflicting write then sets
+    // `value` to NULL and fails the NOT NULL constraint. Each statement here binds exactly its
+    // own placeholders, so it is correct on every dialect.
+    let update_sql = format!(
+        "UPDATE {tbl} SET value = {p1}, updated_at = {now} \
+         WHERE tenant_id = {p2} AND package_id = {p3} AND namespace = {p4} AND key = {p5}",
         tbl = q_table,
-        now = d.now_fn(),
     );
-    sqlx::query(&sql)
+    let affected = sqlx::query(&update_sql)
+        .bind(&body)
         .bind(tenant_id)
         .bind(&package_id)
         .bind(&namespace)
         .bind(&key)
-        .bind(&body)
         .execute(pool)
-        .await?;
+        .await?
+        .rows_affected();
+
+    if affected == 0 {
+        let insert_sql = format!(
+            "INSERT INTO {tbl} (tenant_id, package_id, namespace, key, value, updated_at) \
+             VALUES ({p1}, {p2}, {p3}, {p4}, {p5}, {now})",
+            tbl = q_table,
+        );
+        sqlx::query(&insert_sql)
+            .bind(tenant_id)
+            .bind(&package_id)
+            .bind(&namespace)
+            .bind(&key)
+            .bind(&body)
+            .execute(pool)
+            .await?;
+    }
     Ok(success_one_ok(body))
 }
 

@@ -591,8 +591,99 @@ fn add_entity_paths(
             }
             builder = builder.path(bulk_path, bulk_item.build());
         }
+
+        // Extensible-field admin routes exist only on the default (unprefixed) routes, and only
+        // for entities that declare at least one `extensible` JSON column.
+        if !use_package_param && !entity.extensible_columns.is_empty() {
+            let (xf_get, xf_put, xf_delete) = extensible_fields_operations(entity);
+            builder = builder.path(
+                format!("{}/{}/extensible-fields", path_prefix, seg),
+                PathItemBuilder::new()
+                    .operation(HttpMethod::Get, xf_get)
+                    .operation(HttpMethod::Put, xf_put)
+                    .operation(HttpMethod::Delete, xf_delete)
+                    .build(),
+            );
+            let (idx_get, idx_post) = extensible_indexes_operations(entity);
+            builder = builder.path(
+                format!("{}/{}/extensible-fields/indexes", path_prefix, seg),
+                PathItemBuilder::new()
+                    .operation(HttpMethod::Get, idx_get)
+                    .operation(HttpMethod::Post, idx_post)
+                    .build(),
+            );
+        }
     }
     builder
+}
+
+/// GET/PUT/DELETE operations for `/:entity/extensible-fields` (per-tenant registry admin).
+fn extensible_fields_operations(entity: &ResolvedEntity) -> (Operation, Operation, Operation) {
+    let seg = &entity.path_segment;
+    let get = OperationBuilder::new()
+        .summary(Some("Get extensible-field registry"))
+        .description(Some(
+            "Return the tenant's extensible-field registry document for this entity (or {} when unset).",
+        ))
+        .operation_id(Some(format!("get_extensible_fields_{}", seg)))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    let put = OperationBuilder::new()
+        .summary(Some("Replace extensible-field registry"))
+        .description(Some(
+            "Validate and replace the tenant's registry. Body maps each extensible column to its field definitions, e.g. {\"attributes\":[{\"key\":\"warrantyMonths\",\"type\":\"int\",\"filterable\":true,\"sortable\":true}]}.",
+        ))
+        .operation_id(Some(format!("put_extensible_fields_{}", seg)))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .request_body(Some(
+            RequestBodyBuilder::new()
+                .description(Some("Registry document: { \"<column>\": [ field definitions ] }"))
+                .content(
+                    "application/json",
+                    Content::new(Some(RefOr::T(Schema::Object(
+                        ObjectBuilder::new().schema_type(SchemaType::new(Type::Object)).into(),
+                    )))),
+                )
+                .required(Some(Required::True))
+                .build(),
+        ))
+        .responses(default_responses().build())
+        .build();
+    let delete = OperationBuilder::new()
+        .summary(Some("Clear extensible-field registry"))
+        .description(Some(
+            "Delete the tenant's registry document for this entity.",
+        ))
+        .operation_id(Some(format!("delete_extensible_fields_{}", seg)))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    (get, put, delete)
+}
+
+/// GET/POST operations for `/:entity/extensible-fields/indexes` (suggest / apply index DDL).
+fn extensible_indexes_operations(entity: &ResolvedEntity) -> (Operation, Operation) {
+    let seg = &entity.path_segment;
+    let get = OperationBuilder::new()
+        .summary(Some("Suggested indexes for extensible fields"))
+        .description(Some(
+            "Return CREATE INDEX statements for the tenant's filterable/sortable extensible fields. Review before applying (large-table DDL is heavy).",
+        ))
+        .operation_id(Some(format!("get_extensible_field_indexes_{}", seg)))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    let post = OperationBuilder::new()
+        .summary(Some("Apply extensible-field indexes"))
+        .description(Some(
+            "Apply the suggested indexes to the tenant's data table. Best-effort and idempotent; returns applied statements and any errors.",
+        ))
+        .operation_id(Some(format!("apply_extensible_field_indexes_{}", seg)))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    (get, post)
 }
 
 fn kv_namespace_param() -> Parameter {
@@ -905,4 +996,59 @@ pub async fn spec_handler(State(state): State<AppState>) -> Json<OpenApi> {
         &package_kv_stores,
     );
     Json(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::resolved::{PkType, ResolvedEntity, ResolvedModel};
+    use std::collections::{HashMap, HashSet};
+
+    fn entity(seg: &str, extensible_columns: Vec<String>) -> ResolvedEntity {
+        ResolvedEntity {
+            table_id: seg.to_string(),
+            schema_name: "public".into(),
+            table_name: seg.to_string(),
+            path_segment: seg.to_string(),
+            pk_columns: vec!["id".into()],
+            pk_type: PkType::Uuid,
+            columns: vec![],
+            operations: vec![
+                "read".into(),
+                "create".into(),
+                "update".into(),
+                "delete".into(),
+            ],
+            sensitive_columns: HashSet::new(),
+            includes: vec![],
+            validation: HashMap::new(),
+            events: vec![],
+            archive_field: None,
+            package_id: "_default".into(),
+            audit_log: false,
+            parent_ref_column: None,
+            versioning: None,
+            mcp: None,
+            extensible_columns,
+        }
+    }
+
+    #[test]
+    fn spec_lists_extensible_field_paths_only_for_extensible_entities() {
+        let model = ResolvedModel {
+            entities: vec![
+                entity("products", vec!["attributes".into()]),
+                entity("orders", vec![]),
+            ],
+            entity_by_path: HashMap::new(),
+        };
+        let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
+        let json = serde_json::to_string(&spec).expect("serialize spec");
+
+        // The extensible entity exposes both admin paths.
+        assert!(json.contains("/api/v1/products/extensible-fields"));
+        assert!(json.contains("/api/v1/products/extensible-fields/indexes"));
+        // The non-extensible entity does not.
+        assert!(!json.contains("/api/v1/orders/extensible-fields"));
+    }
 }

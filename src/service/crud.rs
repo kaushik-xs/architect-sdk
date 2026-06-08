@@ -4,6 +4,7 @@ use crate::config::ResolvedEntity;
 use crate::db::pool::{Connection, DbRow, Pool};
 use crate::db::Dialect;
 use crate::error::AppError;
+use crate::extensible_fields::ExtensibleRegistry;
 use crate::sql::{
     archive, coerce_json_value_for_pg_array, delete, insert, insert_history_snapshot,
     prune_history, select_by_column_in, select_by_id, select_list, select_list_with_includes,
@@ -54,6 +55,7 @@ impl CrudService {
         filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
         dialect: &dyn Dialect,
+        registry: Option<&ExtensibleRegistry>,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
@@ -67,6 +69,7 @@ impl CrudService {
             filter_includes,
             schema_override,
             dialect,
+            registry,
         )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }
@@ -85,6 +88,7 @@ impl CrudService {
         filter_includes: &[IncludeSelect<'_>],
         schema_override: Option<&str>,
         dialect: &dyn Dialect,
+        registry: Option<&ExtensibleRegistry>,
     ) -> Result<Vec<Value>, AppError> {
         const DEFAULT_LIMIT: u32 = 100;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(1000);
@@ -99,6 +103,7 @@ impl CrudService {
             filter_includes,
             schema_override,
             dialect,
+            registry,
         )?;
         Self::query_many_exec(executor, &q.sql, &q.params).await
     }

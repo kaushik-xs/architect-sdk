@@ -29,4 +29,7 @@ pub struct AppState {
     pub authrs_client: Option<Arc<AuthrsClient>>,
     /// Active database dialect (set at startup via `db::active_dialect()`).
     pub dialect: Arc<dyn Dialect>,
+    /// Per-tenant extensible-field registry cache (read-through, TTL-bounded, evicted on write).
+    /// Construct with `Default::default()`.
+    pub extensible_cache: crate::extensible_fields::RegistryCache,
 }

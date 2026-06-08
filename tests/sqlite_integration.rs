@@ -68,6 +68,7 @@ fn notes_config() -> FullConfig {
                 default: None,
                 comment: None,
                 asset: None,
+                extensible: false,
             },
             ColumnConfig {
                 id: "c_notes_body".into(),
@@ -78,6 +79,7 @@ fn notes_config() -> FullConfig {
                 default: None,
                 comment: None,
                 asset: None,
+                extensible: false,
             },
         ],
         indexes: vec![],
@@ -144,6 +146,7 @@ fn users_config() -> FullConfig {
                 default: None,
                 comment: None,
                 asset: None,
+                extensible: false,
             },
             ColumnConfig {
                 id: "c_users_name".into(),
@@ -154,6 +157,7 @@ fn users_config() -> FullConfig {
                 default: None,
                 comment: None,
                 asset: None,
+                extensible: false,
             },
             ColumnConfig {
                 id: "c_users_email".into(),
@@ -164,6 +168,7 @@ fn users_config() -> FullConfig {
                 default: None,
                 comment: None,
                 asset: None,
+                extensible: false,
             },
         ],
         indexes: vec![],
@@ -342,6 +347,7 @@ async fn crud_list_returns_all_rows() {
         &[],
         None,
         dialect.as_ref(),
+        None,
     )
     .await
     .expect("list");
@@ -452,6 +458,7 @@ async fn crud_list_with_limit_and_offset() {
         &[],
         None,
         dialect.as_ref(),
+        None,
     )
     .await
     .unwrap();
@@ -468,6 +475,7 @@ async fn crud_list_with_limit_and_offset() {
         &[],
         None,
         dialect.as_ref(),
+        None,
     )
     .await
     .unwrap();
@@ -551,6 +559,7 @@ async fn create_two_users_list_returns_both() {
         &[],
         None,
         dialect.as_ref(),
+        None,
     )
     .await
     .unwrap();
@@ -664,4 +673,111 @@ async fn create_rejects_body_exceeding_max_length() {
     // CrudService doesn't validate — it stores. Validation is the handler's job.
     // We confirm the rule is wired correctly on the entity (tested above).
     let _ = result;
+}
+
+#[tokio::test]
+async fn extensible_registry_store_load_delete_roundtrip() {
+    use architect_sdk::extensible_fields::{
+        delete_registry, load_registry, load_registry_raw, store_registry,
+    };
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let d = dialect.as_ref();
+    ensure_sys_tables(&pool, d).await.expect("sys tables");
+
+    let doc = json!({
+        "attributes": [
+            {"key": "warrantyMonths", "type": "int", "filterable": true, "sortable": true}
+        ]
+    });
+
+    // Nothing stored initially.
+    assert!(load_registry_raw(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Store, then raw read returns the same document.
+    store_registry(&pool, d, "acme", "_default", "products", &doc)
+        .await
+        .unwrap();
+    let raw = load_registry_raw(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw, doc);
+
+    // Parsed registry resolves the declared field.
+    let reg = load_registry(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap();
+    assert!(reg.field("attributes", "warrantyMonths").is_some());
+
+    // Tenant isolation: a different tenant sees nothing.
+    assert!(load_registry_raw(&pool, d, "bella", "_default", "products")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Upsert replaces the whole document.
+    let doc2 = json!({ "attributes": [{"key": "color", "type": "text"}] });
+    store_registry(&pool, d, "acme", "_default", "products", &doc2)
+        .await
+        .unwrap();
+    let reg2 = load_registry(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap();
+    assert!(reg2.field("attributes", "warrantyMonths").is_none());
+    assert!(reg2.field("attributes", "color").is_some());
+
+    // Delete returns true once, then false.
+    assert!(delete_registry(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap());
+    assert!(!delete_registry(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap());
+    assert!(load_registry_raw(&pool, d, "acme", "_default", "products")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn extensible_index_ddl_applies_and_is_idempotent() {
+    use architect_sdk::extensible_fields::{apply_indexes, index_ddl, ExtensibleRegistry};
+    let pool = memory_pool().await;
+    sqlx::query("CREATE TABLE products (id INTEGER PRIMARY KEY, attributes TEXT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let dialect = active_dialect();
+
+    let reg = ExtensibleRegistry::from_value(json!({
+        "attributes": [
+            {"key": "warrantyMonths", "type": "int", "filterable": true, "sortable": true},
+            {"key": "note",           "type": "text", "filterable": false, "sortable": false}
+        ]
+    }))
+    .expect("registry");
+
+    // SQLite has no schemas → table-only target. Only the queryable field is indexed.
+    let stmts = index_ddl("main", "products", &reg, dialect.as_ref(), None);
+    assert_eq!(stmts.len(), 1, "stmts: {:?}", stmts);
+
+    let (applied, errors) = apply_indexes(&pool, &stmts).await;
+    assert!(errors.is_empty(), "apply errors: {:?}", errors);
+    assert_eq!(applied.len(), 1);
+
+    // Idempotent: re-applying the same IF NOT EXISTS statements is a no-op, not an error.
+    let (_applied2, errors2) = apply_indexes(&pool, &stmts).await;
+    assert!(errors2.is_empty(), "re-apply errors: {:?}", errors2);
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'xf_products_attributes_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count indexes");
+    assert_eq!(count, 1, "expected exactly one generated index");
 }

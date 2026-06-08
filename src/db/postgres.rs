@@ -215,6 +215,22 @@ impl Dialect for PostgresDialect {
         )
     }
 
+    fn json_extract_text(&self, col: &str, key: &str) -> String {
+        format!("({} ->> '{}')", col, key.replace('\'', "''"))
+    }
+
+    fn json_extract_typed(&self, col: &str, key: &str, t: &CanonicalType) -> String {
+        let base = self.json_extract_text(col, key);
+        match cast_name(t) {
+            Some(cast) => format!("{}::{}", base, cast),
+            None => base,
+        }
+    }
+
+    fn case_insensitive_like(&self, col: &str, placeholder: &str) -> String {
+        format!("{} ILIKE {}", col, placeholder)
+    }
+
     fn sys_json_type(&self) -> &'static str {
         "JSONB"
     }

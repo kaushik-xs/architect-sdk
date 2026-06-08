@@ -71,6 +71,22 @@ pub trait Dialect: Send + Sync + 'static {
     /// Build a scalar subquery returning a JSON array for a to-many include.
     fn to_many_subquery(&self, col_exprs: &[String], from_clause: &str) -> String;
 
+    // ── JSON path extraction (extensible fields) ───────────────────────────────────
+
+    /// Extract a top-level key from a JSON/JSONB column as text.
+    /// `col` is an already-quoted column expression; `key` is the raw JSON key (escaped here).
+    /// Postgres: `(col ->> 'key')`.  MySQL/SQLite: `col->>'$.key'`.
+    fn json_extract_text(&self, col: &str, key: &str) -> String;
+
+    /// Extract a JSON key and cast it to `t` so comparisons and ORDER BY are type-correct.
+    /// For text-like types this is equivalent to [`Dialect::json_extract_text`].
+    fn json_extract_typed(&self, col: &str, key: &str, t: &CanonicalType) -> String;
+
+    /// Case-insensitive LIKE comparison fragment: `col <ci-like> placeholder`.
+    /// Postgres: `col ILIKE ph`.  MySQL: `LOWER(col) LIKE LOWER(ph)`.  SQLite: `col LIKE ph`
+    /// (SQLite LIKE is case-insensitive for ASCII by default).
+    fn case_insensitive_like(&self, col: &str, placeholder: &str) -> String;
+
     // ── System-table DDL helpers ──────────────────────────────────────────────
 
     /// DDL fragment for a JSON/JSONB payload column (e.g. "JSONB", "JSON", "TEXT").
