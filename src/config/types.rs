@@ -139,6 +139,12 @@ pub struct ColumnConfig {
     pub comment: Option<String>,
     #[serde(default)]
     pub asset: Option<AssetColumnConfig>,
+    /// When true, this JSON/JSONB column is an extensible "extensible fields" bag: per-tenant
+    /// field definitions are stored in the KV registry and its keys become RSQL
+    /// filterable/sortable via the `<column>.<key>` dotted syntax. Ignored (with a warning)
+    /// for non-JSON columns.
+    #[serde(default)]
+    pub extensible: bool,
 }
 
 fn default_true() -> bool {

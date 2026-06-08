@@ -240,6 +240,7 @@ mod tests {
             default: None,
             comment: None,
             asset: None,
+            extensible: false,
         }
     }
 

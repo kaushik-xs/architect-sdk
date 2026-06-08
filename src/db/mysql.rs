@@ -5,6 +5,26 @@ use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 pub struct MySqlDialect;
 
+/// Target type for a MySQL `CAST(... AS <type>)` over a JSON-extracted value.
+/// Returns `None` for text-like types, which need no cast.
+fn mysql_cast(t: &CanonicalType) -> Option<&'static str> {
+    match t {
+        CanonicalType::SmallInt
+        | CanonicalType::Int
+        | CanonicalType::BigInt
+        | CanonicalType::Serial
+        | CanonicalType::BigSerial
+        | CanonicalType::Boolean => Some("SIGNED"),
+        CanonicalType::Real | CanonicalType::Double | CanonicalType::Decimal(_) => {
+            Some("DECIMAL(38, 10)")
+        }
+        CanonicalType::Date => Some("DATE"),
+        CanonicalType::Timestamp | CanonicalType::TimestampNtz => Some("DATETIME"),
+        CanonicalType::Time | CanonicalType::Timetz => Some("TIME"),
+        _ => None,
+    }
+}
+
 impl Dialect for MySqlDialect {
     fn name(&self) -> &'static str {
         "mysql"
@@ -123,6 +143,22 @@ impl Dialect for MySqlDialect {
             "(SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT({})), JSON_ARRAY()) FROM {})",
             pairs, from_clause
         )
+    }
+
+    fn json_extract_text(&self, col: &str, key: &str) -> String {
+        format!("{}->>'$.{}'", col, key.replace('\'', "''"))
+    }
+
+    fn json_extract_typed(&self, col: &str, key: &str, t: &CanonicalType) -> String {
+        let base = self.json_extract_text(col, key);
+        match mysql_cast(t) {
+            Some(cast) => format!("CAST({} AS {})", base, cast),
+            None => base,
+        }
+    }
+
+    fn case_insensitive_like(&self, col: &str, placeholder: &str) -> String {
+        format!("LOWER({}) LIKE LOWER({})", col, placeholder)
     }
 
     fn sys_json_type(&self) -> &'static str {

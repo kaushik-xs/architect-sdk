@@ -3,6 +3,7 @@
 pub mod asset;
 pub mod config;
 pub mod entity;
+pub mod extensible_fields;
 pub mod kv;
 pub mod package;
 pub use asset::*;

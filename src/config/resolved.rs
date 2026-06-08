@@ -82,6 +82,10 @@ pub struct ResolvedEntity {
     pub versioning: Option<VersioningConfig>,
     /// MCP exposure config, carried from ApiEntityConfig. None when not set.
     pub mcp: Option<McpEntityConfig>,
+    /// Names of JSON/JSONB columns flagged `extensible: true`. Each is a extensible-fields bag
+    /// whose per-tenant field definitions live in the KV registry and whose keys are
+    /// RSQL-filterable/sortable via the `<column>.<key>` syntax. Empty when none configured.
+    pub extensible_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

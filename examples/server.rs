@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_client,
         authrs_client,
         dialect,
+        extensible_cache: Default::default(),
     };
 
     let api = Router::new()

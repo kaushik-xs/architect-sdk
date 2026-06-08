@@ -269,6 +269,12 @@ async fn dispatch_operation(
                 .map(parse_sort)
                 .unwrap_or_default();
 
+            // Load the per-tenant extensible-field registry (cached) so `filter`/`sort` can
+            // reference `<column>.<key>` keys on extensible JSON columns.
+            let ext_registry =
+                crate::handlers::entity::load_extensible_registry(state, entity, Some(tenant_id))
+                    .await?;
+
             let rows = CrudService::list(
                 &mut executor,
                 entity,
@@ -279,6 +285,7 @@ async fn dispatch_operation(
                 &[],
                 None,
                 state.dialect.as_ref(),
+                ext_registry.as_ref(),
             )
             .await?;
 

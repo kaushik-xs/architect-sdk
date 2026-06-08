@@ -119,6 +119,30 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             }
         }
 
+        // Collect JSON/JSONB columns flagged `extensible: true` — the extensible-fields bags.
+        // A non-JSON column flagged extensible is ignored (logged) since JSON-path access
+        // only makes sense on a JSON document.
+        let extensible_columns: Vec<String> = table_columns
+            .iter()
+            .filter(|c| c.extensible)
+            .filter_map(|c| {
+                let canonical = parse_canonical(&c.type_);
+                if matches!(
+                    canonical,
+                    crate::db::CanonicalType::Json | crate::db::CanonicalType::Jsonb
+                ) {
+                    Some(c.name.clone())
+                } else {
+                    tracing::warn!(
+                        table = %table.id,
+                        column = %c.name,
+                        "ignoring `extensible: true` on non-JSON column"
+                    );
+                    None
+                }
+            })
+            .collect();
+
         let sensitive_columns: HashSet<String> = api.sensitive_columns.iter().cloned().collect();
         let includes = build_includes_for_table(
             &table.id,
@@ -155,6 +179,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
             parent_ref_column: api.parent_ref_column.clone(),
             versioning: table.versioning.clone(),
             mcp: api.mcp.clone(),
+            extensible_columns,
         };
         entity_by_path.insert(api.path_segment.clone(), entity.clone());
         entities.push(entity);
@@ -186,6 +211,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 parent_ref_column: None,
                 versioning: None,
                 mcp: None,
+                extensible_columns: Vec::new(),
             };
             audit_entity
         })

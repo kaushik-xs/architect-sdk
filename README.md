@@ -14,6 +14,7 @@ Supports **PostgreSQL**, **MySQL**, and **SQLite** via compile-time dialect sele
 - **Package system**: Deploy config as versioned ZIP packages with install/uninstall/upgrade
 - **Migration planning**: Diff-based upgrades with preview before execution
 - **Asset storage**: File uploads with S3, Azure, GCS, or local filesystem backends
+- **Extensible fields**: Per-tenant custom fields on JSON/JSONB columns, filterable/sortable via RSQL — no schema change per tenant
 - **Request validation**: Per-column rules (required, format, length, pattern, allowed, min/max)
 - **Audit logging**: Optional per-table audit trail with row snapshots and change deltas
 - **Event publishing**: Optional async event publishing to Decision Hub after CRUD ops
@@ -504,6 +505,45 @@ Set `DECISION_HUB_URL`. The SDK publishes async events after every create, updat
 
 Set `AUTHRS_URL` and `SERVICE_NAME`. The SDK checks permissions before every entity operation using the `X-User-ID` header. Unauthorized requests receive `401`.
 
+### 11. Extensible Fields (per-tenant custom fields)
+
+Let each tenant add their own queryable fields to an entity without changing the schema. Flag a JSON/JSONB column as extensible:
+
+```json
+{ "id": "col_products_attributes", "table_id": "tbl_products",
+  "name": "attributes", "type": "jsonb", "nullable": false,
+  "default": { "expression": "'{}'::jsonb" }, "extensible": true }
+```
+
+Each tenant then declares the field definitions for that column via the **registry** admin API:
+
+```http
+PUT /api/v1/products/extensible-fields      (X-Tenant-ID: acme)
+{
+  "attributes": [
+    { "key": "warrantyMonths", "type": "int",  "filterable": true, "sortable": true, "min": 0 },
+    { "key": "energyRating",   "type": "text", "maxLength": 4 }
+  ]
+}
+```
+
+Now those keys are first-class in writes and queries for that tenant:
+
+```http
+# Stored & validated on create/update (unknown keys / bad types → 422)
+POST /api/v1/products   { "name": "Drill", "customFields": { "warrantyMonths": 24 } }
+
+# Filter & sort via the <column>.<key> RSQL syntax
+GET  /api/v1/products?q=attributes.warrantyMonths=ge=12&sort=-attributes.warrantyMonths
+```
+
+Notes:
+- **Storage convention**: registry keys are stored verbatim — use **camelCase** so they round-trip to clients unchanged.
+- **Multiple bags**: an entity may flag several JSON columns extensible; the RSQL prefix (`attributes.` vs `specs.`) disambiguates them.
+- **Indexing** (important at scale): filters/sorts on extensible fields are sequential scans until indexed. Review the suggested DDL with `GET /api/v1/:entity/extensible-fields/indexes` and apply it (deliberately, on large tables) with `POST .../indexes`. RLS tenants get partial indexes scoped by `tenant_id`.
+- **Authorization**: the admin/index routes use dedicated verbs — `getExtensibleFields<Table>`, `putExtensibleFields<Table>`, `deleteExtensibleFields<Table>` — so managing definitions is a separate grant from row CRUD.
+- **Scale note**: for very large RLS tables, partition the shared table by `tenant_id` (list/hash) so tenant-scoped queries prune to one partition; this pairs with the per-tenant partial indexes above. (Per-tenant *Database*-strategy deployments are already sharded by database.)
+
 ---
 
 ## Environment Variables
@@ -586,15 +626,27 @@ Replace `:entity` with the entity's `path_segment` from config (e.g. `users`).
 
 **Package-scoped routes** follow the same pattern under `/api/v1/package/:package_id/:entity`.
 
+#### Extensible-Field Admin (requires `X-Tenant-ID`)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/:entity/extensible-fields` | Current registry document for the tenant |
+| `PUT` | `/api/v1/:entity/extensible-fields` | Replace the registry (validated) |
+| `DELETE` | `/api/v1/:entity/extensible-fields` | Clear the registry |
+| `GET` | `/api/v1/:entity/extensible-fields/indexes` | Suggested `CREATE INDEX` statements |
+| `POST` | `/api/v1/:entity/extensible-fields/indexes` | Apply the suggested indexes |
+
 #### List Query Parameters
 
 | Param | Description | Example |
 |---|---|---|
-| `filter` | RSQL/FIQL filter expression | `status==active;created_at>2024-01-01` |
+| `q` | RSQL/FIQL filter expression | `status==active;createdAt=gt=2024-01-01` |
 | `sort` | Comma-separated columns; `+` asc, `-` desc | `+created_at,-status` |
 | `limit` | Page size (default 10) | `50` |
 | `offset` | Skip N records (default 0) | `100` |
 | `include` | Comma-separated related entity path segments | `orders,payments` |
+
+Both `q` and `sort` also accept **extensible-field** keys via the `<column>.<key>` syntax (e.g. `q=attributes.warrantyMonths=ge=12`, `sort=-attributes.warrantyMonths`) when the column is declared `extensible` and the key is in the tenant's registry. See [Extensible Fields](#11-extensible-fields-per-tenant-custom-fields).
 
 #### Response Envelope
 
@@ -707,6 +759,8 @@ Every table automatically gets: `created_at`, `updated_at`, `archived_at`, `crea
 ```
 
 **Validation rules:** `required`, `min_length`, `max_length`, `pattern` (regex), `allowed` (enum list), `minimum`, `maximum`, `format` (`email` | `uuid`).
+
+**`extensible`** *(boolean, JSON/JSONB columns only)*: marks the column as a per-tenant custom-fields bag. Its keys are defined per tenant via the registry admin API and become RSQL filterable/sortable. Ignored (with a warning) on non-JSON columns. See [Extensible Fields](#11-extensible-fields-per-tenant-custom-fields).
 
 ### API Entity
 

@@ -9,6 +9,9 @@ use crate::handlers::entity::{
     list_package, read, read_history_version, read_package, unarchive, unarchive_package, update,
     update_package,
 };
+use crate::handlers::extensible_fields::{
+    apply_indexes_handler, delete_registry_handler, get_indexes, get_registry, put_registry,
+};
 use crate::handlers::kv::{kv_delete, kv_get, kv_list_keys, kv_put};
 use crate::state::AppState;
 use axum::{routing::get, routing::post, Router};
@@ -19,6 +22,17 @@ pub fn entity_routes(state: AppState) -> Router {
         .route("/assets/sign", get(sign_asset))
         .route("/:path_segment", get(list).post(create))
         .route("/:path_segment/bulk", post(bulk_create).patch(bulk_update))
+        // Static second segment — takes precedence over /:path_segment/:id (like /bulk).
+        .route(
+            "/:path_segment/extensible-fields",
+            get(get_registry)
+                .put(put_registry)
+                .delete(delete_registry_handler),
+        )
+        .route(
+            "/:path_segment/extensible-fields/indexes",
+            get(get_indexes).post(apply_indexes_handler),
+        )
         .route(
             "/:path_segment/:id",
             get(read).patch(update).delete(delete_handler),
@@ -58,4 +72,26 @@ pub fn entity_routes(state: AppState) -> Router {
             post(unarchive_package),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use axum::{routing::get, Router};
+
+    async fn noop() -> &'static str {
+        ""
+    }
+
+    /// matchit panics at build time on conflicting routes. This proves the static
+    /// `extensible-fields` segment coexists with the `:id` param segment (same pattern as `bulk`).
+    #[test]
+    fn extensible_fields_route_coexists_with_id_route() {
+        let _router: Router = Router::new()
+            .route("/:path_segment", get(noop))
+            .route("/:path_segment/bulk", get(noop))
+            .route("/:path_segment/extensible-fields", get(noop))
+            .route("/:path_segment/extensible-fields/indexes", get(noop))
+            .route("/:path_segment/:id", get(noop))
+            .route("/:path_segment/:id/archive", get(noop));
+    }
 }

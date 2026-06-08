@@ -27,6 +27,16 @@
     "comment": null
   },
   {
+    "id": "col_users_attributes",
+    "table_id": "tbl_users",
+    "name": "attributes",
+    "type": "jsonb",
+    "nullable": false,
+    "default": { "expression": "'{}'::jsonb" },
+    "comment": "Per-tenant extensible custom fields; keys defined via the extensible-fields registry.",
+    "extensible": true
+  },
+  {
     "id": "col_orders_id",
     "table_id": "tbl_orders",
     "name": "id",

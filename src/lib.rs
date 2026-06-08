@@ -23,6 +23,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod events;
+pub mod extensible_fields;
 pub mod extractors;
 pub mod handlers;
 pub mod migration;

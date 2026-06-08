@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Extensible fields**: per-tenant custom fields on JSON/JSONB columns flagged `"extensible": true`.
+  - Field definitions live in a per-tenant **registry** (KV store, reserved namespace `__extensible_fields__`, keyed by `path_segment`), not in the schema.
+  - Registry keys become first-class **RSQL filterable/sortable** fields via the `<column>.<key>` dotted syntax (e.g. `q=attributes.warrantyMonths=ge=12`, `sort=-attributes.voltage`), with dialect-aware typed JSON extraction (Postgres `->>` + `::cast`; MySQL/SQLite `->>'$.key'` + `CAST`).
+  - Write-time validation (create/update/bulk) against the registry: unknown keys, type/bounds/length/pattern, and required-on-create → `422`.
+  - **Admin API** (authrs-gated, requires `X-Tenant-ID`):
+    - `GET`/`PUT`/`DELETE` `/api/v1/:entity/extensible-fields` — manage the registry.
+    - `GET`/`POST` `/api/v1/:entity/extensible-fields/indexes` — review / apply suggested `CREATE INDEX` DDL for queryable fields (RLS tenants get partial indexes scoped by tenant).
+  - New authrs action verbs: `getExtensibleFields<Table>`, `putExtensibleFields<Table>`, `deleteExtensibleFields<Table>`.
+  - Read-through registry cache on `AppState` (TTL-bounded, evicted on write).
+  - Multiple extensible columns ("bags") per entity supported; disambiguated by the column prefix.
+
+### Changed
+- **Breaking (struct):** `AppState` gained a public `extensible_cache` field. Construct it with `extensible_cache: Default::default()`.
+
+### Fixed
+- Case-insensitive RSQL operators (`=ilike=`/`=contains=`/`=starts=`/`=ends=`) now work on MySQL and SQLite (previously hardcoded `ILIKE`, Postgres-only) via a new `Dialect::case_insensitive_like`.
+
 ## [0.1.2] - 2026-05-29
 
 ### Fixed

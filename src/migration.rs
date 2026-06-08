@@ -2404,6 +2404,7 @@ mod enum_recreate_tests {
             default: default.map(|d| ColumnDefaultConfig::Literal(d.into())),
             comment: None,
             asset: None,
+            extensible: false,
         }
     }
 
@@ -2515,7 +2516,7 @@ mod enum_recreate_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod companion_sync_tests {
     use super::*;
     use crate::db::sqlite::SqliteDialect;
@@ -2555,6 +2556,7 @@ mod companion_sync_tests {
             default: None,
             comment: None,
             asset: None,
+            extensible: false,
         }
     }
 
