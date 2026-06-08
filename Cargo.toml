@@ -3,7 +3,7 @@ members = [".", "example_consumer"]
 
 [package]
 name = "foundry-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Configuration-driven REST backend library for Rust with PostgreSQL — define schemas, tables, and APIs in JSON, get a production-grade REST service."
