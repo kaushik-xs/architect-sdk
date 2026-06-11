@@ -636,6 +636,8 @@ Replace `:entity` with the entity's `path_segment` from config (e.g. `users`).
 | `GET` | `/api/v1/:entity/extensible-fields/indexes` | Suggested `CREATE INDEX` statements |
 | `POST` | `/api/v1/:entity/extensible-fields/indexes` | Apply the suggested indexes |
 
+Each route also has a **package-scoped** form under `/api/v1/package/:package_id/:entity/extensible-fields[/indexes]`, which resolves the entity from that package's model (keying the registry by the correct package). Use it when the same `path_segment` exists in more than one installed package.
+
 #### List Query Parameters
 
 | Param | Description | Example |

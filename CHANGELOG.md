@@ -15,6 +15,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Admin API** (authrs-gated, requires `X-Tenant-ID`):
     - `GET`/`PUT`/`DELETE` `/api/v1/:entity/extensible-fields` — manage the registry.
     - `GET`/`POST` `/api/v1/:entity/extensible-fields/indexes` — review / apply suggested `CREATE INDEX` DDL for queryable fields (RLS tenants get partial indexes scoped by tenant).
+    - All admin routes also have a **package-scoped** form under `/api/v1/package/:package_id/:entity/extensible-fields[/indexes]` (resolves the entity from that package's model).
   - New authrs action verbs: `getExtensibleFields<Table>`, `putExtensibleFields<Table>`, `deleteExtensibleFields<Table>`.
   - Read-through registry cache on `AppState` (TTL-bounded, evicted on write).
   - Multiple extensible columns ("bags") per entity supported; disambiguated by the column prefix.

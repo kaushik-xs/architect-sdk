@@ -10,7 +10,9 @@ use crate::handlers::entity::{
     update_package,
 };
 use crate::handlers::extensible_fields::{
-    apply_indexes_handler, delete_registry_handler, get_indexes, get_registry, put_registry,
+    apply_indexes_handler, apply_indexes_package, delete_registry_handler, delete_registry_package,
+    get_indexes, get_indexes_package, get_registry, get_registry_package, put_registry,
+    put_registry_package,
 };
 use crate::handlers::kv::{kv_delete, kv_get, kv_list_keys, kv_put};
 use crate::state::AppState;
@@ -58,6 +60,16 @@ pub fn entity_routes(state: AppState) -> Router {
             post(bulk_create_package).patch(bulk_update_package),
         )
         .route(
+            "/package/:package_id/:path_segment/extensible-fields",
+            get(get_registry_package)
+                .put(put_registry_package)
+                .delete(delete_registry_package),
+        )
+        .route(
+            "/package/:package_id/:path_segment/extensible-fields/indexes",
+            get(get_indexes_package).post(apply_indexes_package),
+        )
+        .route(
             "/package/:package_id/:path_segment/:id",
             get(read_package)
                 .patch(update_package)
@@ -92,6 +104,17 @@ mod route_tests {
             .route("/:path_segment/extensible-fields", get(noop))
             .route("/:path_segment/extensible-fields/indexes", get(noop))
             .route("/:path_segment/:id", get(noop))
-            .route("/:path_segment/:id/archive", get(noop));
+            .route("/:path_segment/:id/archive", get(noop))
+            .route("/package/:package_id/:path_segment", get(noop))
+            .route("/package/:package_id/:path_segment/bulk", get(noop))
+            .route(
+                "/package/:package_id/:path_segment/extensible-fields",
+                get(noop),
+            )
+            .route(
+                "/package/:package_id/:path_segment/extensible-fields/indexes",
+                get(noop),
+            )
+            .route("/package/:package_id/:path_segment/:id", get(noop));
     }
 }

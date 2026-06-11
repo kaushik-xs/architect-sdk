@@ -592,10 +592,10 @@ fn add_entity_paths(
             builder = builder.path(bulk_path, bulk_item.build());
         }
 
-        // Extensible-field admin routes exist only on the default (unprefixed) routes, and only
+        // Extensible-field admin routes — available in both default and package-scoped forms,
         // for entities that declare at least one `extensible` JSON column.
-        if !use_package_param && !entity.extensible_columns.is_empty() {
-            let (xf_get, xf_put, xf_delete) = extensible_fields_operations(entity);
+        if !entity.extensible_columns.is_empty() {
+            let (xf_get, xf_put, xf_delete) = extensible_fields_operations(entity, op_suffix);
             builder = builder.path(
                 format!("{}/{}/extensible-fields", path_prefix, seg),
                 PathItemBuilder::new()
@@ -604,7 +604,7 @@ fn add_entity_paths(
                     .operation(HttpMethod::Delete, xf_delete)
                     .build(),
             );
-            let (idx_get, idx_post) = extensible_indexes_operations(entity);
+            let (idx_get, idx_post) = extensible_indexes_operations(entity, op_suffix);
             builder = builder.path(
                 format!("{}/{}/extensible-fields/indexes", path_prefix, seg),
                 PathItemBuilder::new()
@@ -618,14 +618,17 @@ fn add_entity_paths(
 }
 
 /// GET/PUT/DELETE operations for `/:entity/extensible-fields` (per-tenant registry admin).
-fn extensible_fields_operations(entity: &ResolvedEntity) -> (Operation, Operation, Operation) {
+fn extensible_fields_operations(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+) -> (Operation, Operation, Operation) {
     let seg = &entity.path_segment;
     let get = OperationBuilder::new()
         .summary(Some("Get extensible-field registry"))
         .description(Some(
             "Return the tenant's extensible-field registry document for this entity (or {} when unset).",
         ))
-        .operation_id(Some(format!("get_extensible_fields_{}", seg)))
+        .operation_id(Some(format!("get_extensible_fields_{}{}", seg, op_suffix)))
         .parameters(Some(vec![x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
@@ -634,7 +637,7 @@ fn extensible_fields_operations(entity: &ResolvedEntity) -> (Operation, Operatio
         .description(Some(
             "Validate and replace the tenant's registry. Body maps each extensible column to its field definitions, e.g. {\"attributes\":[{\"key\":\"warrantyMonths\",\"type\":\"int\",\"filterable\":true,\"sortable\":true}]}.",
         ))
-        .operation_id(Some(format!("put_extensible_fields_{}", seg)))
+        .operation_id(Some(format!("put_extensible_fields_{}{}", seg, op_suffix)))
         .parameters(Some(vec![x_tenant_id_header()]))
         .request_body(Some(
             RequestBodyBuilder::new()
@@ -655,7 +658,10 @@ fn extensible_fields_operations(entity: &ResolvedEntity) -> (Operation, Operatio
         .description(Some(
             "Delete the tenant's registry document for this entity.",
         ))
-        .operation_id(Some(format!("delete_extensible_fields_{}", seg)))
+        .operation_id(Some(format!(
+            "delete_extensible_fields_{}{}",
+            seg, op_suffix
+        )))
         .parameters(Some(vec![x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
@@ -663,14 +669,17 @@ fn extensible_fields_operations(entity: &ResolvedEntity) -> (Operation, Operatio
 }
 
 /// GET/POST operations for `/:entity/extensible-fields/indexes` (suggest / apply index DDL).
-fn extensible_indexes_operations(entity: &ResolvedEntity) -> (Operation, Operation) {
+fn extensible_indexes_operations(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+) -> (Operation, Operation) {
     let seg = &entity.path_segment;
     let get = OperationBuilder::new()
         .summary(Some("Suggested indexes for extensible fields"))
         .description(Some(
             "Return CREATE INDEX statements for the tenant's filterable/sortable extensible fields. Review before applying (large-table DDL is heavy).",
         ))
-        .operation_id(Some(format!("get_extensible_field_indexes_{}", seg)))
+        .operation_id(Some(format!("get_extensible_field_indexes_{}{}", seg, op_suffix)))
         .parameters(Some(vec![x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
@@ -679,7 +688,7 @@ fn extensible_indexes_operations(entity: &ResolvedEntity) -> (Operation, Operati
         .description(Some(
             "Apply the suggested indexes to the tenant's data table. Best-effort and idempotent; returns applied statements and any errors.",
         ))
-        .operation_id(Some(format!("apply_extensible_field_indexes_{}", seg)))
+        .operation_id(Some(format!("apply_extensible_field_indexes_{}{}", seg, op_suffix)))
         .parameters(Some(vec![x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
@@ -1050,5 +1059,27 @@ mod tests {
         assert!(json.contains("/api/v1/products/extensible-fields/indexes"));
         // The non-extensible entity does not.
         assert!(!json.contains("/api/v1/orders/extensible-fields"));
+    }
+
+    #[test]
+    fn spec_lists_package_scoped_extensible_field_paths() {
+        let default_model = ResolvedModel {
+            entities: vec![entity("products", vec!["attributes".into()])],
+            entity_by_path: HashMap::new(),
+        };
+        let mut package_models = HashMap::new();
+        package_models.insert(
+            "billing".to_string(),
+            ResolvedModel {
+                entities: vec![entity("invoices", vec!["meta".into()])],
+                entity_by_path: HashMap::new(),
+            },
+        );
+        let spec = build_spec(&default_model, "/api/v1", &package_models, &HashMap::new());
+        let json = serde_json::to_string(&spec).expect("serialize spec");
+
+        // Package-scoped admin paths are emitted for the package's extensible entity.
+        assert!(json.contains("/api/v1/package/billing/invoices/extensible-fields"));
+        assert!(json.contains("/api/v1/package/billing/invoices/extensible-fields/indexes"));
     }
 }
