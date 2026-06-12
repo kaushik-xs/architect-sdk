@@ -2,5 +2,5 @@
 
 mod crud;
 mod validation;
-pub use crud::{CrudService, TenantExecutor, TenantExecutorInner};
+pub use crud::{CrudService, GraphChild, TenantExecutor, TenantExecutorInner};
 pub use validation::RequestValidator;

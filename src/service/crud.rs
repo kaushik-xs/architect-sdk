@@ -1,6 +1,6 @@
 //! Generic CRUD execution against PostgreSQL.
 
-use crate::config::ResolvedEntity;
+use crate::config::{IncludeSpec, ResolvedEntity};
 use crate::db::pool::{Connection, DbRow, Pool};
 use crate::db::Dialect;
 use crate::error::AppError;
@@ -38,6 +38,10 @@ impl<'a> TenantExecutor<'a> {
         }
     }
 }
+
+/// A child group for [`CrudService::create_graph`]: the to-many include spec, the resolved
+/// child entity, and the list of child bodies to insert under it.
+pub type GraphChild = (IncludeSpec, ResolvedEntity, Vec<HashMap<String, Value>>);
 
 pub struct CrudService;
 
@@ -174,6 +178,89 @@ impl CrudService {
             .await?;
         }
         Ok(row)
+    }
+
+    /// Insert a parent row and its FK-children atomically in a single transaction.
+    ///
+    /// `children` pairs each `ToMany` include spec with its resolved child entity and the
+    /// list of child bodies to insert. For every child, the FK column (`spec.their_key_column`)
+    /// is set to the parent's `spec.our_key_column` value before insertion. Any error rolls
+    /// the whole transaction back, so no orphan parent or partial child set is ever committed.
+    ///
+    /// `set_local_sql` is the `SET LOCAL app.tenant_id = '...'` statement for RLS tenants; it is
+    /// run inside the transaction so it scopes to these inserts. Pass `None` for pool strategy.
+    ///
+    /// Returns `(parent_row, child_rows_by_include_name)` as raw DB rows (snake_case keys,
+    /// sensitive columns NOT stripped — the caller shapes the response).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_graph(
+        pool: &Pool,
+        parent: &ResolvedEntity,
+        parent_body: &HashMap<String, Value>,
+        children: &[GraphChild],
+        schema_override: Option<&str>,
+        rls_tenant_id: Option<&str>,
+        set_local_sql: Option<&str>,
+        caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
+    ) -> Result<(Value, HashMap<String, Vec<Value>>), AppError> {
+        let mut tx = pool.begin().await?;
+        // RLS: scope the tenant to THIS transaction (SET LOCAL only lasts the transaction).
+        if let Some(sql) = set_local_sql {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
+
+        let parent_row;
+        let mut child_rows: HashMap<String, Vec<Value>> = HashMap::new();
+        {
+            // A Transaction derefs to &mut Connection — the Conn executor variant handles it,
+            // so every create() below runs on this same connection (one atomic transaction).
+            let mut exec = TenantExecutor::conn(&mut tx, dialect);
+
+            parent_row = Self::create(
+                &mut exec,
+                parent,
+                parent_body,
+                schema_override,
+                rls_tenant_id,
+                caller_user_id,
+                dialect,
+            )
+            .await?;
+
+            for (spec, child_entity, bodies) in children {
+                // Value to copy from the new parent into each child's FK column.
+                let fk_value = parent_row
+                    .get(&spec.our_key_column)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!(
+                            "parent row is missing key column '{}' for include '{}'",
+                            spec.our_key_column, spec.name
+                        ))
+                    })?;
+                let mut rows = Vec::with_capacity(bodies.len());
+                for body in bodies {
+                    let mut child = body.clone();
+                    child.insert(spec.their_key_column.clone(), fk_value.clone());
+                    let row = Self::create(
+                        &mut exec,
+                        child_entity,
+                        &child,
+                        schema_override,
+                        rls_tenant_id,
+                        caller_user_id,
+                        dialect,
+                    )
+                    .await?;
+                    rows.push(row);
+                }
+                child_rows.insert(spec.name.clone(), rows);
+            }
+        } // exec dropped here, releasing the &mut borrow on tx
+
+        tx.commit().await?; // nothing is durable until this line
+        Ok((parent_row, child_rows))
     }
 
     /// Update one row by id. Returns updated row.

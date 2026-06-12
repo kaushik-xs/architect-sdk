@@ -4,7 +4,9 @@
 //! paths are generated dynamically by listing _sys_packages and loading each package's config.
 
 use crate::case::to_camel_case;
-use crate::config::{load_from_pool, resolve, KvStoreConfig, ResolvedEntity, ResolvedModel};
+use crate::config::{
+    load_from_pool, resolve, IncludeDirection, KvStoreConfig, ResolvedEntity, ResolvedModel,
+};
 use crate::state::AppState;
 use crate::store::list_package_ids;
 use axum::extract::State;
@@ -16,7 +18,9 @@ use utoipa::openapi::path::{
 };
 use utoipa::openapi::request_body::RequestBodyBuilder;
 use utoipa::openapi::response::{Response, ResponsesBuilder};
-use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
+use utoipa::openapi::schema::{
+    ArrayBuilder, ObjectBuilder, OneOfBuilder, Schema, SchemaType, Type,
+};
 use utoipa::openapi::server::{ServerBuilder, ServerVariableBuilder};
 use utoipa::openapi::{Content, Info, OpenApi, OpenApiBuilder, RefOr, Required};
 
@@ -502,6 +506,118 @@ fn bulk_update_operation(
         .build()
 }
 
+/// Child create-body schema for a graph include: like `entity_body_schema(child, true)` but
+/// omits the relationship FK column (it is filled automatically from the parent, and the handler
+/// rejects requests that set it).
+fn graph_child_body_schema(child: &ResolvedEntity, fk_column: &str) -> Schema {
+    let mut builder = ObjectBuilder::new()
+        .schema_type(SchemaType::new(Type::Object))
+        .description(Some(format!(
+            "Fields for {} (camelCase). The relationship column '{}' is set automatically from the parent and must be omitted.",
+            child.path_segment,
+            to_camel_case(fk_column)
+        )));
+    let mut required = Vec::new();
+    for col in &child.columns {
+        if child.sensitive_columns.contains(&col.name) || col.name == *fk_column {
+            continue;
+        }
+        let camel = to_camel_case(&col.name);
+        let prop_schema = column_schema_from_pg_type(col.pg_type.as_deref());
+        builder = builder.property(camel.clone(), RefOr::T(prop_schema));
+        if !col.nullable && !col.has_default {
+            required.push(camel);
+        }
+    }
+    for r in &required {
+        builder = builder.required(r.clone());
+    }
+    Schema::Object(builder.into())
+}
+
+/// POST `/:entity/graph` — insert a parent and its to-many FK-children atomically.
+/// Body: `{ "data": { ...parent... }, "include": { "<toManyName>": child | [child, ...] } }`.
+fn graph_create_operation(
+    entity: &ResolvedEntity,
+    model: &ResolvedModel,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
+
+    // include: each to-many relationship name → a single child object or an array of them.
+    let mut include_builder = ObjectBuilder::new()
+        .schema_type(SchemaType::new(Type::Object))
+        .description(Some(
+            "Related FK-children inserted atomically with the parent. Each key is a to-many include name (same as ?include=); the value is a single object or an array.".to_string(),
+        ));
+    for inc in &entity.includes {
+        if !matches!(inc.direction, IncludeDirection::ToMany) {
+            continue;
+        }
+        let Some(child) = model.entity_by_path(&inc.related_path_segment) else {
+            continue;
+        };
+        if !child.operations.iter().any(|o| o == "create") {
+            continue;
+        }
+        let child_schema = graph_child_body_schema(child, &inc.their_key_column);
+        let one_of = OneOfBuilder::new()
+            .item(RefOr::T(child_schema.clone()))
+            .item(RefOr::T(Schema::Array(
+                ArrayBuilder::new().items(RefOr::T(child_schema)).build(),
+            )))
+            .build();
+        include_builder =
+            include_builder.property(inc.name.clone(), RefOr::T(Schema::OneOf(one_of)));
+    }
+
+    let req_schema = ObjectBuilder::new()
+        .schema_type(SchemaType::new(Type::Object))
+        .property("data", RefOr::T(entity_body_schema(entity, true)))
+        .required("data")
+        .property("include", RefOr::T(Schema::Object(include_builder.into())))
+        .build();
+
+    let body = RequestBodyBuilder::new()
+        .description(Some(
+            "Parent record under 'data' plus optional nested FK-children under 'include'. Inserted atomically in one transaction.",
+        ))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(Schema::Object(req_schema)))),
+        )
+        .required(Some(Required::True))
+        .build();
+
+    OperationBuilder::new()
+        .summary(Some(format!(
+            "Create {} with related children (atomic)",
+            entity.path_segment
+        )))
+        .description(Some(format!(
+            "Insert a {} and its to-many FK-children in a single transaction. Each child's FK is filled from the new parent id; any failure rolls the whole request back.",
+            entity.path_segment
+        )))
+        .operation_id(Some(format!(
+            "create_graph_{}{}",
+            entity.path_segment, op_suffix
+        )))
+        .parameters(Some(params))
+        .request_body(Some(body))
+        .responses(
+            ResponsesBuilder::new()
+                .response("201", Response::new("Created"))
+                .response("400", Response::new("Bad Request"))
+                .response("422", Response::new("Validation Error"))
+                .build(),
+        )
+        .build()
+}
+
 /// Add entity paths for one model.
 /// - For default model: paths are `{base}/{path_segment}` (no package segment).
 /// - For package models: paths are `{base}/package/{package_id}/{path_segment}` with the concrete package id.
@@ -590,6 +706,27 @@ fn add_entity_paths(
                 );
             }
             builder = builder.path(bulk_path, bulk_item.build());
+        }
+
+        // Atomic parent+children insert — opt-in via the "create_graph" operation (like
+        // bulk_create), and only when the entity has at least one to-many (FK-in-child)
+        // relationship to nest under `include`.
+        let has_graph = entity.operations.iter().any(|o| o == "create_graph")
+            && entity
+                .includes
+                .iter()
+                .any(|i| matches!(i.direction, IncludeDirection::ToMany));
+        if has_graph {
+            let graph_path = format!("{}/{}/graph", path_prefix, seg);
+            builder = builder.path(
+                graph_path,
+                PathItemBuilder::new()
+                    .operation(
+                        HttpMethod::Post,
+                        graph_create_operation(entity, model, op_suffix, use_package_param),
+                    )
+                    .build(),
+            );
         }
 
         // Extensible-field admin routes — available in both default and package-scoped forms,

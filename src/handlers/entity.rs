@@ -1668,6 +1668,237 @@ pub async fn create(
     ))
 }
 
+/// Insert a parent row and its FK-children atomically in one transaction.
+///
+/// Body shape: `{ "data": { ...parent... }, "include": { "<name>": <child|children> } }`
+/// where `<name>` is an include name (the related entity's `path_segment`, identical to the
+/// `?include=` query param) and the value is either a single object (one child) or an array
+/// (many). Each child's FK column is filled with the new parent's id automatically. Only
+/// to-many includes (FK in the child table) are supported; to-one references must be passed
+/// as an id inside `data`. Any failure rolls the whole transaction back.
+pub async fn create_graph(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path(path_segment): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+
+    // Resolve the parent entity and authorize.
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "create_graph") {
+        return Err(AppError::BadRequest("create_graph not allowed".into()));
+    }
+    require_storage_for_assets(&state, &entity)?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
+
+    // Top-level body must be an object with "data" and an optional "include".
+    let mut top = match body {
+        Value::Object(m) => m,
+        _ => {
+            return Err(AppError::BadRequest(
+                "body must be a JSON object with 'data' and optional 'include'".into(),
+            ))
+        }
+    };
+    let data_val = top
+        .remove("data")
+        .ok_or_else(|| AppError::BadRequest("missing 'data' object".into()))?;
+    let include_val = top.remove("include");
+    if let Some((k, _)) = top.into_iter().next() {
+        return Err(AppError::BadRequest(format!(
+            "unknown field '{}' (expected only 'data' and 'include')",
+            k
+        )));
+    }
+
+    // Validate the parent record (full semantics — all required fields enforced).
+    let mut parent_body = hashmap_keys_to_snake_case(&body_to_map(data_val)?);
+    process_json_asset_fields(&state, &entity, &tenant_id_str, &mut parent_body).await?;
+    RequestValidator::validate(&parent_body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&parent_body, &entity, &reg, ValidateMode::Full)?;
+    }
+
+    // Build and validate child groups. `singles[i]` records whether include i was sent as a
+    // single object (so the response mirrors the request shape).
+    let mut svc_children: Vec<crate::service::GraphChild> = Vec::new();
+    let mut singles: Vec<bool> = Vec::new();
+    if let Some(inc) = include_val {
+        let inc_map = match inc {
+            Value::Object(m) => m,
+            _ => return Err(AppError::BadRequest("'include' must be an object".into())),
+        };
+        for (name, value) in inc_map {
+            // Resolve the include name the same way the ?include= query param does.
+            let (spec, child_entity) = {
+                let model = state
+                    .model
+                    .read()
+                    .map_err(|_| AppError::BadRequest("state lock".into()))?;
+                let resolved = resolve_includes(&model, &entity, std::slice::from_ref(&name))?;
+                let (_, spec, child) = resolved.into_iter().next().unwrap();
+                (spec, child)
+            };
+            // v1: only to-many (FK-in-child) relationships can be created inline.
+            if !matches!(spec.direction, IncludeDirection::ToMany) {
+                return Err(AppError::BadRequest(format!(
+                    "include '{}' is a to-one reference; set its id in 'data' instead of nesting it",
+                    name
+                )));
+            }
+            if !child_entity.operations.iter().any(|o| o == "create") {
+                return Err(AppError::BadRequest(format!(
+                    "create not allowed on '{}'",
+                    name
+                )));
+            }
+            // Authorize the child entity independently — having `post` on the parent does not
+            // grant the right to insert into a related table.
+            crate::authrs::check_entity_permission_opt(
+                &state.authrs_client,
+                tenant_id_opt.as_deref(),
+                user_id_opt.as_deref(),
+                &child_entity,
+                "post",
+            )
+            .await?;
+            // Object => single child; array => many.
+            let (raw_bodies, single) = match value {
+                Value::Array(arr) => (arr, false),
+                obj @ Value::Object(_) => (vec![obj], true),
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "include '{}' must be an object or array",
+                        name
+                    )))
+                }
+            };
+            // The FK column is managed by the relationship; validating it as required would
+            // fail (we inject it only after the parent is inserted), so exclude it here.
+            let mut child_validation = child_entity.validation.clone();
+            child_validation.remove(&spec.their_key_column);
+            let child_reg =
+                load_extensible_registry(&state, &child_entity, tenant_id_opt.as_deref()).await?;
+            let mut bodies = Vec::with_capacity(raw_bodies.len());
+            for (idx, rb) in raw_bodies.into_iter().enumerate() {
+                let mut cb = hashmap_keys_to_snake_case(&body_to_map(rb)?);
+                if cb.contains_key(&spec.their_key_column) {
+                    return Err(AppError::BadRequest(format!(
+                        "include '{}'[{}]: field '{}' is set automatically from the parent and must be omitted",
+                        name, idx, spec.their_key_column
+                    )));
+                }
+                process_json_asset_fields(&state, &child_entity, &tenant_id_str, &mut cb).await?;
+                RequestValidator::validate(&cb, &child_validation)?;
+                if let Some(ref reg) = child_reg {
+                    validate_extensible_fields(&cb, &child_entity, reg, ValidateMode::Full)?;
+                }
+                bodies.push(cb);
+            }
+            svc_children.push((spec, child_entity, bodies));
+            singles.push(single);
+        }
+    }
+
+    // RLS strategy needs the SET LOCAL statement run inside the transaction; pool passes None.
+    let set_local = match &ctx {
+        TenantContext::Rls { tenant_id, .. } => state.dialect.set_tenant_session_sql(tenant_id),
+        TenantContext::Pool { .. } => None,
+    };
+
+    let (mut parent_row, child_map) = CrudService::create_graph(
+        ctx.migration_pool(),
+        &entity,
+        &parent_body,
+        &svc_children,
+        ctx.schema_override(),
+        ctx.rls_tenant_id(),
+        set_local.as_deref(),
+        user_id_opt.as_deref(),
+        state.dialect.as_ref(),
+    )
+    .await?;
+
+    // Fire create events for the parent and every child before reshaping the response.
+    if let Some(client) = &state.event_client {
+        let raw_parent = parent_row.clone();
+        let mut api_parent = parent_row.clone();
+        strip_sensitive_columns(&mut api_parent, &entity.sensitive_columns);
+        value_keys_to_camel_case(&mut api_parent);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "create",
+            raw_parent,
+            api_parent,
+            tenant_id_str.clone(),
+            None,
+        );
+        for (spec, child_entity, _) in &svc_children {
+            if let Some(rows) = child_map.get(&spec.name) {
+                for raw_child in rows {
+                    let mut api_child = raw_child.clone();
+                    strip_sensitive_columns(&mut api_child, &child_entity.sensitive_columns);
+                    value_keys_to_camel_case(&mut api_child);
+                    spawn_events(
+                        std::sync::Arc::clone(client),
+                        child_entity,
+                        "create",
+                        raw_child.clone(),
+                        api_child,
+                        tenant_id_str.clone(),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    // Attach children (still snake_case) under their include name, stripping each child's own
+    // sensitive columns first. Then strip the parent's sensitive columns and camelCase the whole
+    // tree once — so the include key and nested keys are camelCased exactly like a GET response.
+    if let Value::Object(parent_obj) = &mut parent_row {
+        for ((spec, child_entity, _), single) in svc_children.iter().zip(singles.iter()) {
+            let mut rows = child_map.get(&spec.name).cloned().unwrap_or_default();
+            for r in &mut rows {
+                strip_sensitive_columns(r, &child_entity.sensitive_columns);
+            }
+            let value = if *single {
+                rows.into_iter().next().unwrap_or(Value::Null)
+            } else {
+                Value::Array(rows)
+            };
+            parent_obj.insert(spec.name.clone(), value);
+        }
+    }
+    strip_sensitive_columns(&mut parent_row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut parent_row);
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(crate::response::SuccessOne {
+            data: parent_row,
+            meta: None,
+        }),
+    ))
+}
+
 pub async fn read(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
@@ -2635,6 +2866,233 @@ pub async fn create_package(
         axum::http::StatusCode::CREATED,
         Json(crate::response::SuccessOne {
             data: row,
+            meta: None,
+        }),
+    ))
+}
+
+/// Package-scoped variant of [`create_graph`]: insert a parent row and its FK-children
+/// atomically, resolving entities and includes against the given package's model. Same body
+/// shape, same to-many-only restriction, and the same per-entity authorization — both the
+/// parent and every child entity are independently authorized for `post`.
+pub async fn create_graph_package(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    UserId(user_id_opt): UserId,
+    Path((package_id, path_segment)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
+    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
+
+    // Resolve the parent entity (from the package model) and authorize.
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "create_graph") {
+        return Err(AppError::BadRequest("create_graph not allowed".into()));
+    }
+    require_storage_for_assets(&state, &entity)?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "post",
+    )
+    .await?;
+
+    // Top-level body must be an object with "data" and an optional "include".
+    let mut top = match body {
+        Value::Object(m) => m,
+        _ => {
+            return Err(AppError::BadRequest(
+                "body must be a JSON object with 'data' and optional 'include'".into(),
+            ))
+        }
+    };
+    let data_val = top
+        .remove("data")
+        .ok_or_else(|| AppError::BadRequest("missing 'data' object".into()))?;
+    let include_val = top.remove("include");
+    if let Some((k, _)) = top.into_iter().next() {
+        return Err(AppError::BadRequest(format!(
+            "unknown field '{}' (expected only 'data' and 'include')",
+            k
+        )));
+    }
+
+    // Validate the parent record (full semantics — all required fields enforced).
+    let mut parent_body = hashmap_keys_to_snake_case(&body_to_map(data_val)?);
+    process_json_asset_fields(&state, &entity, &tenant_id_str, &mut parent_body).await?;
+    RequestValidator::validate(&parent_body, &entity.validation)?;
+    if let Some(reg) = load_extensible_registry(&state, &entity, tenant_id_opt.as_deref()).await? {
+        validate_extensible_fields(&parent_body, &entity, &reg, ValidateMode::Full)?;
+    }
+
+    // Build and validate child groups. `singles[i]` records whether include i was sent as a
+    // single object (so the response mirrors the request shape).
+    let mut svc_children: Vec<crate::service::GraphChild> = Vec::new();
+    let mut singles: Vec<bool> = Vec::new();
+    if let Some(inc) = include_val {
+        let inc_map = match inc {
+            Value::Object(m) => m,
+            _ => return Err(AppError::BadRequest("'include' must be an object".into())),
+        };
+        for (name, value) in inc_map {
+            // Resolve the include name against the package model (same as ?include=).
+            let (spec, child_entity) = {
+                let resolved = resolve_includes(&model, &entity, std::slice::from_ref(&name))?;
+                let (_, spec, child) = resolved.into_iter().next().unwrap();
+                (spec, child)
+            };
+            // v1: only to-many (FK-in-child) relationships can be created inline.
+            if !matches!(spec.direction, IncludeDirection::ToMany) {
+                return Err(AppError::BadRequest(format!(
+                    "include '{}' is a to-one reference; set its id in 'data' instead of nesting it",
+                    name
+                )));
+            }
+            if !child_entity.operations.iter().any(|o| o == "create") {
+                return Err(AppError::BadRequest(format!(
+                    "create not allowed on '{}'",
+                    name
+                )));
+            }
+            // Authorize the child entity independently — having `post` on the parent does not
+            // grant the right to insert into a related table.
+            crate::authrs::check_entity_permission_opt(
+                &state.authrs_client,
+                tenant_id_opt.as_deref(),
+                user_id_opt.as_deref(),
+                &child_entity,
+                "post",
+            )
+            .await?;
+            // Object => single child; array => many.
+            let (raw_bodies, single) = match value {
+                Value::Array(arr) => (arr, false),
+                obj @ Value::Object(_) => (vec![obj], true),
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "include '{}' must be an object or array",
+                        name
+                    )))
+                }
+            };
+            // The FK column is managed by the relationship; validating it as required would
+            // fail (we inject it only after the parent is inserted), so exclude it here.
+            let mut child_validation = child_entity.validation.clone();
+            child_validation.remove(&spec.their_key_column);
+            let child_reg =
+                load_extensible_registry(&state, &child_entity, tenant_id_opt.as_deref()).await?;
+            let mut bodies = Vec::with_capacity(raw_bodies.len());
+            for (idx, rb) in raw_bodies.into_iter().enumerate() {
+                let mut cb = hashmap_keys_to_snake_case(&body_to_map(rb)?);
+                if cb.contains_key(&spec.their_key_column) {
+                    return Err(AppError::BadRequest(format!(
+                        "include '{}'[{}]: field '{}' is set automatically from the parent and must be omitted",
+                        name, idx, spec.their_key_column
+                    )));
+                }
+                process_json_asset_fields(&state, &child_entity, &tenant_id_str, &mut cb).await?;
+                RequestValidator::validate(&cb, &child_validation)?;
+                if let Some(ref reg) = child_reg {
+                    validate_extensible_fields(&cb, &child_entity, reg, ValidateMode::Full)?;
+                }
+                bodies.push(cb);
+            }
+            svc_children.push((spec, child_entity, bodies));
+            singles.push(single);
+        }
+    }
+
+    // RLS strategy needs the SET LOCAL statement run inside the transaction; pool passes None.
+    let set_local = match &ctx {
+        TenantContext::Rls { tenant_id, .. } => state.dialect.set_tenant_session_sql(tenant_id),
+        TenantContext::Pool { .. } => None,
+    };
+
+    let (mut parent_row, child_map) = CrudService::create_graph(
+        ctx.migration_pool(),
+        &entity,
+        &parent_body,
+        &svc_children,
+        ctx.schema_override(),
+        ctx.rls_tenant_id(),
+        set_local.as_deref(),
+        user_id_opt.as_deref(),
+        state.dialect.as_ref(),
+    )
+    .await?;
+
+    // Fire create events for the parent and every child before reshaping the response.
+    if let Some(client) = &state.event_client {
+        let raw_parent = parent_row.clone();
+        let mut api_parent = parent_row.clone();
+        strip_sensitive_columns(&mut api_parent, &entity.sensitive_columns);
+        value_keys_to_camel_case(&mut api_parent);
+        spawn_events(
+            std::sync::Arc::clone(client),
+            &entity,
+            "create",
+            raw_parent,
+            api_parent,
+            tenant_id_str.clone(),
+            None,
+        );
+        for (spec, child_entity, _) in &svc_children {
+            if let Some(rows) = child_map.get(&spec.name) {
+                for raw_child in rows {
+                    let mut api_child = raw_child.clone();
+                    strip_sensitive_columns(&mut api_child, &child_entity.sensitive_columns);
+                    value_keys_to_camel_case(&mut api_child);
+                    spawn_events(
+                        std::sync::Arc::clone(client),
+                        child_entity,
+                        "create",
+                        raw_child.clone(),
+                        api_child,
+                        tenant_id_str.clone(),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    // Attach children (still snake_case) under their include name, stripping each child's own
+    // sensitive columns first. Then strip the parent's sensitive columns and camelCase the whole
+    // tree once — so the include key and nested keys are camelCased exactly like a GET response.
+    if let Value::Object(parent_obj) = &mut parent_row {
+        for ((spec, child_entity, _), single) in svc_children.iter().zip(singles.iter()) {
+            let mut rows = child_map.get(&spec.name).cloned().unwrap_or_default();
+            for r in &mut rows {
+                strip_sensitive_columns(r, &child_entity.sensitive_columns);
+            }
+            let value = if *single {
+                rows.into_iter().next().unwrap_or(Value::Null)
+            } else {
+                Value::Array(rows)
+            };
+            parent_obj.insert(spec.name.clone(), value);
+        }
+    }
+    strip_sensitive_columns(&mut parent_row, &entity.sensitive_columns);
+    value_keys_to_camel_case(&mut parent_row);
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(crate::response::SuccessOne {
+            data: parent_row,
             meta: None,
         }),
     ))
