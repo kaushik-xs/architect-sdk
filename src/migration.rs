@@ -17,6 +17,103 @@ fn quote(s: &str) -> String {
 /// Name of the column added to app tables when RLS is enabled. Used by migration and CRUD.
 pub const RLS_TENANT_COLUMN: &str = "tenant_id";
 
+/// Ensure every table in `config` has the RLS tenant column, row-level security enabled, and the
+/// four tenant-isolation policies. Fully idempotent (`ADD COLUMN IF NOT EXISTS`,
+/// `DROP POLICY IF EXISTS` then `CREATE POLICY`), so it is safe to run on both fresh installs and
+/// upgrades. On upgrades this is the path that backfills the tenant column + policies for newly
+/// created tables, which the diff-based migration plan does not touch.
+pub async fn apply_rls_to_tables(
+    pool: &Pool,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+    rls_tenant_column: &str,
+    dialect: &dyn Dialect,
+) -> Result<(), AppError> {
+    if !dialect.supports_rls() {
+        tracing::warn!(dialect = %dialect.name(), "RLS requested but not supported by this dialect; skipping");
+        return Ok(());
+    }
+    let default_sid = config.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+    let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+    let columns_by_table: HashMap<_, Vec<&ColumnConfig>> =
+        config.columns.iter().fold(HashMap::new(), |mut m, c| {
+            m.entry(c.table_id.as_str()).or_default().push(c);
+            m
+        });
+    let col = rls_tenant_column;
+
+    for t in &config.tables {
+        let sid = t.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = match schemas_by_id.get(sid) {
+            Some(s) => s,
+            None => continue,
+        };
+        let schema_name = quote(schema_override.unwrap_or(&schema.name));
+        let full_name = format!("{}.{}", schema_name, quote(&t.name));
+        let config_col_names: HashSet<&str> = columns_by_table
+            .get(t.id.as_str())
+            .map(|v| v.iter().map(|c| c.name.as_str()).collect())
+            .unwrap_or_default();
+
+        if !config_col_names.contains(col) {
+            let add_col = format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
+                full_name,
+                quote(col)
+            );
+            sqlx::query(&add_col).execute(pool).await?;
+        }
+        let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
+        sqlx::query(&enable_rls).execute(pool).await?;
+        let q_col = quote(col);
+        let setting = "current_setting('app.tenant_id', true)";
+        let cond = format!("{} = {}", q_col, setting);
+        let policy_prefix = format!("rls_tenant_{}", t.name);
+        let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+            ("select", "SELECT", Some(cond.as_str()), None),
+            ("insert", "INSERT", None, Some(cond.as_str())),
+            ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
+            ("delete", "DELETE", Some(cond.as_str()), None),
+        ];
+        for (suffix, cmd, using_cond, with_check) in policies.iter() {
+            let policy_name = format!("{}_{}", policy_prefix, suffix);
+            let drop_sql = format!(
+                "DROP POLICY IF EXISTS {} ON {}",
+                quote(&policy_name),
+                full_name
+            );
+            let _ = sqlx::query(&drop_sql).execute(pool).await;
+            let create_sql = match (using_cond, with_check) {
+                (Some(u), Some(w)) => format!(
+                    "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
+                    quote(&policy_name),
+                    full_name,
+                    cmd,
+                    u,
+                    w
+                ),
+                (Some(u), None) => format!(
+                    "CREATE POLICY {} ON {} FOR {} USING ( {} )",
+                    quote(&policy_name),
+                    full_name,
+                    cmd,
+                    u
+                ),
+                (None, Some(w)) => format!(
+                    "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
+                    quote(&policy_name),
+                    full_name,
+                    cmd,
+                    w
+                ),
+                (None, None) => continue,
+            };
+            sqlx::query(&create_sql).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply full config to the database: CREATE SCHEMA, CREATE TYPE, CREATE TABLE, CREATE INDEX, ADD FK.
 /// Validates config first. Idempotent for schemas and types (IF NOT EXISTS); tables are CREATE TABLE only (fails if exists).
 /// When `schema_override` is `Some(s)`, app tables/indexes/FKs are created in schema `s` instead of config schema names (e.g. for schema-strategy tenants).
@@ -218,68 +315,10 @@ pub async fn apply_migrations(
             let idx_sql = history_index_ddl(schema_raw, &t.name, &pk_col);
             let _ = sqlx::query(&idx_sql).execute(pool).await;
         }
+    }
 
-        if let Some(col) = rls_tenant_column {
-            if dialect.supports_rls() {
-                if !config_col_names.contains(col) {
-                    let q_col = quote(col);
-                    let add_col = format!(
-                        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} TEXT",
-                        full_name, q_col
-                    );
-                    sqlx::query(&add_col).execute(pool).await?;
-                }
-                let enable_rls = format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY", full_name);
-                sqlx::query(&enable_rls).execute(pool).await?;
-                let q_col = quote(col);
-                let setting = "current_setting('app.tenant_id', true)";
-                let cond = format!("{} = {}", q_col, setting);
-                let policy_prefix = format!("rls_tenant_{}", t.name);
-                let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
-                    ("select", "SELECT", Some(cond.as_str()), None),
-                    ("insert", "INSERT", None, Some(cond.as_str())),
-                    ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
-                    ("delete", "DELETE", Some(cond.as_str()), None),
-                ];
-                for (suffix, cmd, using_cond, with_check) in policies.iter() {
-                    let policy_name = format!("{}_{}", policy_prefix, suffix);
-                    let drop_sql = format!(
-                        "DROP POLICY IF EXISTS {} ON {}",
-                        quote(&policy_name),
-                        full_name
-                    );
-                    let _ = sqlx::query(&drop_sql).execute(pool).await;
-                    let create_sql = match (using_cond, with_check) {
-                        (Some(u), Some(w)) => format!(
-                            "CREATE POLICY {} ON {} FOR {} USING ( {} ) WITH CHECK ( {} )",
-                            quote(&policy_name),
-                            full_name,
-                            cmd,
-                            u,
-                            w
-                        ),
-                        (Some(u), None) => format!(
-                            "CREATE POLICY {} ON {} FOR {} USING ( {} )",
-                            quote(&policy_name),
-                            full_name,
-                            cmd,
-                            u
-                        ),
-                        (None, Some(w)) => format!(
-                            "CREATE POLICY {} ON {} FOR {} WITH CHECK ( {} )",
-                            quote(&policy_name),
-                            full_name,
-                            cmd,
-                            w
-                        ),
-                        (None, None) => continue,
-                    };
-                    sqlx::query(&create_sql).execute(pool).await?;
-                }
-            } else {
-                tracing::warn!(table = %full_name, dialect = %dialect.name(), "RLS requested but not supported by this dialect; skipping");
-            }
-        }
+    if let Some(col) = rls_tenant_column {
+        apply_rls_to_tables(pool, config, schema_override, col, dialect).await?;
     }
 
     for idx in &config.indexes {

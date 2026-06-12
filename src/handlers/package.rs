@@ -9,8 +9,8 @@ use crate::extractors::tenant::TenantId;
 use crate::handlers::config::{reload_model, replace_config};
 use crate::handlers::entity::{get_or_create_tenant_pool, resolve_tenant_context};
 use crate::migration::{
-    apply_migrations, compute_migration_plan, execute_migration_plan, revert_migrations,
-    MigrationPlan,
+    apply_migrations, apply_rls_to_tables, compute_migration_plan, execute_migration_plan,
+    revert_migrations, MigrationPlan,
 };
 use crate::state::AppState;
 use crate::store::{
@@ -271,17 +271,36 @@ async fn apply_ddl_to_pool(
             )
             .await
             {
-                Ok(result) => TenantMigrationOutcome {
-                    target: target.to_string(),
-                    strategy: strategy.to_string(),
-                    status: if result.warned > 0 {
-                        "applied_with_warnings".to_string()
-                    } else {
-                        "applied".to_string()
-                    },
-                    warnings: result.warnings,
-                    error: None,
-                },
+                Ok(result) => {
+                    // The diff-based migration plan does not add the RLS tenant column / policies
+                    // to newly created (or pre-existing) tables. For RLS targets, reconcile them
+                    // here so inserts that inject `tenant_id` don't fail with "column does not exist".
+                    if let Some(col) = rls_tenant_column {
+                        if let Err(e) =
+                            apply_rls_to_tables(migration_pool, config, None, col, dialect).await
+                        {
+                            tracing::warn!(target, strategy, error = %e, "RLS reconciliation failed after upgrade");
+                            return TenantMigrationOutcome {
+                                target: target.to_string(),
+                                strategy: strategy.to_string(),
+                                status: "failed".to_string(),
+                                warnings: result.warnings,
+                                error: Some(format!("RLS reconciliation failed: {}", e)),
+                            };
+                        }
+                    }
+                    TenantMigrationOutcome {
+                        target: target.to_string(),
+                        strategy: strategy.to_string(),
+                        status: if result.warned > 0 {
+                            "applied_with_warnings".to_string()
+                        } else {
+                            "applied".to_string()
+                        },
+                        warnings: result.warnings,
+                        error: None,
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (upgrade)");
                     TenantMigrationOutcome {
@@ -377,7 +396,9 @@ async fn broadcast_ddl(
 
     // Compute the migration plan once for upgrades (pure function, no DB calls).
     // `_rls_tenant_column` is intentionally ignored by compute_migration_plan, so
-    // the same plan is valid for both RLS and Database targets.
+    // the same plan is valid for both RLS and Database targets. RLS targets get their
+    // tenant column / policies reconciled separately in apply_ddl_to_pool via
+    // apply_rls_to_tables, since the diff plan never emits RLS DDL.
     let plan: Option<MigrationPlan> = match old_config {
         Some(old) => {
             match compute_migration_plan(
@@ -1300,6 +1321,20 @@ pub async fn apply_migration_handler(
     let new_config = load_from_pool(config_pool, &row.package_id)
         .await
         .map_err(AppError::Config)?;
+
+    // For RLS tenants, the diff plan does not add the tenant column / policies to newly created
+    // tables. Reconcile them so subsequent inserts (which inject `tenant_id`) don't fail.
+    if let Some(col) = ctx.rls_tenant_column() {
+        apply_rls_to_tables(
+            migration_pool,
+            &new_config,
+            None,
+            col,
+            state.dialect.as_ref(),
+        )
+        .await?;
+    }
+
     let new_model = resolve(&new_config)
         .map_err(AppError::Config)?
         .with_package_id(&row.package_id);
