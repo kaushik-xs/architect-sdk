@@ -173,6 +173,21 @@ pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(),
     );
     let _ = sqlx::query(&drop_schema_name).execute(pool).await;
 
+    // Auto-provision the Platform Admin tenant (sole writer of `global` shared tables) so global
+    // tables are writable out of the box. Idempotent; only meaningful where RLS is supported.
+    if dialect.supports_rls() {
+        let platform_id = crate::tenant::platform_tenant_id();
+        let insert_platform = format!(
+            "INSERT INTO {} (id, strategy, database_url, updated_at, comment) \
+             VALUES ('{}', 'rls', NULL, {}, 'Platform Admin (auto-provisioned): sole writer of global tables') \
+             ON CONFLICT (id) DO NOTHING",
+            q_tenants,
+            platform_id.replace('\'', "''"),
+            dialect.now_fn(),
+        );
+        sqlx::query(&insert_platform).execute(pool).await?;
+    }
+
     let q_kv_data = qualified_sys_table("_sys_kv_data");
     let kv_data_ddl = format!(
         "CREATE TABLE IF NOT EXISTS {} (\

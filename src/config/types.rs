@@ -55,6 +55,13 @@ pub struct TableConfig {
     /// of the row is written there before every UPDATE and DELETE.
     #[serde(default)]
     pub versioning: Option<VersioningConfig>,
+    /// When true, this table holds data shared across all RLS tenants instead of being
+    /// tenant-isolated. Under the RLS strategy it gets asymmetric row-level-security policies:
+    /// every tenant may read all rows, but only the Platform Admin tenant
+    /// (see `tenant::platform_tenant_id`) may insert/update/delete. Has no effect under the
+    /// Database strategy (tenants are physically separate databases). Default false.
+    #[serde(default)]
+    pub global: bool,
 }
 
 /// Configuration for row-level versioning on a table.

@@ -598,7 +598,7 @@ pub async fn install_package(
             )
         })?;
 
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(id)).await?;
     let config_pool = ctx.config_pool();
     // migration_pool and schema_override are no longer used directly — broadcast_ddl handles all targets.
     let package_cache_key = ctx.package_cache_key().to_string();
@@ -790,7 +790,7 @@ pub async fn uninstall_package(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::BadRequest("X-Tenant-ID header is required".into()))?;
 
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&package_id)).await?;
     let config_pool = ctx.config_pool();
     let migration_pool = ctx.migration_pool();
     let schema_override = ctx.schema_override();
@@ -1103,7 +1103,7 @@ pub async fn preview_migration_handler(
     }
 
     let from_version = existing.semantic_version.clone();
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(id)).await?;
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(id)).await?;
     let config_pool = ctx.config_pool();
 
     let old_config = load_from_pool(config_pool, id)
@@ -1246,7 +1246,7 @@ pub async fn apply_migration_handler(
     let plan: MigrationPlan = serde_json::from_value(row.plan_json.clone())
         .map_err(|e| AppError::BadRequest(format!("corrupted migration plan: {}", e)))?;
 
-    let ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&row.package_id)).await?;
+    let ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&row.package_id)).await?;
     let config_pool = ctx.config_pool();
     let migration_pool = ctx.migration_pool();
     let package_cache_key = ctx.package_cache_key().to_string();

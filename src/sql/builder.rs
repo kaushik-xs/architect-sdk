@@ -1301,6 +1301,7 @@ mod versioning_tests {
             archive_field: None,
             package_id: String::new(),
             audit_log: false,
+            global: false,
             parent_ref_column: None,
             versioning: None,
             mcp: None,

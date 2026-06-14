@@ -227,6 +227,7 @@ mod tests {
             check: vec![],
             audit_log: false,
             versioning: None,
+            global: false,
         }
     }
 

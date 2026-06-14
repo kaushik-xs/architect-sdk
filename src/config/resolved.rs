@@ -76,6 +76,10 @@ pub struct ResolvedEntity {
     pub package_id: String,
     /// When true, a companion `{table}_audit` table exists and every write is journaled there.
     pub audit_log: bool,
+    /// When true, this entity's table is shared across all RLS tenants: every tenant may read it,
+    /// but only the Platform Admin tenant may write. Carried from `TableConfig.global`. Writes by
+    /// non-admin tenants are rejected with 403 in handlers (and blocked by RLS at the DB level).
+    pub global: bool,
     /// Natural-key column used to resolve `parentRef` in bulk create (e.g. `"location_id"`).
     pub parent_ref_column: Option<String>,
     /// Row-level versioning config, carried from TableConfig.

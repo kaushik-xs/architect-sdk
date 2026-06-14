@@ -51,7 +51,7 @@ pub async fn kv_list_keys(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&package_id)).await?;
     let pool = &state.pool;
     validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
@@ -87,7 +87,7 @@ pub async fn kv_get(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&package_id)).await?;
     let pool = &state.pool;
     validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
@@ -124,7 +124,7 @@ pub async fn kv_put(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&package_id)).await?;
     let pool = &state.pool;
     validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");
@@ -190,7 +190,7 @@ pub async fn kv_delete(
         .tenant_registry
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
-    let _ctx = resolve_tenant_context(&state, Some(tenant_id), Some(&package_id)).await?;
+    let _ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(&package_id)).await?;
     let pool = &state.pool;
     validate_namespace(pool, state.dialect.as_ref(), &package_id, &namespace).await?;
     let q_table = qualified_sys_table("_sys_kv_data");

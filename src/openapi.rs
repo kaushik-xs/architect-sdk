@@ -1172,6 +1172,7 @@ mod tests {
             archive_field: None,
             package_id: "_default".into(),
             audit_log: false,
+            global: false,
             parent_ref_column: None,
             versioning: None,
             mcp: None,

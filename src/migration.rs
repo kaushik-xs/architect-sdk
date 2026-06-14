@@ -18,7 +18,9 @@ fn quote(s: &str) -> String {
 pub const RLS_TENANT_COLUMN: &str = "tenant_id";
 
 /// Ensure every table in `config` has the RLS tenant column, row-level security enabled, and the
-/// four tenant-isolation policies. Fully idempotent (`ADD COLUMN IF NOT EXISTS`,
+/// four tenant-isolation policies. Tables flagged `global` instead get asymmetric policies — every
+/// tenant may read (`SELECT USING (true)`) but only the Platform Admin tenant may write — so they
+/// hold data shared across all RLS tenants. Fully idempotent (`ADD COLUMN IF NOT EXISTS`,
 /// `DROP POLICY IF EXISTS` then `CREATE POLICY`), so it is safe to run on both fresh installs and
 /// upgrades. On upgrades this is the path that backfills the tenant column + policies for newly
 /// created tables, which the diff-based migration plan does not touch.
@@ -34,6 +36,7 @@ pub async fn apply_rls_to_tables(
         return Ok(());
     }
     let default_sid = config.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+    let platform_id = crate::tenant::platform_tenant_id();
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
     let columns_by_table: HashMap<_, Vec<&ColumnConfig>> =
         config.columns.iter().fold(HashMap::new(), |mut m, c| {
@@ -67,14 +70,40 @@ pub async fn apply_rls_to_tables(
         sqlx::query(&enable_rls).execute(pool).await?;
         let q_col = quote(col);
         let setting = "current_setting('app.tenant_id', true)";
-        let cond = format!("{} = {}", q_col, setting);
+        // Tenant-isolated condition: a row belongs to the caller's tenant.
+        let tenant_cond = format!("{} = {}", q_col, setting);
+        // Platform-admin condition: the caller's session is the Platform Admin tenant. Keys off the
+        // session setting, not a row column, so it gates writes regardless of the row's tenant_id.
+        let admin_cond = format!("{} = '{}'", setting, platform_id.replace('\'', "''"));
+        let read_all = "true".to_string();
         let policy_prefix = format!("rls_tenant_{}", t.name);
-        let policies: &[(&str, &str, Option<&str>, Option<&str>)] = &[
-            ("select", "SELECT", Some(cond.as_str()), None),
-            ("insert", "INSERT", None, Some(cond.as_str())),
-            ("update", "UPDATE", Some(cond.as_str()), Some(cond.as_str())),
-            ("delete", "DELETE", Some(cond.as_str()), None),
-        ];
+        // Global tables: everyone reads (USING true), only the Platform Admin writes.
+        // Tenant tables: every operation is scoped to the caller's tenant_id.
+        let policies: Vec<(&str, &str, Option<&str>, Option<&str>)> = if t.global {
+            vec![
+                ("select", "SELECT", Some(read_all.as_str()), None),
+                ("insert", "INSERT", None, Some(admin_cond.as_str())),
+                (
+                    "update",
+                    "UPDATE",
+                    Some(admin_cond.as_str()),
+                    Some(admin_cond.as_str()),
+                ),
+                ("delete", "DELETE", Some(admin_cond.as_str()), None),
+            ]
+        } else {
+            vec![
+                ("select", "SELECT", Some(tenant_cond.as_str()), None),
+                ("insert", "INSERT", None, Some(tenant_cond.as_str())),
+                (
+                    "update",
+                    "UPDATE",
+                    Some(tenant_cond.as_str()),
+                    Some(tenant_cond.as_str()),
+                ),
+                ("delete", "DELETE", Some(tenant_cond.as_str()), None),
+            ]
+        };
         for (suffix, cmd, using_cond, with_check) in policies.iter() {
             let policy_name = format!("{}_{}", policy_prefix, suffix);
             let drop_sql = format!(
@@ -2430,6 +2459,7 @@ mod enum_recreate_tests {
             check: vec![],
             audit_log: false,
             versioning: None,
+            global: false,
         }
     }
 
@@ -2582,6 +2612,7 @@ mod companion_sync_tests {
                 enabled: true,
                 keep_versions: None,
             }),
+            global: false,
         }
     }
 

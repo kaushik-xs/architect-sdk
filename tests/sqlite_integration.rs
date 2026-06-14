@@ -57,6 +57,7 @@ fn notes_config() -> FullConfig {
             check: vec![],
             audit_log: false,
             versioning: None,
+            global: false,
         }],
         columns: vec![
             ColumnConfig {
@@ -135,6 +136,7 @@ fn users_config() -> FullConfig {
             check: vec![],
             audit_log: false,
             versioning: None,
+            global: false,
         }],
         columns: vec![
             ColumnConfig {

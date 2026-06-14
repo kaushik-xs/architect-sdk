@@ -89,7 +89,7 @@ async fn resolve_package(
     path_segment: &str,
 ) -> Result<(String, ResolvedEntity), AppError> {
     let tenant_id = require_tenant(state, tenant_id_opt)?.to_string();
-    let ctx = resolve_tenant_context(state, Some(&tenant_id), Some(package_id)).await?;
+    let ctx = resolve_tenant_context(state, Some(&tenant_id), None, Some(package_id)).await?;
     let model = get_or_load_package_model(
         state,
         ctx.config_pool(),
@@ -205,7 +205,7 @@ async fn build_index_statements(
     )
     .await?;
 
-    let ctx = resolve_tenant_context(state, Some(tenant_id), None).await?;
+    let ctx = resolve_tenant_context(state, Some(tenant_id), None, None).await?;
     let schema = ctx
         .schema_override()
         .map(str::to_string)

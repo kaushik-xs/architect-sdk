@@ -47,6 +47,8 @@ pub enum AppError {
     Storage(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("bulk validation failed")]
     BulkValidation(Vec<BulkFieldError>),
 }
@@ -149,6 +151,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::BulkValidation(_) => unreachable!(),
         };
         let body = ErrorBody {

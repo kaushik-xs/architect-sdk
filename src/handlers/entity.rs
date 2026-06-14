@@ -12,7 +12,7 @@ use crate::events::spawn_events;
 use crate::extensible_fields::{
     load_registry, validate_extensible_fields, ExtensibleRegistry, ValidateMode,
 };
-use crate::extractors::tenant::TenantId;
+use crate::extractors::tenant::{ActAsTenant, TenantId};
 use crate::extractors::user::UserId;
 use crate::service::{CrudService, RequestValidator, TenantExecutor};
 use crate::sql::{
@@ -990,6 +990,7 @@ impl TenantContext {
 pub async fn resolve_tenant_context(
     state: &AppState,
     tenant_id_opt: Option<&str>,
+    act_as_opt: Option<&str>,
     package_id_opt: Option<&str>,
 ) -> Result<TenantContext, AppError> {
     let tenant_id = tenant_id_opt
@@ -1004,38 +1005,86 @@ pub async fn resolve_tenant_context(
         .get(tenant_id)
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
 
+    // Platform-Admin impersonation: when X-Act-As-Tenant is set, run entirely AS the named tenant
+    // (RLS strategy only). Only the Platform Admin may impersonate; the target must be a known RLS
+    // tenant. When absent, the request runs as the caller.
+    let (eff_id, eff_entry) = match act_as_opt.filter(|s| !s.is_empty()) {
+        Some(target) => {
+            if tenant_id != crate::tenant::platform_tenant_id() {
+                return Err(AppError::Forbidden(
+                    "X-Act-As-Tenant is restricted to the Platform Admin".into(),
+                ));
+            }
+            let te = state.tenant_registry.get(target).ok_or_else(|| {
+                AppError::NotFound(format!("act-as tenant not found: {}", target))
+            })?;
+            if !matches!(te.strategy, TenantStrategy::Rls) {
+                return Err(AppError::BadRequest(
+                    "X-Act-As-Tenant is only supported for RLS-strategy tenants".into(),
+                ));
+            }
+            tracing::info!(admin = %tenant_id, acting_as = %target, "platform admin impersonating tenant");
+            (target, te)
+        }
+        None => (tenant_id, entry),
+    };
+
     // Architect schema and _sys_* config tables exist only in DATABASE_URL (from .env), always in the architect schema. Tenant DBs are used for app data/migrations only.
     let architect_pool = state.pool.clone();
 
-    match &entry.strategy {
+    match &eff_entry.strategy {
         TenantStrategy::Database => {
-            let database_url = entry.database_url.as_deref().ok_or_else(|| {
+            let database_url = eff_entry.database_url.as_deref().ok_or_else(|| {
                 AppError::BadRequest(format!(
                     "tenant {}: strategy database requires database_url",
-                    tenant_id
+                    eff_id
                 ))
             })?;
-            let pool = get_or_create_tenant_pool(state, tenant_id, database_url).await?;
+            let pool = get_or_create_tenant_pool(state, eff_id, database_url).await?;
             Ok(TenantContext::Pool {
                 pool: pool.clone(),
                 schema_override: None,
                 config_pool: architect_pool,
-                package_cache_key: format!("{}:{}", package_id, tenant_id),
+                package_cache_key: format!("{}:{}", package_id, eff_id),
             })
         }
         TenantStrategy::Rls => {
-            let pool = match entry.database_url.as_deref() {
-                Some(url) => get_or_create_tenant_pool(state, tenant_id, url).await?,
+            let pool = match eff_entry.database_url.as_deref() {
+                Some(url) => get_or_create_tenant_pool(state, eff_id, url).await?,
                 None => architect_pool.clone(),
             };
             Ok(TenantContext::Rls {
-                tenant_id: tenant_id.to_string(),
+                tenant_id: eff_id.to_string(),
                 pool,
                 config_pool: architect_pool,
                 package_cache_key,
             })
         }
     }
+}
+
+/// Authorize a write (create/update/delete/bulk) against a possibly-`global` entity.
+///
+/// Global tables are shared across all RLS tenants: readable by everyone, writable only by the
+/// Platform Admin tenant (`tenant::platform_tenant_id`). The database enforces this via RLS
+/// policies, but a non-admin write would surface there as an opaque RLS error (INSERT) or a silent
+/// no-op / 404 (UPDATE/DELETE). This pre-check returns a clear 403 instead. No-op for non-global
+/// entities. `tenant_id` is the caller's X-Tenant-ID (already validated as present upstream).
+pub fn ensure_global_write_allowed(
+    entity: &ResolvedEntity,
+    tenant_id: Option<&str>,
+) -> Result<(), AppError> {
+    if !entity.global {
+        return Ok(());
+    }
+    let caller = tenant_id.unwrap_or("");
+    if caller != crate::tenant::platform_tenant_id() {
+        return Err(AppError::Forbidden(format!(
+            "entity '{}' is global (shared across tenants); only the Platform Admin may modify it",
+            entity.path_segment
+        )));
+    }
+    Ok(())
 }
 
 /// Get or create a pool for the given tenant_id and database_url. Config lives in architect DB; this pool is for app data when tenant uses a different DB.
@@ -1354,11 +1403,18 @@ pub fn evict_extensible_registry(
 pub async fn list(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -1556,12 +1612,19 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -1597,6 +1660,7 @@ pub async fn create(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -1679,12 +1743,19 @@ pub async fn create(
 pub async fn create_graph(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
 
     // Resolve the parent entity and authorize.
     let entity = state
@@ -1697,6 +1768,7 @@ pub async fn create_graph(
     if !entity.operations.iter().any(|o| o == "create_graph") {
         return Err(AppError::BadRequest("create_graph not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -1902,11 +1974,18 @@ pub async fn create_graph(
 pub async fn read(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -2026,12 +2105,19 @@ pub async fn read(
 pub async fn update(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -2067,6 +2153,7 @@ pub async fn update(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -2173,10 +2260,17 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -2212,6 +2306,7 @@ pub async fn delete(
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -2275,11 +2370,18 @@ pub async fn delete(
 pub async fn bulk_create(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -2315,6 +2417,7 @@ pub async fn bulk_create(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -2430,11 +2533,18 @@ pub async fn bulk_create(
 pub async fn bulk_update(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path(path_segment): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -2470,6 +2580,7 @@ pub async fn bulk_update(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -2568,11 +2679,18 @@ pub async fn bulk_update(
 pub async fn list_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -2756,12 +2874,19 @@ pub async fn list_package(
 pub async fn create_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -2801,6 +2926,7 @@ pub async fn create_package(
     if !entity.operations.iter().any(|o| o == "create") {
         return Err(AppError::BadRequest("create not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -2878,12 +3004,19 @@ pub async fn create_package(
 pub async fn create_graph_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -2900,6 +3033,7 @@ pub async fn create_graph_package(
     if !entity.operations.iter().any(|o| o == "create_graph") {
         return Err(AppError::BadRequest("create_graph not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -3101,11 +3235,18 @@ pub async fn create_graph_package(
 pub async fn read_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3222,12 +3363,19 @@ pub async fn read_package(
 pub async fn update_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3267,6 +3415,7 @@ pub async fn update_package(
     if !entity.operations.iter().any(|o| o == "update") {
         return Err(AppError::BadRequest("update not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -3366,10 +3515,17 @@ pub async fn update_package(
 pub async fn delete_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3409,6 +3565,7 @@ pub async fn delete_package(
     if !entity.operations.iter().any(|o| o == "delete") {
         return Err(AppError::BadRequest("delete not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
@@ -3472,11 +3629,18 @@ pub async fn delete_package(
 pub async fn bulk_create_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3516,6 +3680,7 @@ pub async fn bulk_create_package(
     if !entity.operations.iter().any(|o| o == "bulk_create") {
         return Err(AppError::BadRequest("bulk_create not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -3630,11 +3795,18 @@ pub async fn bulk_create_package(
 pub async fn bulk_update_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3674,6 +3846,7 @@ pub async fn bulk_update_package(
     if !entity.operations.iter().any(|o| o == "bulk_update") {
         return Err(AppError::BadRequest("bulk_update not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     require_storage_for_assets(&state, &entity)?;
     crate::authrs::check_entity_permission_opt(
         &state.authrs_client,
@@ -3773,11 +3946,18 @@ pub async fn bulk_update_package(
 pub async fn archive(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -3813,6 +3993,7 @@ pub async fn archive(
     if !entity.operations.iter().any(|o| o == "archive") {
         return Err(AppError::BadRequest("archive not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
         AppError::BadRequest("archive_field is not configured for this entity".into())
     })?;
@@ -3865,11 +4046,18 @@ pub async fn archive(
 pub async fn unarchive(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -3905,6 +4093,7 @@ pub async fn unarchive(
     if !entity.operations.iter().any(|o| o == "unarchive") {
         return Err(AppError::BadRequest("unarchive not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
         AppError::BadRequest("archive_field is not configured for this entity".into())
     })?;
@@ -3955,11 +4144,18 @@ pub async fn unarchive(
 pub async fn unarchive_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -3999,6 +4195,7 @@ pub async fn unarchive_package(
     if !entity.operations.iter().any(|o| o == "unarchive") {
         return Err(AppError::BadRequest("unarchive not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
         AppError::BadRequest("archive_field is not configured for this entity".into())
     })?;
@@ -4049,11 +4246,18 @@ pub async fn unarchive_package(
 pub async fn archive_package(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((package_id, path_segment, id_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id_str = tenant_id_opt.as_deref().unwrap_or("").to_string();
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), Some(&package_id)).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
     let model = get_or_load_package_model(
         &state,
         ctx.config_pool(),
@@ -4093,6 +4297,7 @@ pub async fn archive_package(
     if !entity.operations.iter().any(|o| o == "archive") {
         return Err(AppError::BadRequest("archive not allowed".into()));
     }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
     let archive_field = entity.archive_field.as_deref().ok_or_else(|| {
         AppError::BadRequest("archive_field is not configured for this entity".into())
     })?;
@@ -4145,10 +4350,17 @@ pub async fn archive_package(
 pub async fn list_history(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str)): Path<(String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)]
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -4229,6 +4441,7 @@ pub async fn list_history(
 pub async fn read_history_version(
     State(state): State<AppState>,
     TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     Path((path_segment, id_str, version_str)): Path<(String, String, String)>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
@@ -4236,7 +4449,13 @@ pub async fn read_history_version(
         .parse()
         .map_err(|_| AppError::BadRequest("version must be an integer".into()))?;
 
-    let ctx = resolve_tenant_context(&state, tenant_id_opt.as_deref(), None).await?;
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
     #[allow(unused_assignments)]
     let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
     let (mut executor, schema_override) = match &ctx {
@@ -4305,4 +4524,64 @@ pub async fn read_history_version(
             meta: None,
         }),
     ))
+}
+
+#[cfg(test)]
+mod global_write_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn entity(path: &str, global: bool) -> ResolvedEntity {
+        ResolvedEntity {
+            table_id: "t".into(),
+            schema_name: "s".into(),
+            table_name: path.into(),
+            path_segment: path.into(),
+            pk_columns: vec!["id".into()],
+            pk_type: PkType::Uuid,
+            columns: vec![],
+            operations: vec!["create".into(), "update".into(), "delete".into()],
+            sensitive_columns: HashSet::new(),
+            includes: vec![],
+            validation: HashMap::new(),
+            events: vec![],
+            archive_field: None,
+            package_id: "_default".into(),
+            audit_log: false,
+            global,
+            parent_ref_column: None,
+            versioning: None,
+            mcp: None,
+            extensible_columns: vec![],
+        }
+    }
+
+    #[test]
+    fn non_global_entity_allows_any_tenant() {
+        let e = entity("notes", false);
+        assert!(ensure_global_write_allowed(&e, Some("tenant-1")).is_ok());
+        assert!(ensure_global_write_allowed(&e, None).is_ok());
+    }
+
+    #[test]
+    fn global_entity_blocks_regular_tenant() {
+        let e = entity("currencies", true);
+        let err = ensure_global_write_allowed(&e, Some("tenant-1")).unwrap_err();
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "expected 403, got {err:?}"
+        );
+        // Missing tenant is also forbidden (never equals the platform id).
+        assert!(matches!(
+            ensure_global_write_allowed(&e, None).unwrap_err(),
+            AppError::Forbidden(_)
+        ));
+    }
+
+    #[test]
+    fn global_entity_allows_platform_admin() {
+        let e = entity("currencies", true);
+        let admin = crate::tenant::platform_tenant_id();
+        assert!(ensure_global_write_allowed(&e, Some(&admin)).is_ok());
+    }
 }
