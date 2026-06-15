@@ -278,6 +278,144 @@ fn build_includes_for_table(
     includes
 }
 
+/// Precomputed cross-package include map. Built from ALL installed packages' configs so that
+/// `?include=<name>` can join a related entity that lives in a *different* package, in either
+/// direction (to_one when the FK is in the requesting table, to_many when it points back to it).
+///
+/// Keyed by `(owning_table_id, include_name)`. The `include_name` is the related entity's
+/// `path_segment`, matching the same-package include convention. Same-package relationships are
+/// intentionally skipped — they are already resolved by [`resolve`] into `ResolvedEntity::includes`.
+///
+/// Limitation: the join executes against the request's tenant pool. For Database-strategy tenants
+/// the related package must be physically migrated into that tenant's DB; if it is not, the join
+/// fails at execution time rather than here.
+#[derive(Clone, Debug, Default)]
+pub struct CrossPackageIndex {
+    entries: HashMap<(String, String), (IncludeSpec, ResolvedEntity)>,
+}
+
+impl CrossPackageIndex {
+    /// Look up a cross-package include for `table_id` by include name (the related path_segment).
+    pub fn get(&self, table_id: &str, name: &str) -> Option<&(IncludeSpec, ResolvedEntity)> {
+        self.entries.get(&(table_id.to_string(), name.to_string()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Build the cross-package include index by loading every installed package's config from the
+/// central config DB (`_sys_*` tables) and resolving cross-package relationships. Best-effort:
+/// packages that fail to load or resolve are skipped rather than aborting the whole index.
+pub async fn build_cross_package_index(pool: &Pool) -> CrossPackageIndex {
+    let mut ids = crate::store::list_package_ids(pool)
+        .await
+        .unwrap_or_default();
+    if !ids.iter().any(|i| i == crate::store::DEFAULT_PACKAGE_ID) {
+        ids.push(crate::store::DEFAULT_PACKAGE_ID.to_string());
+    }
+
+    // Global maps spanning all packages.
+    let mut col_name: HashMap<String, String> = HashMap::new();
+    let mut table_to_path: HashMap<String, String> = HashMap::new();
+    let mut table_to_pkg: HashMap<String, String> = HashMap::new();
+    let mut entity_by_table: HashMap<String, ResolvedEntity> = HashMap::new();
+    let mut all_rels: Vec<RelationshipConfig> = Vec::new();
+
+    for id in ids {
+        let cfg = match load_from_pool(pool, &id).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for c in &cfg.columns {
+            col_name.insert(c.id.clone(), c.name.clone());
+        }
+        for api in &cfg.api_entities {
+            table_to_path.insert(api.entity_id.clone(), api.path_segment.clone());
+            table_to_pkg.insert(api.entity_id.clone(), id.clone());
+        }
+        if let Ok(model) = resolve(&cfg) {
+            for e in model.with_package_id(&id).entities {
+                entity_by_table.entry(e.table_id.clone()).or_insert(e);
+            }
+        }
+        all_rels.extend(cfg.relationships.iter().cloned());
+    }
+
+    CrossPackageIndex {
+        entries: cross_package_entries(
+            &col_name,
+            &table_to_path,
+            &table_to_pkg,
+            &entity_by_table,
+            &all_rels,
+        ),
+    }
+}
+
+/// Pure relationship → cross-package include mapping. Separated from DB loading so it can be
+/// unit-tested. Only relationships whose two sides live in *different* packages produce entries;
+/// same-package relationships are handled by [`resolve`].
+fn cross_package_entries(
+    col_name: &HashMap<String, String>,
+    table_to_path: &HashMap<String, String>,
+    table_to_pkg: &HashMap<String, String>,
+    entity_by_table: &HashMap<String, ResolvedEntity>,
+    relationships: &[RelationshipConfig],
+) -> HashMap<(String, String), (IncludeSpec, ResolvedEntity)> {
+    let mut entries: HashMap<(String, String), (IncludeSpec, ResolvedEntity)> = HashMap::new();
+    for rel in relationships {
+        let (Some(from_pkg), Some(to_pkg)) = (
+            table_to_pkg.get(&rel.from_table_id),
+            table_to_pkg.get(&rel.to_table_id),
+        ) else {
+            continue;
+        };
+        if from_pkg == to_pkg {
+            continue; // same-package relationships are handled by resolve()
+        }
+        let (Some(from_col), Some(to_col), Some(from_path), Some(to_path)) = (
+            col_name.get(&rel.from_column_id),
+            col_name.get(&rel.to_column_id),
+            table_to_path.get(&rel.from_table_id),
+            table_to_path.get(&rel.to_table_id),
+        ) else {
+            continue;
+        };
+
+        // to_one: the requesting (from) table holds the FK and includes the to-side entity.
+        if let Some(related) = entity_by_table.get(&rel.to_table_id) {
+            let spec = IncludeSpec {
+                name: to_path.clone(),
+                direction: IncludeDirection::ToOne,
+                related_path_segment: to_path.clone(),
+                our_key_column: from_col.clone(),
+                their_key_column: to_col.clone(),
+            };
+            entries.insert(
+                (rel.from_table_id.clone(), to_path.clone()),
+                (spec, related.clone()),
+            );
+        }
+        // to_many: the to-side table includes the rows that point back to it via the FK.
+        if let Some(related) = entity_by_table.get(&rel.from_table_id) {
+            let spec = IncludeSpec {
+                name: from_path.clone(),
+                direction: IncludeDirection::ToMany,
+                related_path_segment: from_path.clone(),
+                our_key_column: to_col.clone(),
+                their_key_column: from_col.clone(),
+            };
+            entries.insert(
+                (rel.to_table_id.clone(), from_path.clone()),
+                (spec, related.clone()),
+            );
+        }
+    }
+    entries
+}
+
 /// Build the column list for a synthetic audit entity.
 /// Prepends the five audit metadata columns then appends all source columns with pk_type cleared
 /// (audit_id is the new PK, so source PKs become regular queryable columns).
@@ -452,4 +590,161 @@ where
         out.push(value);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ent(table_id: &str, path: &str, schema: &str, pkg: &str) -> ResolvedEntity {
+        ResolvedEntity {
+            table_id: table_id.into(),
+            schema_name: schema.into(),
+            table_name: table_id.into(),
+            path_segment: path.into(),
+            pk_columns: vec!["id".into()],
+            pk_type: PkType::Uuid,
+            columns: vec![],
+            operations: vec!["list".into(), "read".into()],
+            sensitive_columns: HashSet::new(),
+            includes: vec![],
+            validation: HashMap::new(),
+            events: vec![],
+            archive_field: None,
+            package_id: pkg.into(),
+            audit_log: false,
+            global: false,
+            parent_ref_column: None,
+            versioning: None,
+            mcp: None,
+            extensible_columns: vec![],
+        }
+    }
+
+    fn rel(id: &str, from_t: &str, from_c: &str, to_t: &str, to_c: &str) -> RelationshipConfig {
+        RelationshipConfig {
+            id: id.into(),
+            from_schema_id: None,
+            from_table_id: from_t.into(),
+            from_column_id: from_c.into(),
+            to_package_id: None,
+            to_schema_id: None,
+            to_table_id: to_t.into(),
+            to_column_id: to_c.into(),
+            on_update: None,
+            on_delete: None,
+            name: None,
+        }
+    }
+
+    /// A cross-package FK (users in pkg A → orgs in pkg B) yields BOTH directions:
+    /// users can include `orgs` (to_one) and orgs can include `users` (to_many).
+    #[test]
+    fn cross_package_relationship_builds_both_directions() {
+        let col_name = HashMap::from([
+            ("c_org_id".to_string(), "org_id".to_string()),
+            ("c_org_pk".to_string(), "id".to_string()),
+        ]);
+        let table_to_path = HashMap::from([
+            ("t_users".to_string(), "users".to_string()),
+            ("t_orgs".to_string(), "orgs".to_string()),
+        ]);
+        let table_to_pkg = HashMap::from([
+            ("t_users".to_string(), "pkg_a".to_string()),
+            ("t_orgs".to_string(), "pkg_b".to_string()),
+        ]);
+        let entity_by_table = HashMap::from([
+            ("t_users".to_string(), ent("t_users", "users", "a", "pkg_a")),
+            ("t_orgs".to_string(), ent("t_orgs", "orgs", "b", "pkg_b")),
+        ]);
+        let rels = vec![rel("r1", "t_users", "c_org_id", "t_orgs", "c_org_pk")];
+
+        let entries = cross_package_entries(
+            &col_name,
+            &table_to_path,
+            &table_to_pkg,
+            &entity_by_table,
+            &rels,
+        );
+
+        // to_one: users?include=orgs
+        let (one_spec, one_rel) = entries
+            .get(&("t_users".to_string(), "orgs".to_string()))
+            .expect("users → orgs to_one entry");
+        assert!(matches!(one_spec.direction, IncludeDirection::ToOne));
+        assert_eq!(one_spec.our_key_column, "org_id");
+        assert_eq!(one_spec.their_key_column, "id");
+        assert_eq!(one_rel.schema_name, "b");
+
+        // to_many: orgs?include=users
+        let (many_spec, many_rel) = entries
+            .get(&("t_orgs".to_string(), "users".to_string()))
+            .expect("orgs → users to_many entry");
+        assert!(matches!(many_spec.direction, IncludeDirection::ToMany));
+        assert_eq!(many_spec.our_key_column, "id");
+        assert_eq!(many_spec.their_key_column, "org_id");
+        assert_eq!(many_rel.schema_name, "a");
+    }
+
+    /// Same-package relationships must NOT appear in the cross-package index (resolve() owns them).
+    #[test]
+    fn same_package_relationship_is_skipped() {
+        let col_name = HashMap::from([
+            ("c_fk".to_string(), "user_id".to_string()),
+            ("c_pk".to_string(), "id".to_string()),
+        ]);
+        let table_to_path = HashMap::from([
+            ("t_orders".to_string(), "orders".to_string()),
+            ("t_users".to_string(), "users".to_string()),
+        ]);
+        // Both tables in the same package.
+        let table_to_pkg = HashMap::from([
+            ("t_orders".to_string(), "pkg_a".to_string()),
+            ("t_users".to_string(), "pkg_a".to_string()),
+        ]);
+        let entity_by_table = HashMap::from([
+            (
+                "t_orders".to_string(),
+                ent("t_orders", "orders", "a", "pkg_a"),
+            ),
+            ("t_users".to_string(), ent("t_users", "users", "a", "pkg_a")),
+        ]);
+        let rels = vec![rel("r1", "t_orders", "c_fk", "t_users", "c_pk")];
+
+        let entries = cross_package_entries(
+            &col_name,
+            &table_to_path,
+            &table_to_pkg,
+            &entity_by_table,
+            &rels,
+        );
+        assert!(entries.is_empty(), "same-package rel should be skipped");
+    }
+
+    /// When the related table has no API entity (not exposed), no include is built for it.
+    #[test]
+    fn missing_related_path_yields_no_entry() {
+        let col_name = HashMap::from([
+            ("c_org_id".to_string(), "org_id".to_string()),
+            ("c_org_pk".to_string(), "id".to_string()),
+        ]);
+        // t_orgs has a package mapping but no path_segment (no api_entity).
+        let table_to_path = HashMap::from([("t_users".to_string(), "users".to_string())]);
+        let table_to_pkg = HashMap::from([
+            ("t_users".to_string(), "pkg_a".to_string()),
+            ("t_orgs".to_string(), "pkg_b".to_string()),
+        ]);
+        let entity_by_table =
+            HashMap::from([("t_users".to_string(), ent("t_users", "users", "a", "pkg_a"))]);
+        let rels = vec![rel("r1", "t_users", "c_org_id", "t_orgs", "c_org_pk")];
+
+        let entries = cross_package_entries(
+            &col_name,
+            &table_to_path,
+            &table_to_pkg,
+            &entity_by_table,
+            &rels,
+        );
+        assert!(entries.is_empty());
+    }
 }

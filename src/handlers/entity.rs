@@ -893,29 +893,43 @@ async fn delete_all_asset_paths(state: &AppState, entity: &ResolvedEntity, row: 
 }
 
 /// Resolve include names to (name, spec, related_entity). Call with model read lock held.
+/// Resolve `?include=` names to (name, spec, related entity). Same-package includes are looked up
+/// in the entity's own `includes`; when `xpkg` is supplied, names not found there fall back to the
+/// cross-package index, which can join a related entity living in another package (both directions).
+/// `xpkg` is `None` on write paths (graph create), which stay same-package only.
 fn resolve_includes(
     model: &ResolvedModel,
     entity: &ResolvedEntity,
     include_names: &[String],
+    xpkg: Option<&crate::config::CrossPackageIndex>,
 ) -> Result<Vec<(String, crate::config::IncludeSpec, ResolvedEntity)>, AppError> {
     let mut out = Vec::new();
     for name in include_names {
-        let spec = entity
+        // 1. Same-package include declared on this entity.
+        if let Some(spec) = entity
             .includes
             .iter()
             .find(|i| i.name.as_str() == name.as_str())
-            .ok_or_else(|| AppError::BadRequest(format!("unknown include: {}", name)))?
-            .clone();
-        let related = model
-            .entity_by_path(&spec.related_path_segment)
             .cloned()
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "related entity not found: {}",
-                    spec.related_path_segment
-                ))
-            })?;
-        out.push((name.clone(), spec, related));
+        {
+            let related = model
+                .entity_by_path(&spec.related_path_segment)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "related entity not found: {}",
+                        spec.related_path_segment
+                    ))
+                })?;
+            out.push((name.clone(), spec, related));
+            continue;
+        }
+        // 2. Cross-package include (related entity lives in another package).
+        if let Some((spec, related)) = xpkg.and_then(|idx| idx.get(&entity.table_id, name)) {
+            out.push((name.clone(), spec.clone(), related.clone()));
+            continue;
+        }
+        return Err(AppError::BadRequest(format!("unknown include: {}", name)));
     }
     Ok(out)
 }
@@ -1173,6 +1187,40 @@ pub(crate) async fn get_or_load_package_model(
         .map_err(|_| AppError::BadRequest("state lock".into()))?
         .insert(cache_key.to_string(), model.clone());
     Ok(model)
+}
+
+/// Get the cross-package include index from cache, building it from all installed package configs
+/// on first use (or after invalidation). The index is best-effort and cached in `AppState`;
+/// it is invalidated (set to `None`) on model reload and package install/uninstall.
+pub(crate) async fn get_or_build_cross_package_index(
+    state: &AppState,
+    config_pool: &crate::db::pool::Pool,
+) -> Result<std::sync::Arc<crate::config::CrossPackageIndex>, AppError> {
+    {
+        let guard = state
+            .cross_package_index
+            .read()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
+        if let Some(idx) = guard.as_ref() {
+            return Ok(idx.clone());
+        }
+    }
+    let idx = std::sync::Arc::new(crate::config::build_cross_package_index(config_pool).await);
+    *state
+        .cross_package_index
+        .write()
+        .map_err(|_| AppError::BadRequest("state lock".into()))? = Some(idx.clone());
+    Ok(idx)
+}
+
+/// Drop the cached cross-package index so the next include request rebuilds it. Best-effort.
+/// Call after any config change (model reload, package install/uninstall) that may alter
+/// cross-package relationships. Must be called without holding the model lock — request paths take
+/// the cross-package lock before the model lock, so the reverse order risks a deadlock.
+pub(crate) fn invalidate_cross_package_index(state: &AppState) {
+    if let Ok(mut guard) = state.cross_package_index.write() {
+        *guard = None;
+    }
 }
 
 /// Post-process rows from single-query list_with_includes: parse JSON include columns if string, strip sensitive and camelCase nested objects.
@@ -1512,11 +1560,15 @@ pub async fn list(
     };
     let resolved_all: Vec<(String, crate::config::IncludeSpec, ResolvedEntity)> =
         if !all_include_names.is_empty() {
+            // Build (or fetch cached) cross-package index before taking the model lock — it does
+            // async DB work and the model guard is a std::sync::RwLock that must not be held across
+            // an await.
+            let xpkg = get_or_build_cross_package_index(&state, ctx.config_pool()).await?;
             let model = state
                 .model
                 .read()
                 .map_err(|_| AppError::BadRequest("state lock".into()))?;
-            resolve_includes(&model, &entity, &all_include_names)?
+            resolve_includes(&model, &entity, &all_include_names, Some(&xpkg))?
         } else {
             Vec::new()
         };
@@ -1823,7 +1875,8 @@ pub async fn create_graph(
                     .model
                     .read()
                     .map_err(|_| AppError::BadRequest("state lock".into()))?;
-                let resolved = resolve_includes(&model, &entity, std::slice::from_ref(&name))?;
+                let resolved =
+                    resolve_includes(&model, &entity, std::slice::from_ref(&name), None)?;
                 let (_, spec, child) = resolved.into_iter().next().unwrap();
                 (spec, child)
             };
@@ -2049,12 +2102,13 @@ pub async fn read(
         })
         .unwrap_or_default();
     if !include_names.is_empty() {
+        let xpkg = get_or_build_cross_package_index(&state, ctx.config_pool()).await?;
         let resolved = {
             let model = state
                 .model
                 .read()
                 .map_err(|_| AppError::BadRequest("state lock".into()))?;
-            resolve_includes(&model, &entity, &include_names)?
+            resolve_includes(&model, &entity, &include_names, Some(&xpkg))?
         };
         let mut rows = [row];
         attach_includes(
@@ -2785,7 +2839,8 @@ pub async fn list_package(
     };
     let resolved_all: Vec<(String, crate::config::IncludeSpec, ResolvedEntity)> =
         if !all_include_names.is_empty() {
-            resolve_includes(&model, &entity, &all_include_names)?
+            let xpkg = get_or_build_cross_package_index(&state, ctx.config_pool()).await?;
+            resolve_includes(&model, &entity, &all_include_names, Some(&xpkg))?
         } else {
             Vec::new()
         };
@@ -3084,7 +3139,8 @@ pub async fn create_graph_package(
         for (name, value) in inc_map {
             // Resolve the include name against the package model (same as ?include=).
             let (spec, child_entity) = {
-                let resolved = resolve_includes(&model, &entity, std::slice::from_ref(&name))?;
+                let resolved =
+                    resolve_includes(&model, &entity, std::slice::from_ref(&name), None)?;
                 let (_, spec, child) = resolved.into_iter().next().unwrap();
                 (spec, child)
             };
@@ -3314,7 +3370,8 @@ pub async fn read_package(
         })
         .unwrap_or_default();
     if !include_names.is_empty() {
-        let resolved = resolve_includes(&model, &entity, &include_names)?;
+        let xpkg = get_or_build_cross_package_index(&state, ctx.config_pool()).await?;
+        let resolved = resolve_includes(&model, &entity, &include_names, Some(&xpkg))?;
         let mut rows = [row];
         attach_includes(
             &mut executor,

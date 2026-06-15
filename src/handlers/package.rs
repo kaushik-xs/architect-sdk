@@ -751,6 +751,8 @@ pub async fn install_package(
         // Keep the requesting tenant's own cache slot in sync (covers edge cases).
         pkg_guard.insert(package_cache_key, new_model);
     }
+    // Package set changed: drop the cached cross-package index so it rebuilds on the next include.
+    crate::handlers::entity::invalidate_cross_package_index(&state);
 
     #[derive(serde::Serialize)]
     struct PackageInstallResponse {
@@ -839,6 +841,8 @@ pub async fn uninstall_package(
             .map_err(|_| AppError::BadRequest("state lock".into()))?
             .remove(&package_cache_key);
     }
+    // A package was removed: drop the cached cross-package index so it rebuilds on the next include.
+    crate::handlers::entity::invalidate_cross_package_index(&state);
 
     // Reload default model when uninstall was on the central DB so in-memory state stays in sync (no process restart needed).
     if std::ptr::eq(&state.pool as *const _, config_pool as *const _) {
@@ -1350,6 +1354,8 @@ pub async fn apply_migration_handler(
             .map_err(|_| AppError::BadRequest("state lock".into()))?
             .insert(package_cache_key, new_model);
     }
+    // Package config changed: drop the cached cross-package index so it rebuilds on the next include.
+    crate::handlers::entity::invalidate_cross_package_index(&state);
 
     Ok((
         axum::http::StatusCode::OK,

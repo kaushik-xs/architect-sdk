@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         authrs_client: architect_sdk::authrs::AuthrsClient::from_env(),
         dialect,
         extensible_cache: Default::default(),
+        cross_package_index: Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = common_routes_with_ready(state);

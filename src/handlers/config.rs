@@ -67,11 +67,15 @@ pub(crate) async fn reload_model(state: &AppState) -> Result<(), AppError> {
     let new_model = resolve(&config)
         .map_err(AppError::Config)?
         .with_package_id(DEFAULT_PACKAGE_ID);
-    let mut guard = state
-        .model
-        .write()
-        .map_err(|_| AppError::BadRequest("state lock".into()))?;
-    *guard = new_model;
+    {
+        let mut guard = state
+            .model
+            .write()
+            .map_err(|_| AppError::BadRequest("state lock".into()))?;
+        *guard = new_model;
+    }
+    // Config changed: drop the cached cross-package index so it rebuilds on the next include.
+    crate::handlers::entity::invalidate_cross_package_index(state);
     Ok(())
 }
 

@@ -32,4 +32,8 @@ pub struct AppState {
     /// Per-tenant extensible-field registry cache (read-through, TTL-bounded, evicted on write).
     /// Construct with `Default::default()`.
     pub extensible_cache: crate::extensible_fields::RegistryCache,
+    /// Cached cross-package include index, built lazily from all installed package configs and
+    /// invalidated (set to `None`) on model reload and package install/uninstall. Initialize with
+    /// `Arc::new(RwLock::new(None))`.
+    pub cross_package_index: Arc<RwLock<Option<Arc<crate::config::CrossPackageIndex>>>>,
 }

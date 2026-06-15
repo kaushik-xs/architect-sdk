@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         authrs_client,
         dialect,
         extensible_cache: Default::default(),
+        cross_package_index: Arc::new(RwLock::new(None)),
     };
 
     let api = Router::new()
