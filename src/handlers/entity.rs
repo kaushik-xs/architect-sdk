@@ -1485,8 +1485,7 @@ pub async fn list(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -1496,19 +1495,10 @@ pub async fn list(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
 
     let entity = state
@@ -1699,8 +1689,7 @@ pub async fn create(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -1710,19 +1699,10 @@ pub async fn create(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -1783,6 +1763,10 @@ pub async fn create(
         state.dialect.as_ref(),
     )
     .await?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -2061,8 +2045,7 @@ pub async fn read(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2072,19 +2055,10 @@ pub async fn read(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -2194,8 +2168,7 @@ pub async fn update(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2205,19 +2178,10 @@ pub async fn update(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -2302,6 +2266,10 @@ pub async fn update(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(id_str))?;
+    // Commit the RLS transaction before post-write asset cleanup / events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
 
     // Hard-delete any asset files dropped from storage after a successful DB write.
     if let Some(ref old_row) = pre_update_row {
@@ -2347,8 +2315,7 @@ pub async fn delete(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2358,19 +2325,10 @@ pub async fn delete(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -2417,6 +2375,10 @@ pub async fn delete(
         state.dialect.as_ref(),
     )
     .await?;
+    // Commit the RLS transaction before post-delete asset cleanup / events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {
@@ -2764,8 +2726,7 @@ pub async fn list_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2775,19 +2736,10 @@ pub async fn list_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -2961,8 +2913,7 @@ pub async fn create_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2972,19 +2923,10 @@ pub async fn create_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3041,6 +2983,10 @@ pub async fn create_package(
         state.dialect.as_ref(),
     )
     .await?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -3322,8 +3268,7 @@ pub async fn read_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -3333,19 +3278,10 @@ pub async fn read_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3452,8 +3388,7 @@ pub async fn update_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -3463,19 +3398,10 @@ pub async fn update_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3550,6 +3476,10 @@ pub async fn update_package(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(id_str))?;
+    // Commit the RLS transaction before post-write asset cleanup / events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
 
     // Hard-delete dropped asset files after a successful DB write.
     if let Some(ref old_row) = pre_update_row {
@@ -3602,8 +3532,7 @@ pub async fn delete_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -3613,19 +3542,10 @@ pub async fn delete_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3669,6 +3589,10 @@ pub async fn delete_package(
         state.dialect.as_ref(),
     )
     .await?;
+    // Commit the RLS transaction before post-delete asset cleanup / events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
 
     // Hard-delete all asset files belonging to this record after a successful DB delete.
     if let Some(ref old_row) = pre_delete_row {
@@ -4017,8 +3941,7 @@ pub async fn archive(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4028,19 +3951,10 @@ pub async fn archive(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -4075,6 +3989,10 @@ pub async fn archive(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -4117,8 +4035,7 @@ pub async fn unarchive(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4128,19 +4045,10 @@ pub async fn unarchive(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -4175,6 +4083,10 @@ pub async fn unarchive(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -4222,8 +4134,7 @@ pub async fn unarchive_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4233,19 +4144,10 @@ pub async fn unarchive_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -4277,6 +4179,10 @@ pub async fn unarchive_package(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} not found or not currently archived", id_str)))?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -4324,8 +4230,7 @@ pub async fn archive_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4335,19 +4240,10 @@ pub async fn archive_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -4379,6 +4275,10 @@ pub async fn archive_package(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} not found or already archived", id_str)))?;
+    // Commit the RLS transaction before shaping the response / spawning events.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_row = row.clone();
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
@@ -4420,8 +4320,7 @@ pub async fn list_history(
         None,
     )
     .await?;
-    #[allow(unused_assignments)]
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4431,19 +4330,10 @@ pub async fn list_history(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -4515,8 +4405,7 @@ pub async fn read_history_version(
         None,
     )
     .await?;
-    #[allow(unused_assignments)]
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -4526,19 +4415,10 @@ pub async fn read_history_version(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
