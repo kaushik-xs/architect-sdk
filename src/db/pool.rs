@@ -11,6 +11,8 @@ pub use sqlx::PgConnection as Connection;
 pub use sqlx::PgPool as Pool;
 #[cfg(feature = "postgres")]
 pub type DbConnection = sqlx::pool::PoolConnection<sqlx::Postgres>;
+#[cfg(feature = "postgres")]
+pub type DbTransaction = sqlx::Transaction<'static, sqlx::Postgres>;
 
 #[cfg(feature = "mysql")]
 pub use sqlx::mysql::MySqlRow as DbRow;
@@ -20,6 +22,8 @@ pub use sqlx::MySqlConnection as Connection;
 pub use sqlx::MySqlPool as Pool;
 #[cfg(feature = "mysql")]
 pub type DbConnection = sqlx::pool::PoolConnection<sqlx::MySql>;
+#[cfg(feature = "mysql")]
+pub type DbTransaction = sqlx::Transaction<'static, sqlx::MySql>;
 
 #[cfg(feature = "sqlite")]
 pub use sqlx::sqlite::SqliteRow as DbRow;
@@ -29,3 +33,5 @@ pub use sqlx::SqliteConnection as Connection;
 pub use sqlx::SqlitePool as Pool;
 #[cfg(feature = "sqlite")]
 pub type DbConnection = sqlx::pool::PoolConnection<sqlx::Sqlite>;
+#[cfg(feature = "sqlite")]
+pub type DbTransaction = sqlx::Transaction<'static, sqlx::Sqlite>;

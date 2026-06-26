@@ -999,6 +999,28 @@ impl TenantContext {
     }
 }
 
+/// Begin a transaction scoped to an RLS tenant, running `SET LOCAL app.tenant_id` inside it so
+/// the setting actually takes effect (`SET LOCAL` is a no-op outside a transaction block). Returns
+/// `None` for the pool/schema strategy. Callers that issue per-item `SAVEPOINT`s (bulk operations)
+/// require this open transaction; the caller MUST `commit()` the returned transaction on success.
+async fn begin_rls_tx(
+    state: &AppState,
+    ctx: &TenantContext,
+) -> Result<Option<crate::db::pool::DbTransaction>, AppError> {
+    match ctx {
+        TenantContext::Rls {
+            tenant_id, pool, ..
+        } => {
+            let mut tx = pool.begin().await?;
+            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
+                sqlx::query(&set_sql).execute(&mut *tx).await?;
+            }
+            Ok(Some(tx))
+        }
+        TenantContext::Pool { .. } => Ok(None),
+    }
+}
+
 /// Resolve execution context from tenant id. X-Tenant-ID is required; returns 400 if missing, 404 if tenant unknown.
 /// For package_id_opt: when None (default routes), package_cache_key is DEFAULT_PACKAGE_ID.
 pub async fn resolve_tenant_context(
@@ -2436,8 +2458,8 @@ pub async fn bulk_create(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2447,19 +2469,10 @@ pub async fn bulk_create(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -2555,6 +2568,10 @@ pub async fn bulk_create(
             .await?;
         }
     }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -2599,8 +2616,8 @@ pub async fn bulk_update(
         None,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -2610,19 +2627,10 @@ pub async fn bulk_update(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = state
         .model
@@ -2697,6 +2705,10 @@ pub async fn bulk_update(
         return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
             db_errs,
         )));
+    }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
     }
     let raw_rows = rows.clone();
     for row in &mut rows {
@@ -3705,8 +3717,8 @@ pub async fn bulk_create_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -3716,19 +3728,10 @@ pub async fn bulk_create_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3820,6 +3823,10 @@ pub async fn bulk_create_package(
             .await?;
         }
     }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
     let raw_rows = rows.clone();
     for row in &mut rows {
         strip_sensitive_columns(row, &entity.sensitive_columns);
@@ -3871,8 +3878,8 @@ pub async fn bulk_update_package(
         &package_id,
     )
     .await?;
-    #[allow(unused_assignments)] // set in Rls branch; Pool branch does not use it
-    let mut rls_conn: Option<crate::db::pool::DbConnection> = None;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
     let (mut executor, schema_override) = match &ctx {
         TenantContext::Pool {
             pool,
@@ -3882,19 +3889,10 @@ pub async fn bulk_update_package(
             TenantExecutor::pool(pool, state.dialect.as_ref()),
             schema_override.as_deref(),
         ),
-        TenantContext::Rls {
-            tenant_id, pool, ..
-        } => {
-            let mut conn = pool.acquire().await?;
-            if let Some(set_sql) = state.dialect.set_tenant_session_sql(tenant_id) {
-                sqlx::query(&set_sql).execute(&mut *conn).await?;
-            }
-            rls_conn = Some(conn);
-            (
-                TenantExecutor::conn(&mut *rls_conn.as_mut().unwrap(), state.dialect.as_ref()),
-                None,
-            )
-        }
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
     };
     let entity = model
         .entity_by_path(&path_segment)
@@ -3966,6 +3964,10 @@ pub async fn bulk_update_package(
         return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
             db_errs,
         )));
+    }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
     }
     let mut rows = raw_rows.clone();
     for row in &mut rows {
