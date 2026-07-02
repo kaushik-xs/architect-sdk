@@ -1453,6 +1453,26 @@ mod versioning_tests {
 
     #[cfg(feature = "postgres")]
     #[test]
+    fn select_by_column_in_casts_bigserial_join_column() {
+        // Regression: an include whose join target is a BIGSERIAL column (e.g. a related
+        // table's auto-number PK) must cast the placeholder, or the value — which binds as
+        // TEXT — hits `operator does not exist: bigint = text`. The loader stores the column's
+        // pg_type via active_cast_name, which now returns "bigint" for BIGSERIAL.
+        use crate::db::{active_cast_name, CanonicalType};
+        let d = crate::db::PostgresDialect;
+        let mut e = make_entity();
+        // Mirror how the loader resolves a bigserial column's pg_type.
+        e.columns[0].pg_type = active_cast_name(&CanonicalType::BigSerial);
+        let q = select_by_column_in(&e, "id", &[Value::String("5".into())], None, &d);
+        assert!(
+            q.sql.contains("\"id\" IN ($1::bigint)"),
+            "bigserial join column must be cast: {}",
+            q.sql
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
     fn select_by_id_leaves_text_pk_uncast() {
         let d = crate::db::PostgresDialect;
         let q = select_by_id(&entity_with_pk(PkType::Text), None, &d);

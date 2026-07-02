@@ -62,9 +62,11 @@ pub fn ddl_type(t: &CanonicalType) -> String {
 pub fn cast_name(t: &CanonicalType) -> Option<String> {
     let s = match t {
         // Numeric types: must be cast since parameters arrive as TEXT.
+        // Serial/BigSerial differ from Int/BigInt only in their DDL default (the sequence);
+        // in value comparisons (WHERE/IN/=) they are plain integer/bigint and need the same cast.
         CanonicalType::SmallInt => "smallint",
-        CanonicalType::Int => "integer",
-        CanonicalType::BigInt => "bigint",
+        CanonicalType::Int | CanonicalType::Serial => "integer",
+        CanonicalType::BigInt | CanonicalType::BigSerial => "bigint",
         CanonicalType::Real => "real",
         CanonicalType::Double => "double precision",
         CanonicalType::Decimal(_) => "numeric",
@@ -88,7 +90,7 @@ pub fn cast_name(t: &CanonicalType) -> Option<String> {
             return Some(s.clone());
         }
         CanonicalType::Custom(_) => return None,
-        // Text-compatible types (TEXT, VARCHAR, CHAR, SERIAL, BIGSERIAL, ASSET) bind fine
+        // Text-compatible types (TEXT, VARCHAR, CHAR, ASSET) bind fine
         // as-is because the parameter OID is already TEXT.
         _ => return None,
     };
@@ -268,5 +270,33 @@ impl Dialect for PostgresDialect {
             "SET LOCAL app.tenant_id = '{}'",
             tenant_id.replace('\'', "''")
         ))
+    }
+}
+
+#[cfg(test)]
+mod cast_name_tests {
+    use super::cast_name;
+    use crate::db::CanonicalType;
+
+    #[test]
+    fn serial_types_cast_as_their_integer_width() {
+        // Regression: SERIAL/BIGSERIAL are integer/bigint in value comparisons. Without a cast,
+        // an include/filter on such a column fails with `operator does not exist: bigint = text`
+        // because all params bind as TEXT.
+        assert_eq!(
+            cast_name(&CanonicalType::Serial).as_deref(),
+            Some("integer")
+        );
+        assert_eq!(
+            cast_name(&CanonicalType::BigSerial).as_deref(),
+            Some("bigint")
+        );
+        assert_eq!(cast_name(&CanonicalType::Int).as_deref(), Some("integer"));
+        assert_eq!(cast_name(&CanonicalType::BigInt).as_deref(), Some("bigint"));
+    }
+
+    #[test]
+    fn text_types_remain_uncast() {
+        assert_eq!(cast_name(&CanonicalType::Text), None);
     }
 }
