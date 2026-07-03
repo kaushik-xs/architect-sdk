@@ -506,6 +506,56 @@ fn bulk_update_operation(
         .build()
 }
 
+fn bulk_delete_operation(
+    entity: &ResolvedEntity,
+    op_suffix: &str,
+    include_package_id_param: bool,
+) -> Operation {
+    let mut params = vec![x_tenant_id_header()];
+    if include_package_id_param {
+        params.push(package_id_param());
+    }
+    // Body: { "ids": [ ...pk values... ] }. A bare JSON array of ids is also accepted.
+    let ids_schema = Schema::Array(
+        utoipa::openapi::schema::ArrayBuilder::new()
+            .items(RefOr::T(Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::new(Type::String))
+                    .build(),
+            )))
+            .build(),
+    );
+    let body_schema = ObjectBuilder::new()
+        .schema_type(SchemaType::new(Type::Object))
+        .property("ids", RefOr::T(ids_schema))
+        .required("ids")
+        .build();
+    let body = RequestBodyBuilder::new()
+        .description(Some(
+            "Object with an `ids` array of primary-key values to delete (a bare JSON array of ids is also accepted).",
+        ))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(Schema::Object(body_schema)))),
+        )
+        .required(Some(Required::True))
+        .build();
+    OperationBuilder::new()
+        .summary(Some(format!("Bulk delete {}", entity.path_segment)))
+        .description(Some(format!(
+            "Delete multiple {} by id. Ids that do not exist are skipped.",
+            entity.path_segment
+        )))
+        .operation_id(Some(format!(
+            "bulk_delete_{}{}",
+            entity.path_segment, op_suffix
+        )))
+        .parameters(Some(params))
+        .request_body(Some(body))
+        .responses(default_responses().build())
+        .build()
+}
+
 /// Child create-body schema for a graph include: like `entity_body_schema(child, true)` but
 /// omits the relationship FK column (it is filled automatically from the parent, and the handler
 /// rejects requests that set it).
@@ -691,7 +741,8 @@ fn add_entity_paths(
 
         let has_bulk_create = entity.operations.iter().any(|o| o == "bulk_create");
         let has_bulk_update = entity.operations.iter().any(|o| o == "bulk_update");
-        if has_bulk_create || has_bulk_update {
+        let has_bulk_delete = entity.operations.iter().any(|o| o == "bulk_delete");
+        if has_bulk_create || has_bulk_update || has_bulk_delete {
             let mut bulk_item = PathItemBuilder::new();
             if has_bulk_create {
                 bulk_item = bulk_item.operation(
@@ -703,6 +754,12 @@ fn add_entity_paths(
                 bulk_item = bulk_item.operation(
                     HttpMethod::Patch,
                     bulk_update_operation(entity, op_suffix, use_package_param),
+                );
+            }
+            if has_bulk_delete {
+                bulk_item = bulk_item.operation(
+                    HttpMethod::Delete,
+                    bulk_delete_operation(entity, op_suffix, use_package_param),
                 );
             }
             builder = builder.path(bulk_path, bulk_item.build());

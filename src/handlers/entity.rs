@@ -64,6 +64,42 @@ fn body_to_map(value: Value) -> Result<HashMap<String, Value>, AppError> {
     }
 }
 
+/// Extract and parse ids for a bulk delete request. Accepts either a bare JSON array of ids
+/// (`["a","b"]`) or an object with an `ids` array (`{"ids":["a","b"]}`). Each id is parsed
+/// against the entity's pk type.
+fn parse_bulk_delete_ids(body: Value, pk_type: &PkType) -> Result<Vec<Value>, AppError> {
+    let raw = match body {
+        Value::Array(arr) => arr,
+        Value::Object(mut m) => match m.remove("ids") {
+            Some(Value::Array(arr)) => arr,
+            _ => {
+                return Err(AppError::BadRequest(
+                    "body must be a JSON array of ids or an object with an 'ids' array".into(),
+                ))
+            }
+        },
+        _ => {
+            return Err(AppError::BadRequest(
+                "body must be a JSON array of ids or an object with an 'ids' array".into(),
+            ))
+        }
+    };
+    let mut ids = Vec::with_capacity(raw.len());
+    for v in raw {
+        let id_str = match v {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "each id must be a string or number".into(),
+                ))
+            }
+        };
+        ids.push(parse_id(&id_str, pk_type)?);
+    }
+    Ok(ids)
+}
+
 /// Convert a vec of (row_index, AppError) from CrudService collecting methods into BulkFieldErrors.
 /// Parses PostgreSQL error detail to extract the offending column name.
 fn db_errors_to_bulk_field_errors(row_errors: Vec<(usize, AppError)>) -> Vec<BulkFieldError> {
@@ -2702,6 +2738,131 @@ pub async fn bulk_update(
     ))
 }
 
+pub async fn bulk_delete(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
+    UserId(user_id_opt): UserId,
+    Path(path_segment): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        None,
+    )
+    .await?;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
+    };
+    let entity = state
+        .model
+        .read()
+        .map_err(|_| AppError::BadRequest("state lock".into()))?
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "bulk_delete") {
+        return Err(AppError::BadRequest("bulk_delete not allowed".into()));
+    }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "delete",
+    )
+    .await?;
+    let ids = parse_bulk_delete_ids(body, &entity.pk_type)?;
+    let (deleted_rows, db_errs) = CrudService::bulk_delete_collecting(
+        &mut executor,
+        &entity,
+        &ids,
+        schema_override,
+        user_id_opt.as_deref(),
+        state.dialect.as_ref(),
+    )
+    .await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
+    }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
+    finish_bulk_delete(&state, &entity, deleted_rows, tenant_id_opt.as_deref()).await
+}
+
+/// Post-commit work shared by `bulk_delete` and `bulk_delete_package`: hard-delete asset files for
+/// each removed row, fire `delete` events, and return the stripped/camelCased rows with a count.
+async fn finish_bulk_delete(
+    state: &AppState,
+    entity: &ResolvedEntity,
+    deleted_rows: Vec<Value>,
+    tenant_id: Option<&str>,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<crate::response::SuccessMany<Value>>,
+    ),
+    AppError,
+> {
+    // Hard-delete all asset files belonging to each removed record (uses RETURNING * rows).
+    let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
+    if entity_has_assets {
+        for raw_row in &deleted_rows {
+            delete_all_asset_paths(state, entity, raw_row).await;
+        }
+    }
+    if let Some(client) = &state.event_client {
+        let tid = tenant_id.unwrap_or("").to_string();
+        for raw_row in deleted_rows.iter().cloned() {
+            let mut api_row = raw_row.clone();
+            strip_sensitive_columns(&mut api_row, &entity.sensitive_columns);
+            value_keys_to_camel_case(&mut api_row);
+            spawn_events(
+                std::sync::Arc::clone(client),
+                entity,
+                "delete",
+                raw_row,
+                api_row,
+                tid.clone(),
+                None,
+            );
+        }
+    }
+    let mut rows = deleted_rows;
+    for row in &mut rows {
+        strip_sensitive_columns(row, &entity.sensitive_columns);
+        value_keys_to_camel_case(row);
+    }
+    let count = rows.len() as u64;
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(crate::response::SuccessMany {
+            data: rows,
+            meta: crate::response::MetaCount { count },
+        }),
+    ))
+}
+
 // ---- Package-scoped handlers: /api/v1/package/:package_id/:path_segment ----
 
 pub async fn list_package(
@@ -3920,6 +4081,82 @@ pub async fn bulk_update_package(
             meta: crate::response::MetaCount { count },
         }),
     ))
+}
+
+pub async fn bulk_delete_package(
+    State(state): State<AppState>,
+    TenantId(tenant_id_opt): TenantId,
+    ActAsTenant(act_as_opt): ActAsTenant,
+    UserId(user_id_opt): UserId,
+    Path((package_id, path_segment)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let ctx = resolve_tenant_context(
+        &state,
+        tenant_id_opt.as_deref(),
+        act_as_opt.as_deref(),
+        Some(&package_id),
+    )
+    .await?;
+    let model = get_or_load_package_model(
+        &state,
+        ctx.config_pool(),
+        ctx.package_cache_key(),
+        &package_id,
+    )
+    .await?;
+    // RLS: open a transaction (with SET LOCAL inside) so per-item SAVEPOINTs work; committed below.
+    let mut rls_tx = begin_rls_tx(&state, &ctx).await?;
+    let (mut executor, schema_override) = match &ctx {
+        TenantContext::Pool {
+            pool,
+            schema_override,
+            ..
+        } => (
+            TenantExecutor::pool(pool, state.dialect.as_ref()),
+            schema_override.as_deref(),
+        ),
+        TenantContext::Rls { .. } => (
+            TenantExecutor::conn(&mut *rls_tx.as_mut().unwrap(), state.dialect.as_ref()),
+            None,
+        ),
+    };
+    let entity = model
+        .entity_by_path(&path_segment)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(path_segment.clone()))?;
+    if !entity.operations.iter().any(|o| o == "bulk_delete") {
+        return Err(AppError::BadRequest("bulk_delete not allowed".into()));
+    }
+    ensure_global_write_allowed(&entity, ctx.rls_tenant_id())?;
+    crate::authrs::check_entity_permission_opt(
+        &state.authrs_client,
+        tenant_id_opt.as_deref(),
+        user_id_opt.as_deref(),
+        &entity,
+        "delete",
+    )
+    .await?;
+    let ids = parse_bulk_delete_ids(body, &entity.pk_type)?;
+    let (deleted_rows, db_errs) = CrudService::bulk_delete_collecting(
+        &mut executor,
+        &entity,
+        &ids,
+        schema_override,
+        user_id_opt.as_deref(),
+        state.dialect.as_ref(),
+    )
+    .await?;
+    if !db_errs.is_empty() {
+        return Err(AppError::BulkValidation(db_errors_to_bulk_field_errors(
+            db_errs,
+        )));
+    }
+    // executor's borrow of rls_tx ends at its last use above (NLL); commit the RLS transaction.
+    if let Some(tx) = rls_tx.take() {
+        tx.commit().await?;
+    }
+    finish_bulk_delete(&state, &entity, deleted_rows, tenant_id_opt.as_deref()).await
 }
 
 /// Archive a single entity by id (default model).

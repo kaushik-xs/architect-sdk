@@ -743,6 +743,120 @@ impl CrudService {
         Ok((out, row_errors))
     }
 
+    /// Bulk delete by id with per-row savepoint isolation, mirroring `bulk_update_collecting`.
+    /// Each id is deleted via [`Self::delete`] on the shared transaction/connection, so versioning
+    /// snapshots and audit rows are honored exactly as for single deletes. Ids that do not exist are
+    /// skipped silently (no row and no error), matching single-delete semantics.
+    /// Returns `(deleted_rows, row_errors)`. If any error occurs the transaction is rolled back and
+    /// deleted_rows is cleared (all-or-nothing).
+    pub async fn bulk_delete_collecting<'a>(
+        executor: &mut TenantExecutor<'a>,
+        entity: &ResolvedEntity,
+        ids: &[Value],
+        schema_override: Option<&str>,
+        caller_user_id: Option<&str>,
+        dialect: &dyn Dialect,
+    ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
+        const BULK_LIMIT: usize = 100;
+        if ids.len() > BULK_LIMIT {
+            return Err(AppError::BadRequest(format!(
+                "bulk delete limited to {} items",
+                BULK_LIMIT
+            )));
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        let mut row_errors: Vec<(usize, AppError)> = Vec::new();
+        match executor.executor {
+            TenantExecutorInner::Pool(pool) => {
+                let mut tx = pool.begin().await?;
+                for (idx, id) in ids.iter().enumerate() {
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut *tx)
+                        .await?;
+                    // Delete on the shared tx connection (Conn executor) so it participates in this
+                    // transaction rather than autocommitting per row.
+                    let mut ex = TenantExecutor::conn(&mut tx, dialect);
+                    let res = Self::delete(
+                        &mut ex,
+                        entity,
+                        id,
+                        schema_override,
+                        caller_user_id,
+                        dialect,
+                    )
+                    .await;
+                    match res {
+                        Ok(Some(row)) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
+                            out.push(row);
+                        }
+                        Ok(None) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut *tx)
+                                .await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if row_errors.is_empty() {
+                    tx.commit().await?;
+                } else {
+                    tx.rollback().await?;
+                    out.clear();
+                }
+            }
+            TenantExecutorInner::Conn(ref mut conn) => {
+                for (idx, id) in ids.iter().enumerate() {
+                    let sp = format!("sp_{}", idx);
+                    sqlx::query(&format!("SAVEPOINT {}", sp))
+                        .execute(&mut **conn)
+                        .await?;
+                    let mut ex = TenantExecutor::conn(conn, dialect);
+                    let res = Self::delete(
+                        &mut ex,
+                        entity,
+                        id,
+                        schema_override,
+                        caller_user_id,
+                        dialect,
+                    )
+                    .await;
+                    match res {
+                        Ok(Some(row)) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
+                            out.push(row);
+                        }
+                        Ok(None) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
+                        }
+                        Err(e) => {
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
+                                .execute(&mut **conn)
+                                .await?;
+                            row_errors.push((idx, e));
+                        }
+                    }
+                }
+                if !row_errors.is_empty() {
+                    out.clear();
+                }
+            }
+        }
+        Ok((out, row_errors))
+    }
+
     /// Execute a history SELECT that returns multiple rows (used by list_history handler).
     /// Binds: params[0] = pk value.
     pub async fn query_history_many<'a>(

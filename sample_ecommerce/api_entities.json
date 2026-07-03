@@ -2,7 +2,7 @@
   {
     "entity_id": "tbl_organizations",
     "path_segment": "organizations",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "name": { "required": true, "max_length": 255 },
@@ -13,7 +13,7 @@
   {
     "entity_id": "tbl_users",
     "path_segment": "users",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": ["email"],
     "validation": {
       "email": { "required": true, "format": "email", "max_length": 255 },
@@ -25,7 +25,7 @@
   {
     "entity_id": "tbl_customers",
     "path_segment": "customers",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": ["email"],
     "validation": {
       "email": { "required": true, "format": "email", "max_length": 255 },
@@ -37,7 +37,7 @@
   {
     "entity_id": "tbl_addresses",
     "path_segment": "addresses",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "customer_id": { "required": true, "format": "uuid" },
@@ -52,7 +52,7 @@
   {
     "entity_id": "tbl_warehouses",
     "path_segment": "warehouses",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "organization_id": { "required": true, "format": "uuid" },
@@ -63,7 +63,7 @@
   {
     "entity_id": "tbl_product_categories",
     "path_segment": "product_categories",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "organization_id": { "required": true, "format": "uuid" },
@@ -76,7 +76,7 @@
   {
     "entity_id": "tbl_products",
     "path_segment": "products",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "organization_id": { "required": true, "format": "uuid" },
@@ -100,7 +100,7 @@
   {
     "entity_id": "tbl_orders",
     "path_segment": "orders",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "organization_id": { "required": true, "format": "uuid" },
@@ -115,7 +115,7 @@
   {
     "entity_id": "tbl_order_items",
     "path_segment": "order_items",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "order_id": { "required": true, "format": "uuid" },
@@ -128,7 +128,7 @@
   {
     "entity_id": "tbl_payments",
     "path_segment": "payments",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": ["reference"],
     "validation": {
       "order_id": { "required": true, "format": "uuid" },
@@ -141,7 +141,7 @@
   {
     "entity_id": "tbl_inventory",
     "path_segment": "inventory",
-    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update"],
+    "operations": ["create", "read", "update", "delete", "bulk_create", "bulk_update", "bulk_delete"],
     "sensitive_columns": [],
     "validation": {
       "product_id": { "required": true, "format": "uuid" },

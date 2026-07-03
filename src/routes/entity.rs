@@ -4,10 +4,10 @@
 
 use crate::handlers::asset::sign_asset;
 use crate::handlers::entity::{
-    archive, archive_package, bulk_create, bulk_create_package, bulk_update, bulk_update_package,
-    create, create_graph, create_graph_package, create_package, delete as delete_handler,
-    delete_package, list, list_history, list_package, read, read_history_version, read_package,
-    unarchive, unarchive_package, update, update_package,
+    archive, archive_package, bulk_create, bulk_create_package, bulk_delete, bulk_delete_package,
+    bulk_update, bulk_update_package, create, create_graph, create_graph_package, create_package,
+    delete as delete_handler, delete_package, list, list_history, list_package, read,
+    read_history_version, read_package, unarchive, unarchive_package, update, update_package,
 };
 use crate::handlers::extensible_fields::{
     apply_indexes_handler, apply_indexes_package, delete_registry_handler, delete_registry_package,
@@ -23,7 +23,10 @@ pub fn entity_routes(state: AppState) -> Router {
         // /assets/sign must be declared before /:path_segment to avoid being captured.
         .route("/assets/sign", get(sign_asset))
         .route("/:path_segment", get(list).post(create))
-        .route("/:path_segment/bulk", post(bulk_create).patch(bulk_update))
+        .route(
+            "/:path_segment/bulk",
+            post(bulk_create).patch(bulk_update).delete(bulk_delete),
+        )
         // Static second segment — takes precedence over /:path_segment/:id (like /bulk).
         .route("/:path_segment/graph", post(create_graph))
         .route(
@@ -58,7 +61,9 @@ pub fn entity_routes(state: AppState) -> Router {
         )
         .route(
             "/package/:package_id/:path_segment/bulk",
-            post(bulk_create_package).patch(bulk_update_package),
+            post(bulk_create_package)
+                .patch(bulk_update_package)
+                .delete(bulk_delete_package),
         )
         .route(
             "/package/:package_id/:path_segment/graph",
