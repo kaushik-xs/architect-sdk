@@ -8,6 +8,9 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Event includes on every write lifecycle**: a trigger's `include` list (related entities expanded into the decision-hub payload's `context.entity`) is now honoured by `archive`, `unarchive`, `create_graph` (parent *and* each child row), `bulk_create`, and `bulk_update`, on both the unprefixed and `/api/v1/package/:package_id/...` routes. Previously only single-row `create`/`update` expanded them; every other lifecycle silently published the flat row. `delete` still publishes the flat row by design — the row is gone by publish time.
+  - Bulk paths resolve the include set once per batch and re-point it per row (`EventIncludeCtx::with_pk_value`) rather than re-walking the model for every row.
+
 - **Extensible fields**: per-tenant custom fields on JSON/JSONB columns flagged `"extensible": true`.
   - Field definitions live in a per-tenant **registry** (KV store, reserved namespace `__extensible_fields__`, keyed by `path_segment`), not in the schema.
   - Registry keys become first-class **RSQL filterable/sortable** fields via the `<column>.<key>` dotted syntax (e.g. `q=attributes.warrantyMonths=ge=12`, `sort=-attributes.voltage`), with dialect-aware typed JSON extraction (Postgres `->>` + `::cast`; MySQL/SQLite `->>'$.key'` + `CAST`).
@@ -24,6 +27,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking (struct):** `AppState` gained a public `extensible_cache` field. Construct it with `extensible_cache: Default::default()`.
 
 ### Fixed
+- **Event includes were silently dropped on package-scoped routes.** `build_event_include_ctx` resolved include names against `state.model` (only ever the `_default` package) even when the entity came from a package model, so every configured `include` on `/api/v1/package/:package_id/...` degraded to the flat row with no log line. The caller's model is now passed in, and an unresolvable include logs a warning instead of failing silently.
 - Case-insensitive RSQL operators (`=ilike=`/`=contains=`/`=starts=`/`=ends=`) now work on MySQL and SQLite (previously hardcoded `ILIKE`, Postgres-only) via a new `Dialect::case_insensitive_like`.
 
 ## [0.1.2] - 2026-05-29

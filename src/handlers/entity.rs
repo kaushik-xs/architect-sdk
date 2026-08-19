@@ -1281,17 +1281,42 @@ pub(crate) fn invalidate_cross_package_index(state: &AppState) {
     }
 }
 
+/// Primary-key value of a row, rendered the way an RSQL `==` leaf expects it.
+fn event_pk_value(raw_row: &Value, pk_column: &str) -> Option<String> {
+    match raw_row.get(pk_column) {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(v) if !v.is_null() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// Re-point a batch's include context at one row of that batch. Bulk paths resolve the include set
+/// once and swap the pk per row, instead of walking the model again for every row written.
+fn event_include_ctx_for_row(
+    base: Option<&crate::events::EventIncludeCtx>,
+    raw_row: &Value,
+) -> Option<crate::events::EventIncludeCtx> {
+    let base = base?;
+    Some(base.with_pk_value(event_pk_value(raw_row, &base.pk_column)?))
+}
+
 /// Build the context the decision-hub publish task needs to expand each trigger's `include` list.
 ///
 /// Returns `None` — meaning "publish the flat row" — when no trigger on this entity requests
 /// includes, when the entity has no single-column primary key, or when the row carries no usable
 /// pk value. Resolution happens here (in-memory, plus the cached cross-package index); the SELECT
 /// itself runs later inside the detached task.
+///
+/// `model` must be the model the entity itself came from: `Some(&model)` on the
+/// `/api/v1/package/:package_id/...` routes, `None` on the unprefixed routes to use `state.model`.
+/// Passing the wrong one resolves include names against a model that doesn't contain the related
+/// entities, and every event silently degrades to the flat row.
 pub(crate) async fn build_event_include_ctx(
     state: &AppState,
     ctx: &TenantContext,
     entity: &ResolvedEntity,
     raw_row: &Value,
+    model: Option<&ResolvedModel>,
 ) -> Option<crate::events::EventIncludeCtx> {
     let mut names: Vec<String> = entity
         .events
@@ -1311,18 +1336,32 @@ pub(crate) async fn build_event_include_ctx(
         );
         return None;
     };
-    let pk_value = match raw_row.get(pk_column) {
-        Some(Value::String(s)) => s.clone(),
-        Some(v) if !v.is_null() => v.to_string(),
-        _ => return None,
-    };
+    let pk_value = event_pk_value(raw_row, pk_column)?;
 
     let xpkg = get_or_build_cross_package_index(state, ctx.config_pool())
         .await
         .ok()?;
-    let model = state.model.read().ok()?;
-    let resolved = resolve_includes(&model, entity, &names, Some(&xpkg)).ok()?;
-    drop(model);
+    let resolved = match model {
+        Some(m) => resolve_includes(m, entity, &names, Some(&xpkg)),
+        None => {
+            let guard = state.model.read().ok()?;
+            resolve_includes(&guard, entity, &names, Some(&xpkg))
+        }
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => {
+            // Loud on purpose: the alternative is an event that looks fine but quietly lost its
+            // related data.
+            tracing::warn!(
+                entity = %entity.path_segment,
+                includes = ?names,
+                error = %e,
+                "event includes could not be resolved — publishing the flat row"
+            );
+            return None;
+        }
+    };
 
     Some(crate::events::EventIncludeCtx {
         pool: ctx.migration_pool().clone(),
@@ -1862,7 +1901,7 @@ pub async fn create(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row, None).await;
         crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
@@ -2065,7 +2104,8 @@ pub async fn create_graph(
         let mut api_parent = parent_row.clone();
         strip_sensitive_columns(&mut api_parent, &entity.sensitive_columns);
         value_keys_to_camel_case(&mut api_parent);
-        spawn_events(
+        let parent_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_parent, None).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "create",
@@ -2073,6 +2113,7 @@ pub async fn create_graph(
             api_parent,
             tenant_id_str.clone(),
             None,
+            parent_ctx,
         );
         for (spec, child_entity, _) in &svc_children {
             if let Some(rows) = child_map.get(&spec.name) {
@@ -2080,7 +2121,11 @@ pub async fn create_graph(
                     let mut api_child = raw_child.clone();
                     strip_sensitive_columns(&mut api_child, &child_entity.sensitive_columns);
                     value_keys_to_camel_case(&mut api_child);
-                    spawn_events(
+                    // Per child row: cheap no-op unless the child entity's own triggers ask for
+                    // includes, in which case each child needs its own pk to expand from.
+                    let child_ctx =
+                        build_event_include_ctx(&state, &ctx, child_entity, raw_child, None).await;
+                    crate::events::spawn_events_with(
                         std::sync::Arc::clone(client),
                         child_entity,
                         "create",
@@ -2088,6 +2133,7 @@ pub async fn create_graph(
                         api_child,
                         tenant_id_str.clone(),
                         None,
+                        child_ctx,
                     );
                 }
             }
@@ -2375,7 +2421,7 @@ pub async fn update(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row, None).await;
         crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
@@ -2636,8 +2682,15 @@ pub async fn bulk_create(
     }
     if let Some(client) = &state.event_client {
         let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
+        // Includes are resolved once for the batch; each row then reuses that resolution
+        // under its own primary key.
+        let batch_ctx = match raw_rows.first() {
+            Some(first) => build_event_include_ctx(&state, &ctx, &entity, first, None).await,
+            None => None,
+        };
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(
+            let row_ctx = event_include_ctx_for_row(batch_ctx.as_ref(), &raw_row);
+            crate::events::spawn_events_with(
                 std::sync::Arc::clone(client),
                 &entity,
                 "create",
@@ -2645,6 +2698,7 @@ pub async fn bulk_create(
                 api_row,
                 tid.clone(),
                 None,
+                row_ctx,
             );
         }
     }
@@ -2774,9 +2828,16 @@ pub async fn bulk_update(
     }
     if let Some(client) = &state.event_client {
         let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
+        // Includes are resolved once for the batch; each row then reuses that resolution
+        // under its own primary key.
+        let batch_ctx = match raw_rows.first() {
+            Some(first) => build_event_include_ctx(&state, &ctx, &entity, first, None).await,
+            None => None,
+        };
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
             // bulk_update doesn't pre-fetch old rows; changed_to checks post-update value only.
-            spawn_events(
+            let row_ctx = event_include_ctx_for_row(batch_ctx.as_ref(), &raw_row);
+            crate::events::spawn_events_with(
                 std::sync::Arc::clone(client),
                 &entity,
                 "update",
@@ -2784,6 +2845,7 @@ pub async fn bulk_update(
                 api_row,
                 tid.clone(),
                 None,
+                row_ctx,
             );
         }
     }
@@ -3211,7 +3273,8 @@ pub async fn create_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        let include_ctx =
+            build_event_include_ctx(&state, &ctx, &entity, &raw_row, Some(&model)).await;
         crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
@@ -3410,7 +3473,9 @@ pub async fn create_graph_package(
         let mut api_parent = parent_row.clone();
         strip_sensitive_columns(&mut api_parent, &entity.sensitive_columns);
         value_keys_to_camel_case(&mut api_parent);
-        spawn_events(
+        let parent_ctx =
+            build_event_include_ctx(&state, &ctx, &entity, &raw_parent, Some(&model)).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "create",
@@ -3418,6 +3483,7 @@ pub async fn create_graph_package(
             api_parent,
             tenant_id_str.clone(),
             None,
+            parent_ctx,
         );
         for (spec, child_entity, _) in &svc_children {
             if let Some(rows) = child_map.get(&spec.name) {
@@ -3425,7 +3491,17 @@ pub async fn create_graph_package(
                     let mut api_child = raw_child.clone();
                     strip_sensitive_columns(&mut api_child, &child_entity.sensitive_columns);
                     value_keys_to_camel_case(&mut api_child);
-                    spawn_events(
+                    // Per child row: cheap no-op unless the child entity's own triggers ask for
+                    // includes, in which case each child needs its own pk to expand from.
+                    let child_ctx = build_event_include_ctx(
+                        &state,
+                        &ctx,
+                        child_entity,
+                        raw_child,
+                        Some(&model),
+                    )
+                    .await;
+                    crate::events::spawn_events_with(
                         std::sync::Arc::clone(client),
                         child_entity,
                         "create",
@@ -3433,6 +3509,7 @@ pub async fn create_graph_package(
                         api_child,
                         tenant_id_str.clone(),
                         None,
+                        child_ctx,
                     );
                 }
             }
@@ -3714,7 +3791,8 @@ pub async fn update_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        let include_ctx =
+            build_event_include_ctx(&state, &ctx, &entity, &raw_row, Some(&model)).await;
         crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
@@ -3982,8 +4060,17 @@ pub async fn bulk_create_package(
     }
     let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
     if let Some(client) = &state.event_client {
+        // Includes are resolved once for the batch; each row then reuses that resolution
+        // under its own primary key.
+        let batch_ctx = match raw_rows.first() {
+            Some(first) => {
+                build_event_include_ctx(&state, &ctx, &entity, first, Some(&model)).await
+            }
+            None => None,
+        };
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(
+            let row_ctx = event_include_ctx_for_row(batch_ctx.as_ref(), &raw_row);
+            crate::events::spawn_events_with(
                 std::sync::Arc::clone(client),
                 &entity,
                 "create",
@@ -3991,6 +4078,7 @@ pub async fn bulk_create_package(
                 api_row,
                 tid.clone(),
                 None,
+                row_ctx,
             );
         }
     }
@@ -4124,8 +4212,17 @@ pub async fn bulk_update_package(
     }
     let tid = tenant_id_opt.as_deref().unwrap_or("").to_string();
     if let Some(client) = &state.event_client {
+        // Includes are resolved once for the batch; each row then reuses that resolution
+        // under its own primary key.
+        let batch_ctx = match raw_rows.first() {
+            Some(first) => {
+                build_event_include_ctx(&state, &ctx, &entity, first, Some(&model)).await
+            }
+            None => None,
+        };
         for (raw_row, api_row) in raw_rows.into_iter().zip(rows.iter().cloned()) {
-            spawn_events(
+            let row_ctx = event_include_ctx_for_row(batch_ctx.as_ref(), &raw_row);
+            crate::events::spawn_events_with(
                 std::sync::Arc::clone(client),
                 &entity,
                 "update",
@@ -4133,6 +4230,7 @@ pub async fn bulk_update_package(
                 api_row,
                 tid.clone(),
                 None,
+                row_ctx,
             );
         }
     }
@@ -4297,7 +4395,8 @@ pub async fn archive(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row, None).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "archive",
@@ -4305,6 +4404,7 @@ pub async fn archive(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -4391,7 +4491,8 @@ pub async fn unarchive(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row, None).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "unarchive",
@@ -4399,6 +4500,7 @@ pub async fn unarchive(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -4487,7 +4589,9 @@ pub async fn unarchive_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx =
+            build_event_include_ctx(&state, &ctx, &entity, &raw_row, Some(&model)).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "unarchive",
@@ -4495,6 +4599,7 @@ pub async fn unarchive_package(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -4583,7 +4688,9 @@ pub async fn archive_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx =
+            build_event_include_ctx(&state, &ctx, &entity, &raw_row, Some(&model)).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "archive",
@@ -4591,6 +4698,7 @@ pub async fn archive_package(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -4822,5 +4930,89 @@ mod global_write_tests {
         let e = entity("currencies", true);
         let admin = crate::tenant::platform_tenant_id();
         assert!(ensure_global_write_allowed(&e, Some(&admin)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod event_include_tests {
+    use super::*;
+    use crate::config::resolved::{IncludeDirection, IncludeSpec};
+    use std::collections::{HashMap, HashSet};
+
+    fn entity(path: &str) -> ResolvedEntity {
+        ResolvedEntity {
+            table_id: format!("tbl_{path}"),
+            schema_name: "s".into(),
+            table_name: path.into(),
+            path_segment: path.into(),
+            pk_columns: vec!["id".into()],
+            pk_type: PkType::Uuid,
+            columns: vec![],
+            operations: vec!["create".into()],
+            sensitive_columns: HashSet::new(),
+            includes: vec![],
+            validation: HashMap::new(),
+            events: vec![],
+            archive_field: None,
+            package_id: "_default".into(),
+            audit_log: false,
+            global: false,
+            parent_ref_column: None,
+            versioning: None,
+            mcp: None,
+            extensible_columns: vec![],
+        }
+    }
+
+    fn ctx(pk_value: &str) -> crate::events::EventIncludeCtx {
+        crate::events::EventIncludeCtx {
+            pool: crate::db::pool::Pool::connect_lazy("sqlite::memory:").unwrap(),
+            rls_tenant: None,
+            schema_override: None,
+            dialect: crate::db::active_dialect(),
+            entity: entity("orders"),
+            resolved: vec![(
+                "order_items".into(),
+                IncludeSpec {
+                    name: "order_items".into(),
+                    direction: IncludeDirection::ToMany,
+                    related_path_segment: "order_items".into(),
+                    our_key_column: "id".into(),
+                    their_key_column: "order_id".into(),
+                },
+                entity("order_items"),
+            )],
+            pk_column: "id".into(),
+            pk_value: pk_value.into(),
+        }
+    }
+
+    #[test]
+    fn pk_value_reads_strings_bare_and_numbers_rendered() {
+        let row = serde_json::json!({ "id": "ord_1", "seq": 42, "gone": null });
+        assert_eq!(event_pk_value(&row, "id").as_deref(), Some("ord_1"));
+        assert_eq!(event_pk_value(&row, "seq").as_deref(), Some("42"));
+        assert_eq!(event_pk_value(&row, "gone"), None);
+        assert_eq!(event_pk_value(&row, "missing"), None);
+    }
+
+    #[tokio::test]
+    async fn batch_ctx_is_repointed_per_row_keeping_its_resolution() {
+        let base = ctx("ord_1");
+        let row = serde_json::json!({ "id": "ord_9" });
+        let per_row = event_include_ctx_for_row(Some(&base), &row).expect("row has a pk");
+        assert_eq!(per_row.pk_value, "ord_9");
+        assert_eq!(per_row.pk_column, "id");
+        // The expensive part — the resolved include set — is carried over untouched.
+        assert_eq!(per_row.resolved.len(), 1);
+        assert_eq!(per_row.resolved[0].0, "order_items");
+    }
+
+    #[tokio::test]
+    async fn batch_ctx_absent_or_row_without_pk_publishes_flat() {
+        let base = ctx("ord_1");
+        let no_pk = serde_json::json!({ "name": "x" });
+        assert!(event_include_ctx_for_row(Some(&base), &no_pk).is_none());
+        assert!(event_include_ctx_for_row(None, &serde_json::json!({ "id": "ord_9" })).is_none());
     }
 }

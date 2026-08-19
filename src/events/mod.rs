@@ -197,6 +197,7 @@ pub fn spawn_events(
 ///
 /// Owned rather than borrowed: the fetch happens inside the detached task, after the handler's
 /// executor (and any RLS transaction) is gone.
+#[derive(Clone)]
 pub struct EventIncludeCtx {
     pub pool: crate::db::pool::Pool,
     /// `Some(tenant)` for RLS-strategy tenants — a fresh transaction with `SET LOCAL` is opened
@@ -211,6 +212,17 @@ pub struct EventIncludeCtx {
     pub pk_column: String,
     /// Primary-key value of the affected row, rendered for an RSQL `==` leaf.
     pub pk_value: String,
+}
+
+impl EventIncludeCtx {
+    /// Same resolution pointed at a different row. Bulk paths publish one event per row but
+    /// resolve the include set once for the whole batch — only the pk differs.
+    pub fn with_pk_value(&self, pk_value: String) -> Self {
+        Self {
+            pk_value,
+            ..self.clone()
+        }
+    }
 }
 
 /// As [`spawn_events`], plus the context needed to honour each trigger's `include` list.

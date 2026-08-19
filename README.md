@@ -501,6 +501,32 @@ Include multiple relationships: `?include=orders,payments`.
 
 Set `DECISION_HUB_URL`. The SDK publishes async events after every create, update, delete, and archive — fire-and-forget, never blocks the API caller.
 
+**Expanding related entities into the payload.** A trigger can name the relationships it wants carried along, using the same names as `?include=`:
+
+```json
+{ "id": "evt_order_paid", "on": "update", "event_name": "paid",
+  "condition": { "field": "status", "changed_to": "paid" },
+  "include": ["order_items", "payments"] }
+```
+
+The event's `context.entity` then carries those relations nested inside the row, sensitive columns stripped at every level and keys camelCased exactly like a `GET` response:
+
+```json
+{ "tenant_id": "acme", "event_type": "ecommerce.orders:paid",
+  "context": { "operation": "update", "entity": {
+    "id": "ord_1", "status": "paid",
+    "orderItems": [ { "id": "oi_1", "qty": 2 } ],
+    "payments":   [ { "id": "pay_1", "amount": 240 } ]
+  } } }
+```
+
+Notes:
+- **Off the request path.** Expansion is a separate read issued inside the detached publish task, after the response is already on the wire. RLS tenants get their own transaction for it.
+- **Both directions, one level.** `to_one` (this row's FK) and `to_many` (rows pointing back) both work, as do cross-package relationships. Nested includes (`orders.items`) are not supported.
+- **Never costs the event.** An include that fails to resolve or read is logged and the flat row is published instead.
+- **`delete` publishes the flat row**, `include` or not — there is nothing left to read by publish time.
+- **Fan-out is yours to manage**: a `to_many` include has no row cap, so `include` on the many-side of a large relationship puts every child row in the event body.
+
 ### 10. Authorization (Authrs)
 
 Set `AUTHRS_URL` and `SERVICE_NAME`. The SDK checks permissions before every entity operation using the `X-User-ID` header. Unauthorized requests receive `401`.
