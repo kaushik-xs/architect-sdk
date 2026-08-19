@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// Remove sensitive column keys from a row object. No-op if sensitive_columns is empty.
-fn strip_sensitive_columns(row: &mut Value, sensitive_columns: &HashSet<String>) {
+pub(crate) fn strip_sensitive_columns(row: &mut Value, sensitive_columns: &HashSet<String>) {
     if sensitive_columns.is_empty() {
         return;
     }
@@ -1281,8 +1281,63 @@ pub(crate) fn invalidate_cross_package_index(state: &AppState) {
     }
 }
 
+/// Build the context the decision-hub publish task needs to expand each trigger's `include` list.
+///
+/// Returns `None` — meaning "publish the flat row" — when no trigger on this entity requests
+/// includes, when the entity has no single-column primary key, or when the row carries no usable
+/// pk value. Resolution happens here (in-memory, plus the cached cross-package index); the SELECT
+/// itself runs later inside the detached task.
+pub(crate) async fn build_event_include_ctx(
+    state: &AppState,
+    ctx: &TenantContext,
+    entity: &ResolvedEntity,
+    raw_row: &Value,
+) -> Option<crate::events::EventIncludeCtx> {
+    let mut names: Vec<String> = entity
+        .events
+        .iter()
+        .flat_map(|t| t.include.iter().cloned())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+
+    let [pk_column] = entity.pk_columns.as_slice() else {
+        tracing::warn!(
+            entity = %entity.path_segment,
+            "event include needs a single-column primary key — publishing the flat row"
+        );
+        return None;
+    };
+    let pk_value = match raw_row.get(pk_column) {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => return None,
+    };
+
+    let xpkg = get_or_build_cross_package_index(state, ctx.config_pool())
+        .await
+        .ok()?;
+    let model = state.model.read().ok()?;
+    let resolved = resolve_includes(&model, entity, &names, Some(&xpkg)).ok()?;
+    drop(model);
+
+    Some(crate::events::EventIncludeCtx {
+        pool: ctx.migration_pool().clone(),
+        rls_tenant: ctx.rls_tenant_id().map(|s| s.to_string()),
+        schema_override: ctx.schema_override().map(|s| s.to_string()),
+        dialect: std::sync::Arc::clone(&state.dialect),
+        entity: entity.clone(),
+        resolved,
+        pk_column: pk_column.clone(),
+        pk_value,
+    })
+}
+
 /// Post-process rows from single-query list_with_includes: parse JSON include columns if string, strip sensitive and camelCase nested objects.
-fn post_process_include_columns(
+pub(crate) fn post_process_include_columns(
     rows: &mut [Value],
     resolved_includes: &[(String, crate::config::IncludeSpec, ResolvedEntity)],
 ) {
@@ -1807,7 +1862,8 @@ pub async fn create(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "create",
@@ -1815,6 +1871,7 @@ pub async fn create(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -2318,7 +2375,8 @@ pub async fn update(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "update",
@@ -2326,6 +2384,7 @@ pub async fn update(
             row.clone(),
             tenant_id_str,
             pre_update_row,
+            include_ctx,
         );
     }
     Ok((
@@ -3152,7 +3211,8 @@ pub async fn create_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "create",
@@ -3160,6 +3220,7 @@ pub async fn create_package(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((
@@ -3653,7 +3714,8 @@ pub async fn update_package(
     strip_sensitive_columns(&mut row, &entity.sensitive_columns);
     value_keys_to_camel_case(&mut row);
     if let Some(client) = &state.event_client {
-        spawn_events(
+        let include_ctx = build_event_include_ctx(&state, &ctx, &entity, &raw_row).await;
+        crate::events::spawn_events_with(
             std::sync::Arc::clone(client),
             &entity,
             "update",
@@ -3661,6 +3723,7 @@ pub async fn update_package(
             row.clone(),
             tenant_id_str,
             None,
+            include_ctx,
         );
     }
     Ok((

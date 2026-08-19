@@ -292,6 +292,11 @@ pub struct EntityEventTrigger {
     /// Only fire when this condition is satisfied against the saved row (snake_case keys).
     #[serde(default)]
     pub condition: Option<EventCondition>,
+    /// Related entities to expand into `context.entity`, using the same names as `?include=`.
+    /// Empty (the default) publishes the flat row. Expansion is a separate SELECT run inside the
+    /// detached publish task, so it never adds latency to the originating request.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// Configuration for exposing a selected API entity as an MCP tool.
