@@ -2236,131 +2236,104 @@ pub fn reconcile_step(step: &MigrationStep, snap: &DbSnapshot) -> StepDecision {
     }
     let schema = step.schema.as_str();
     let object = step.object.as_str();
-    let table = match step.table.as_deref() {
-        Some(t) => t,
-        None => return StepDecision::Execute,
+    let Some(table) = step.table.as_deref() else {
+        return StepDecision::Execute;
     };
     let table_known = snap.has_table(schema, table);
+    let column = snap.column(schema, table, object);
+    // Only meaningful for a table we could actually read: an unknown table means the snapshot
+    // has nothing to say, not that the column is missing.
+    let column_gone = table_known && column.is_none();
+    let missing_column = || {
+        format!(
+            "column \"{}\" does not exist on \"{}\".\"{}\"",
+            object, schema, table
+        )
+    };
 
-    match step.operation {
-        MigrationOperation::CreateTable => {
-            if table_known {
-                return StepDecision::Skip(format!(
-                    "table \"{}\".\"{}\" already exists",
-                    schema, table
-                ));
-            }
+    use MigrationOperation as Op;
+    let reason: Option<String> = match step.operation {
+        Op::CreateTable if table_known => {
+            Some(format!("table \"{}\".\"{}\" already exists", schema, table))
         }
-        MigrationOperation::AddColumn => {
-            if snap.has_column(schema, table, object) {
-                return StepDecision::Skip(format!(
-                    "column \"{}\" already exists on \"{}\".\"{}\"",
-                    object, schema, table
-                ));
-            }
+        Op::AddColumn if column.is_some() => Some(format!(
+            "column \"{}\" already exists on \"{}\".\"{}\"",
+            object, schema, table
+        )),
+        Op::RenameColumn => rename_skip_reason(step, snap, schema, table, table_known),
+
+        // A column that is gone cannot be retyped, defaulted or backfilled.
+        Op::AlterColumnType | Op::BackfillNulls | Op::SetDefault if column_gone => {
+            Some(missing_column())
         }
-        MigrationOperation::RenameColumn => {
-            let from = match step.from_object.as_deref() {
-                Some(f) => f,
-                // Plans saved before `from_object` existed carry no previous name; nothing to
-                // check, so let the statement run.
-                None => return StepDecision::Execute,
-            };
-            if !table_known {
-                return StepDecision::Execute;
-            }
-            let has_old = snap.has_column(schema, table, from);
-            let has_new = snap.has_column(schema, table, object);
-            if !has_old && has_new {
-                return StepDecision::Skip(format!(
-                    "column \"{}\".\"{}\".\"{}\" is already named \"{}\"",
-                    schema, table, from, object
-                ));
-            }
-            if !has_old && !has_new {
-                return StepDecision::Skip(format!(
-                    "neither \"{}\" nor \"{}\" exists on \"{}\".\"{}\" — nothing to rename",
-                    from, object, schema, table
-                ));
-            }
+
+        Op::SetNotNull if column.is_some_and(|f| !f.nullable) => Some(format!(
+            "column \"{}\".\"{}\".\"{}\" is already NOT NULL",
+            schema, table, object
+        )),
+        Op::DropNotNull if column.is_some_and(|f| f.nullable) => Some(format!(
+            "column \"{}\".\"{}\".\"{}\" is already nullable",
+            schema, table, object
+        )),
+        Op::DropDefault if column.is_some_and(|f| !f.has_default) => Some(format!(
+            "column \"{}\".\"{}\".\"{}\" has no DEFAULT",
+            schema, table, object
+        )),
+        Op::SetNotNull | Op::DropNotNull | Op::DropDefault if column_gone => Some(missing_column()),
+
+        Op::CreateIndex if snap.indexes_known && snap.has_index(schema, object) => Some(format!(
+            "index \"{}\".\"{}\" already exists",
+            schema, object
+        )),
+        Op::AddForeignKey
+            if snap.constraints_known && snap.has_constraint(schema, table, object) =>
+        {
+            Some(format!(
+                "constraint \"{}\" already exists on \"{}\".\"{}\"",
+                object, schema, table
+            ))
         }
-        MigrationOperation::AlterColumnType
-        | MigrationOperation::BackfillNulls
-        | MigrationOperation::SetDefault => {
-            if table_known && !snap.has_column(schema, table, object) {
-                return StepDecision::Skip(format!(
-                    "column \"{}\" does not exist on \"{}\".\"{}\"",
-                    object, schema, table
-                ));
-            }
-        }
-        MigrationOperation::SetNotNull => match snap.column(schema, table, object) {
-            Some(facts) if !facts.nullable => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\".\"{}\".\"{}\" is already NOT NULL",
-                    schema, table, object
-                ))
-            }
-            None if table_known => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\" does not exist on \"{}\".\"{}\"",
-                    object, schema, table
-                ))
-            }
-            _ => {}
-        },
-        MigrationOperation::DropNotNull => match snap.column(schema, table, object) {
-            Some(facts) if facts.nullable => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\".\"{}\".\"{}\" is already nullable",
-                    schema, table, object
-                ))
-            }
-            None if table_known => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\" does not exist on \"{}\".\"{}\"",
-                    object, schema, table
-                ))
-            }
-            _ => {}
-        },
-        MigrationOperation::DropDefault => match snap.column(schema, table, object) {
-            Some(facts) if !facts.has_default => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\".\"{}\".\"{}\" has no DEFAULT",
-                    schema, table, object
-                ))
-            }
-            None if table_known => {
-                return StepDecision::Skip(format!(
-                    "column \"{}\" does not exist on \"{}\".\"{}\"",
-                    object, schema, table
-                ))
-            }
-            _ => {}
-        },
-        MigrationOperation::CreateIndex => {
-            if snap.indexes_known && snap.has_index(schema, object) {
-                return StepDecision::Skip(format!(
-                    "index \"{}\".\"{}\" already exists",
-                    schema, object
-                ));
-            }
-        }
-        MigrationOperation::AddForeignKey => {
-            if snap.constraints_known && snap.has_constraint(schema, table, object) {
-                return StepDecision::Skip(format!(
-                    "constraint \"{}\" already exists on \"{}\".\"{}\"",
-                    object, schema, table
-                ));
-            }
-        }
+
         // Drops already carry IF EXISTS, and enum steps are either IF NOT EXISTS or part of a
         // rename/recreate sequence whose intermediate state a pre-flight snapshot cannot describe.
-        _ => {}
-    }
+        _ => None,
+    };
 
-    StepDecision::Execute
+    match reason {
+        Some(r) => StepDecision::Skip(r),
+        None => StepDecision::Execute,
+    }
+}
+
+/// Skip reason for a `RenameColumn` step, or `None` when the rename still has work to do.
+fn rename_skip_reason(
+    step: &MigrationStep,
+    snap: &DbSnapshot,
+    schema: &str,
+    table: &str,
+    table_known: bool,
+) -> Option<String> {
+    // Plans saved before `from_object` existed carry no previous name; nothing to check, so let
+    // the statement run.
+    let from = step.from_object.as_deref()?;
+    if !table_known {
+        return None;
+    }
+    let to = step.object.as_str();
+    match (
+        snap.has_column(schema, table, from),
+        snap.has_column(schema, table, to),
+    ) {
+        (false, true) => Some(format!(
+            "column \"{}\".\"{}\".\"{}\" is already named \"{}\"",
+            schema, table, from, to
+        )),
+        (false, false) => Some(format!(
+            "neither \"{}\" nor \"{}\" exists on \"{}\".\"{}\" — nothing to rename",
+            from, to, schema, table
+        )),
+        _ => None,
+    }
 }
 
 /// Fold a successfully executed step into `snap` so later steps in the same plan see the state
@@ -2372,8 +2345,9 @@ fn apply_step_to_snapshot(step: &MigrationStep, snap: &mut DbSnapshot) {
     let schema = step.schema.as_str();
     let object = step.object.as_str();
     let table = step.table.as_deref();
-    match (step.operation.clone(), table) {
-        (MigrationOperation::AddColumn, Some(t)) => {
+    // `from_object` rides in the tuple so the rename arm needs no nested conditional.
+    match (step.operation.clone(), table, step.from_object.as_deref()) {
+        (MigrationOperation::AddColumn, Some(t), _) => {
             let ddl = step.ddl.as_deref().unwrap_or("").to_uppercase();
             snap.add_column(
                 schema,
@@ -2386,21 +2360,23 @@ fn apply_step_to_snapshot(step: &MigrationStep, snap: &mut DbSnapshot) {
                 },
             );
         }
-        (MigrationOperation::RenameColumn, Some(t)) => {
-            if let Some(from) = step.from_object.as_deref() {
-                snap.rename_column(schema, t, from, object);
-            }
+        (MigrationOperation::RenameColumn, Some(t), Some(from)) => {
+            snap.rename_column(schema, t, from, object)
         }
-        (MigrationOperation::SetNotNull, Some(t)) => snap.set_nullable(schema, t, object, false),
-        (MigrationOperation::DropNotNull, Some(t)) => snap.set_nullable(schema, t, object, true),
-        (MigrationOperation::SetDefault, Some(t)) => snap.set_has_default(schema, t, object, true),
-        (MigrationOperation::DropDefault, Some(t)) => {
+        (MigrationOperation::SetNotNull, Some(t), _) => snap.set_nullable(schema, t, object, false),
+        (MigrationOperation::DropNotNull, Some(t), _) => snap.set_nullable(schema, t, object, true),
+        (MigrationOperation::SetDefault, Some(t), _) => {
+            snap.set_has_default(schema, t, object, true)
+        }
+        (MigrationOperation::DropDefault, Some(t), _) => {
             snap.set_has_default(schema, t, object, false)
         }
-        (MigrationOperation::CreateIndex, _) => snap.add_index(schema, object),
-        (MigrationOperation::DropIndex, _) => snap.remove_index(schema, object),
-        (MigrationOperation::AddForeignKey, Some(t)) => snap.add_constraint(schema, t, object),
-        (MigrationOperation::DropForeignKey, Some(t)) => snap.remove_constraint(schema, t, object),
+        (MigrationOperation::CreateIndex, _, _) => snap.add_index(schema, object),
+        (MigrationOperation::DropIndex, _, _) => snap.remove_index(schema, object),
+        (MigrationOperation::AddForeignKey, Some(t), _) => snap.add_constraint(schema, t, object),
+        (MigrationOperation::DropForeignKey, Some(t), _) => {
+            snap.remove_constraint(schema, t, object)
+        }
         _ => {}
     }
 }
@@ -2412,14 +2388,15 @@ fn apply_step_to_snapshot(step: &MigrationStep, snap: &mut DbSnapshot) {
 /// constraint catalogs.
 fn duplicate_object_reason(dialect: &dyn Dialect, e: &sqlx::Error) -> Option<String> {
     let dbe = e.as_database_error()?;
-    if let Some(code) = dbe.code() {
-        if dialect.is_duplicate_object_code(code.as_ref()) {
-            return Some(format!(
-                "object already exists (SQLSTATE {}): {}",
-                code,
-                dbe.message()
-            ));
-        }
+    let duplicate_code = dbe
+        .code()
+        .is_some_and(|code| dialect.is_duplicate_object_code(code.as_ref()));
+    if duplicate_code {
+        return Some(format!(
+            "object already exists (SQLSTATE {}): {}",
+            dbe.code().unwrap_or_default(),
+            dbe.message()
+        ));
     }
     let msg = dbe.message().to_ascii_lowercase();
     if msg.contains("already exists")
@@ -2532,9 +2509,8 @@ pub async fn execute_migration_plan(
                 warned += 1;
             }
             MigrationSafety::Safe | MigrationSafety::BestEffort => {
-                let sql = match step.ddl {
-                    Some(ref sql) => sql,
-                    None => continue,
+                let Some(ref sql) = step.ddl else {
+                    continue;
                 };
 
                 if let StepDecision::Skip(reason) = reconcile_step(step, &snapshot) {
