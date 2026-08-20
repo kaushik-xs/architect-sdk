@@ -21,24 +21,39 @@ done
 
 # ── locate LLVM tools ─────────────────────────────────────────────────────────
 
+# Returns the path to an LLVM tool on stdout, or a non-zero status when it cannot be found.
+# Note: `exit` here would only leave the command substitution, so the caller checks the status.
 find_llvm_tool() {
-  local name="$1"
+  local name="$1" candidate found
   # 1. Already on PATH (rustup toolchain or custom install)
-  if command -v "$name" &>/dev/null; then printf '%s' "$(command -v "$name")"; return; fi
-  # 2. Homebrew Cellar (versioned)
-  local found
-  found=$(find /opt/homebrew/Cellar/llvm -name "$name" -type f 2>/dev/null | sort -V | tail -1)
-  if [[ -n "$found" ]]; then printf '%s' "$found"; return; fi
-  # 3. Homebrew opt symlink
-  if [[ -f "/opt/homebrew/opt/llvm/bin/$name" ]]; then
-    printf '%s' "/opt/homebrew/opt/llvm/bin/$name"; return
-  fi
-  echo "ERROR: $name not found. Install with: brew install llvm" >&2
-  exit 1
+  if command -v "$name" &>/dev/null; then printf '%s' "$(command -v "$name")"; return 0; fi
+  # 2. Homebrew opt symlinks — unversioned formula first, then the newest llvm@N.
+  #    Homebrew's rust depends on a versioned llvm@N (e.g. llvm@22), so on a machine without
+  #    the plain `llvm` formula that versioned one is the only copy present — and its LLVM
+  #    version matches the rustc that produced the profile data.
+  for candidate in /opt/homebrew/opt/llvm/bin/"$name" \
+                   $(ls -d /opt/homebrew/opt/llvm@* 2>/dev/null | sort -Vr | sed "s|\$|/bin/$name|"); do
+    if [[ -x "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  done
+  # 3. Homebrew Cellar, versioned or not
+  found=$(find /opt/homebrew/Cellar/llvm /opt/homebrew/Cellar/llvm@* -name "$name" -type f 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$found" ]]; then printf '%s' "$found"; return 0; fi
+  return 1
 }
 
-export LLVM_COV="$(find_llvm_tool llvm-cov)"
-export LLVM_PROFDATA="$(find_llvm_tool llvm-profdata)"
+require_llvm_tool() {
+  local name="$1" path
+  if ! path=$(find_llvm_tool "$name"); then
+    echo "ERROR: $name not found. Install with: brew install llvm" >&2
+    echo "       (or 'brew install llvm@22' to match the LLVM your rustc was built against)" >&2
+    exit 1
+  fi
+  printf '%s' "$path"
+}
+
+LLVM_COV="$(require_llvm_tool llvm-cov)"
+LLVM_PROFDATA="$(require_llvm_tool llvm-profdata)"
+export LLVM_COV LLVM_PROFDATA
 echo "llvm-cov:      $LLVM_COV"
 echo "llvm-profdata: $LLVM_PROFDATA"
 
