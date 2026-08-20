@@ -38,10 +38,12 @@ pub mod store;
 pub mod tenant;
 
 pub use config::{load_from_pool, resolve, FullConfig, ResolvedEntity, ResolvedModel};
+pub use db::{introspect, DbSnapshot};
 pub use error::{AppError, ConfigError};
 pub use migration::{
-    apply_migrations, compute_migration_plan, execute_migration_plan, MigrationOperation,
-    MigrationPlan, MigrationRisk, MigrationSafety, MigrationStep, MigrationSummary,
+    apply_migrations, compute_migration_plan, execute_migration_plan, reconcile_step,
+    MigrationOperation, MigrationPlan, MigrationRisk, MigrationSafety, MigrationStep,
+    MigrationSummary, StepDecision,
 };
 pub use response::{error_body, success_many, success_one};
 pub use routes::{common_routes, common_routes_with_ready, config_routes, entity_routes};

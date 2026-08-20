@@ -3,7 +3,7 @@
 //! Free functions are kept for zero-overhead internal use. `PostgresDialect` implements the
 //! `Dialect` trait for use via `Arc<dyn Dialect>` in AppState.
 
-use super::dialect::Dialect;
+use super::dialect::{escape_literal, Dialect};
 use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 /// Zero-sized marker for the PostgreSQL dialect.
@@ -269,6 +269,58 @@ impl Dialect for PostgresDialect {
         Some(format!(
             "SET LOCAL app.tenant_id = '{}'",
             tenant_id.replace('\'', "''")
+        ))
+    }
+
+    // ── Idempotent DDL / introspection ────────────────────────────────────────
+
+    fn supports_add_column_if_not_exists(&self) -> bool {
+        true
+    }
+
+    fn is_duplicate_object_code(&self, code: &str) -> bool {
+        matches!(
+            code,
+            // duplicate_column | duplicate_table (also index/relation) | duplicate_object
+            // (constraint, type) | duplicate_schema | duplicate_alias
+            "42701" | "42P07" | "42710" | "42P06" | "42712"
+        )
+    }
+
+    fn introspect_columns_sql(&self, schema: &str) -> String {
+        // pg_catalog rather than information_schema: information_schema exposes `is_nullable`
+        // as the `yes_or_no` domain, which sqlx cannot decode without an explicit cast, and it
+        // hides columns from tables the connected role has no privileges on.
+        format!(
+            "SELECT c.relname::text, a.attname::text, \
+                    format_type(a.atttypid, a.atttypmod)::text, \
+                    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
+                    CASE WHEN a.atthasdef THEN 'YES' ELSE 'NO' END \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{}' AND c.relkind IN ('r', 'p') \
+               AND a.attnum > 0 AND NOT a.attisdropped",
+            escape_literal(schema)
+        )
+    }
+
+    fn introspect_indexes_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT c.relname::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{}' AND c.relkind IN ('i', 'I')",
+            escape_literal(schema)
+        ))
+    }
+
+    fn introspect_constraints_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT t.relname::text, con.conname::text FROM pg_constraint con \
+             JOIN pg_class t ON t.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = '{}'",
+            escape_literal(schema)
         ))
     }
 }

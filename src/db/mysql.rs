@@ -1,6 +1,6 @@
 //! MySQL dialect implementation.
 
-use super::dialect::Dialect;
+use super::dialect::{escape_literal, Dialect};
 use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 pub struct MySqlDialect;
@@ -197,6 +197,40 @@ impl Dialect for MySqlDialect {
         Some(format!(
             "SET @tenant_id = '{}'",
             tenant_id.replace('\'', "''")
+        ))
+    }
+
+    // ── Idempotent DDL / introspection ────────────────────────────────────────
+
+    fn is_duplicate_object_code(&self, code: &str) -> bool {
+        // MySQL surfaces the SQLSTATE through sqlx; 42S01 table exists, 42S21 duplicate column,
+        // 42000 covers duplicate key name (ER_DUP_KEYNAME).
+        matches!(code, "42S01" | "42S21" | "1050" | "1060" | "1061")
+    }
+
+    fn introspect_columns_sql(&self, schema: &str) -> String {
+        // MySQL has no schemas: the "schema" is the database name.
+        format!(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, \
+                    CASE WHEN COLUMN_DEFAULT IS NULL THEN 'NO' ELSE 'YES' END \
+             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '{}'",
+            escape_literal(schema)
+        )
+    }
+
+    fn introspect_indexes_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = '{}'",
+            escape_literal(schema)
+        ))
+    }
+
+    fn introspect_constraints_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS \
+             WHERE CONSTRAINT_SCHEMA = '{}'",
+            escape_literal(schema)
         ))
     }
 }

@@ -14,13 +14,13 @@
 use std::collections::HashMap;
 
 use architect_sdk::{
-    apply_migrations,
+    apply_migrations, compute_migration_plan,
     config::{
         ApiEntityConfig, ColumnConfig, ColumnTypeConfig, FullConfig, PrimaryKeyConfig,
         SchemaConfig, TableConfig, ValidationRule,
     },
     db::active_dialect,
-    ensure_sys_tables, resolve,
+    ensure_sys_tables, execute_migration_plan, resolve,
     service::{CrudService, TenantExecutor},
 };
 use serde_json::json;
@@ -276,6 +276,151 @@ async fn migration_is_idempotent() {
     )
     .await
     .expect("second apply should be idempotent");
+}
+
+// ── Migration idempotency against a drifted database ─────────────────────────
+
+/// `notes_config` plus a `project_id` column — a package that gained a field.
+fn notes_config_v2() -> FullConfig {
+    let mut cfg = notes_config();
+    cfg.columns.push(ColumnConfig {
+        id: "c_notes_project_id".into(),
+        table_id: "t_notes".into(),
+        name: "project_id".into(),
+        type_: ColumnTypeConfig::Simple("text".into()),
+        nullable: true,
+        default: None,
+        comment: None,
+        asset: None,
+        extensible: false,
+    });
+    cfg
+}
+
+#[tokio::test]
+async fn install_adds_columns_missing_from_a_pre_existing_table() {
+    // `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so installing a
+    // newer version of a package over an older table must reconcile the missing columns.
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+
+    apply_migrations(
+        &pool,
+        &notes_config(),
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install v1");
+
+    apply_migrations(
+        &pool,
+        &notes_config_v2(),
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install v2 over v1");
+
+    sqlx::query(r#"INSERT INTO "main"."notes" ("body", "project_id") VALUES ('hello', 'p1')"#)
+        .execute(&pool)
+        .await
+        .expect("project_id column should exist after re-applying the newer config");
+}
+
+#[tokio::test]
+async fn replaying_a_migration_plan_skips_steps_that_are_already_applied() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let v1 = notes_config();
+    let v2 = notes_config_v2();
+
+    apply_migrations(&pool, &v1, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("install v1");
+
+    let plan = compute_migration_plan(&v1, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .expect("migration plan");
+
+    let first = execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-1",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+    )
+    .await
+    .expect("first execution");
+    assert_eq!(first.applied, 1, "the ADD COLUMN step should run once");
+    assert_eq!(first.skipped, 0);
+
+    // Replay — e.g. the upgrade was retried after a later step failed.
+    let second = execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-1-retry",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+    )
+    .await
+    .expect("replaying a plan must not fail on already-applied steps");
+    assert_eq!(second.applied, 0);
+    assert_eq!(second.skipped, 1);
+}
+
+#[tokio::test]
+async fn a_column_the_database_already_has_does_not_fail_the_upgrade() {
+    // The reported failure: the physical table is ahead of the old config (added by an earlier
+    // partial run, by RLS reconciliation, or by hand), so the diff plan tries to add a column
+    // that is already there.
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let v1 = notes_config();
+    let v2 = notes_config_v2();
+
+    apply_migrations(&pool, &v1, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("install v1");
+    sqlx::query(r#"ALTER TABLE "main"."notes" ADD COLUMN "project_id" TEXT"#)
+        .execute(&pool)
+        .await
+        .expect("simulate drift");
+
+    let plan = compute_migration_plan(&v1, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .expect("migration plan");
+    let result = execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-2",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+    )
+    .await
+    .expect("upgrade must not fail when the column already exists");
+
+    assert_eq!(result.applied, 0);
+    assert_eq!(result.skipped, 1);
+    assert!(
+        result.skips[0].contains("already exists"),
+        "{:?}",
+        result.skips
+    );
 }
 
 // ── CrudService: notes (serial / integer PK) ─────────────────────────────────

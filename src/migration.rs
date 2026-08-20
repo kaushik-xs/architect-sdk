@@ -5,7 +5,7 @@ use crate::config::types::*;
 use crate::config::{validate, FullConfig};
 use crate::db::parse_canonical;
 use crate::db::pool::Pool;
-use crate::db::Dialect;
+use crate::db::{ColumnFacts, DbSnapshot, Dialect};
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -143,6 +143,82 @@ pub async fn apply_rls_to_tables(
     Ok(())
 }
 
+/// Add any of `desired` columns that the table does not have yet.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a table created by
+/// an earlier version of a package never picks up columns added since. This closes that gap and
+/// makes install/bootstrap idempotent in the same way an upgrade plan is.
+///
+/// Best-effort by design: a column that cannot be added (most often `NOT NULL` with no default on
+/// a table that already has rows) is retried as nullable and then logged, never returned as an
+/// error — refusing to install because of pre-existing drift helps nobody.
+async fn add_missing_columns(
+    pool: &Pool,
+    snapshot: &DbSnapshot,
+    dialect: &dyn Dialect,
+    schema: &str,
+    table: &str,
+    desired: &[(String, String)],
+) {
+    if !snapshot.introspected {
+        return;
+    }
+    let full = format!("{}.{}", quote(schema), quote(table));
+    for (name, def) in desired {
+        if snapshot.has_column(schema, table, name) {
+            continue;
+        }
+        let col_def = format!("{} {}", quote(name), def);
+        let sql = add_column_ddl(dialect, &full, &col_def);
+        match sqlx::query(&sql).execute(pool).await {
+            Ok(_) => {
+                tracing::info!(schema, table, column = %name, "added missing column to pre-existing table");
+            }
+            Err(e) => {
+                // NOT NULL without a default cannot be added to a populated table; fall back to a
+                // nullable column so reads and writes of that field at least work.
+                let upper = def.to_uppercase();
+                if upper.contains("NOT NULL") && !upper.contains("DEFAULT") {
+                    let relaxed_def = def.replace("NOT NULL", "").trim().to_string();
+                    let retry =
+                        add_column_ddl(dialect, &full, &format!("{} {}", quote(name), relaxed_def));
+                    if sqlx::query(&retry).execute(pool).await.is_ok() {
+                        tracing::warn!(schema, table, column = %name, "added missing column as NULLABLE — NOT NULL could not be applied to the existing table");
+                        continue;
+                    }
+                }
+                tracing::warn!(schema, table, column = %name, error = %e, "could not add missing column to pre-existing table");
+            }
+        }
+    }
+}
+
+/// Source columns as a companion (`_audit` / `_history`) table replicates them: same type,
+/// always nullable, no constraints. Mirrors `audit_table_ddl` / `history_table_ddl`.
+fn companion_source_columns(
+    source_cols: &[&ColumnConfig],
+    dialect: &dyn Dialect,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = source_cols
+        .iter()
+        .map(|c| (c.name.clone(), dialect.ddl_type(&parse_canonical(&c.type_))))
+        .collect();
+    let config_col_names: HashSet<&str> = source_cols.iter().map(|c| c.name.as_str()).collect();
+    let audit_ts = dialect.audit_timestamp_type();
+    for (name, typ) in [
+        ("created_at", audit_ts),
+        ("updated_at", audit_ts),
+        ("archived_at", audit_ts),
+        ("created_by", "TEXT"),
+        ("updated_by", "TEXT"),
+    ] {
+        if !config_col_names.contains(name) {
+            out.push((name.to_string(), typ.to_string()));
+        }
+    }
+    out
+}
+
 /// Apply full config to the database: CREATE SCHEMA, CREATE TYPE, CREATE TABLE, CREATE INDEX, ADD FK.
 /// Validates config first. Idempotent for schemas and types (IF NOT EXISTS); tables are CREATE TABLE only (fails if exists).
 /// When `schema_override` is `Some(s)`, app tables/indexes/FKs are created in schema `s` instead of config schema names (e.g. for schema-strategy tenants).
@@ -226,6 +302,16 @@ pub async fn apply_migrations(
         }
     }
 
+    // Which tables already exist, and with which columns? `CREATE TABLE IF NOT EXISTS` silently
+    // leaves a pre-existing table alone, so without this a table created by an older version of
+    // the package would never gain the columns added since. Taken before any DDL runs, so
+    // `has_table` means "existed before this call".
+    let target_schemas: Vec<String> = match schema_override {
+        Some(o) => vec![o.to_string()],
+        None => config.schemas.iter().map(|s| s.name.clone()).collect(),
+    };
+    let pre_snapshot = crate::db::introspect(pool, dialect, &target_schemas).await;
+
     for t in &config.tables {
         let sid = t.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id.get(sid).ok_or_else(|| {
@@ -234,18 +320,22 @@ pub async fn apply_migrations(
                 id: sid.to_string(),
             })
         })?;
-        let schema_name = quote(schema_override.unwrap_or(&schema.name));
+        let schema_raw = schema_override.unwrap_or(&schema.name);
+        let schema_name = quote(schema_raw);
         let table_name = quote(&t.name);
         let full_name = format!("{}.{}", schema_name, table_name);
+        let table_pre_existed = pre_snapshot.has_table(schema_raw, &t.name);
 
         let cols = columns_by_table
             .get(t.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let mut col_defs: Vec<String> = Vec::new();
+        // (column name, DDL suffix) pairs — reused below to add columns a pre-existing table
+        // is missing, so CREATE TABLE and ALTER TABLE can never disagree about a definition.
+        let mut columns: Vec<(String, String)> = Vec::new();
         for c in cols {
             let typ = dialect.ddl_type(&parse_canonical(&c.type_));
-            let mut def = format!("{} {}", quote(&c.name), typ);
+            let mut def = typ;
             if !c.nullable {
                 def.push_str(" NOT NULL");
             }
@@ -256,7 +346,7 @@ pub async fn apply_migrations(
                     ColumnDefaultConfig::Expression { expression } => def.push_str(expression),
                 }
             }
-            col_defs.push(def);
+            columns.push((c.name.clone(), def));
         }
 
         let config_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
@@ -274,9 +364,14 @@ pub async fn apply_migrations(
             ("updated_by", "TEXT"),
         ] {
             if !config_col_names.contains(name) {
-                col_defs.push(format!("{} {}", quote(name), def_suffix));
+                columns.push((name.to_string(), def_suffix.to_string()));
             }
         }
+
+        let mut col_defs: Vec<String> = columns
+            .iter()
+            .map(|(name, def)| format!("{} {}", quote(name), def))
+            .collect();
 
         let pk_cols = match &t.primary_key {
             PrimaryKeyConfig::Single(s) => vec![quote(s)],
@@ -304,8 +399,11 @@ pub async fn apply_migrations(
         );
         sqlx::query(&sql).execute(pool).await?;
 
+        if table_pre_existed {
+            add_missing_columns(pool, &pre_snapshot, dialect, schema_raw, &t.name, &columns).await;
+        }
+
         if t.audit_log {
-            let schema_raw = schema_override.unwrap_or(&schema.name);
             let audit_sql = audit_table_ddl(schema_raw, &t.name, cols, dialect);
             sqlx::query(&audit_sql).execute(pool).await?;
             let pk_col = match &t.primary_key {
@@ -325,10 +423,22 @@ pub async fn apply_migrations(
                 quote("audit_at")
             );
             let _ = sqlx::query(&idx_sql).execute(pool).await;
+
+            let audit_table = format!("{}_audit", t.name);
+            if pre_snapshot.has_table(schema_raw, &audit_table) {
+                add_missing_columns(
+                    pool,
+                    &pre_snapshot,
+                    dialect,
+                    schema_raw,
+                    &audit_table,
+                    &companion_source_columns(cols, dialect),
+                )
+                .await;
+            }
         }
 
         if t.versioning.as_ref().is_some_and(|v| v.enabled) {
-            let schema_raw = schema_override.unwrap_or(&schema.name);
             let pk_col = match &t.primary_key {
                 PrimaryKeyConfig::Single(s) => s.clone(),
                 PrimaryKeyConfig::Composite(v) => v[0].clone(),
@@ -343,6 +453,19 @@ pub async fn apply_migrations(
             sqlx::query(create_only.trim()).execute(pool).await?;
             let idx_sql = history_index_ddl(schema_raw, &t.name, &pk_col);
             let _ = sqlx::query(&idx_sql).execute(pool).await;
+
+            let history_table = format!("{}_history", t.name);
+            if pre_snapshot.has_table(schema_raw, &history_table) {
+                add_missing_columns(
+                    pool,
+                    &pre_snapshot,
+                    dialect,
+                    schema_raw,
+                    &history_table,
+                    &companion_source_columns(cols, dialect),
+                )
+                .await;
+            }
         }
     }
 
@@ -618,6 +741,23 @@ pub async fn revert_migrations(
     Ok(())
 }
 
+/// `ALTER TABLE … ADD COLUMN` with an `IF NOT EXISTS` guard where the dialect supports it.
+///
+/// The guard makes the step a no-op when the column is already present — the common case when a
+/// plan is replayed after a partial failure, or broadcast to a tenant database that already has
+/// the column. Dialects without the syntax (MySQL, SQLite) rely on the executor's pre-flight
+/// introspection instead (see `db::introspect`).
+fn add_column_ddl(dialect: &dyn Dialect, full_table: &str, col_def: &str) -> String {
+    if dialect.supports_add_column_if_not_exists() {
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {}",
+            full_table, col_def
+        )
+    } else {
+        format!("ALTER TABLE {} ADD COLUMN {}", full_table, col_def)
+    }
+}
+
 // ─── Migration plan types ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,6 +831,11 @@ pub struct MigrationStep {
     pub table: Option<String>,
     /// Column name, index name, FK constraint name, enum name, etc.
     pub object: String,
+    /// Previous name of `object` for rename operations. `None` for every other operation.
+    /// Optional in the serialized form so migration plans saved before this field existed
+    /// still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_object: Option<String>,
     /// "column" | "table" | "index" | "foreign_key" | "enum" | "enum_value" | "schema"
     pub object_type: String,
     pub description: String,
@@ -738,7 +883,11 @@ impl MigrationPlan {
 pub struct MigrationExecutionResult {
     pub applied: usize,
     pub warned: usize,
+    /// Steps whose effect was already present in the database and were not re-run.
+    pub skipped: usize,
     pub warnings: Vec<String>,
+    /// One human-readable line per skipped step.
+    pub skips: Vec<String>,
 }
 
 fn default_str(d: &ColumnDefaultConfig) -> String {
@@ -841,6 +990,7 @@ fn recreate_enum_steps(
         table: None,
         object: format!("{}:{}", new_enum.name, removed.join(",")),
         object_type: "enum".into(),
+        from_object: None,
         description: format!(
             "Rebuild enum \"{}\".\"{}\" to remove value(s): {}",
             schema,
@@ -867,6 +1017,7 @@ fn recreate_enum_steps(
         table: None,
         object: new_enum.name.clone(),
         object_type: "enum".into(),
+        from_object: None,
         description: format!(
             "Rename enum \"{}\".\"{}\" to \"{}\" before rebuild",
             schema, new_enum.name, tmp_name
@@ -889,6 +1040,7 @@ fn recreate_enum_steps(
         table: None,
         object: new_enum.name.clone(),
         object_type: "enum".into(),
+        from_object: None,
         description: format!(
             "Recreate enum \"{}\".\"{}\" with {} value(s)",
             schema,
@@ -919,6 +1071,7 @@ fn recreate_enum_steps(
                 table: Some(dep.table.clone()),
                 object: dep.column.clone(),
                 object_type: "column".into(),
+                from_object: None,
                 description: format!(
                     "Drop default on {}.{} before enum recast",
                     dep.table, dep.column
@@ -948,6 +1101,7 @@ fn recreate_enum_steps(
             table: Some(dep.table.clone()),
             object: dep.column.clone(),
             object_type: "column".into(),
+            from_object: None,
             description: format!(
                 "Recast {}.{} onto rebuilt enum \"{}\"",
                 dep.table, dep.column, new_enum.name
@@ -972,6 +1126,7 @@ fn recreate_enum_steps(
                 table: Some(dep.table.clone()),
                 object: dep.column.clone(),
                 object_type: "column".into(),
+                from_object: None,
                 description: format!(
                     "Restore default on {}.{} after enum recast",
                     dep.table, dep.column
@@ -995,6 +1150,7 @@ fn recreate_enum_steps(
         table: None,
         object: tmp_name.clone(),
         object_type: "enum".into(),
+        from_object: None,
         description: format!("Drop superseded enum \"{}\".\"{}\"", schema, tmp_name),
         ddl: Some(format!(
             "DROP TYPE IF EXISTS {}.{}",
@@ -1076,6 +1232,7 @@ pub fn compute_migration_plan(
                     table: None,
                     object: s.name.clone(),
                     object_type: "schema".into(),
+                    from_object: None,
                     description: format!("Create schema \"{}\"", s.name),
                     ddl: Some(format!("CREATE SCHEMA IF NOT EXISTS {}", quote(&s.name))),
                     safety: MigrationSafety::Safe,
@@ -1116,6 +1273,7 @@ pub fn compute_migration_plan(
                         table: None,
                         object: format!("{}:{}", new_enum.name, val),
                         object_type: "enum_value".into(),
+                        from_object: None,
                         description: format!(
                             "Add value '{}' to enum \"{}\".\"{}\"",
                             val, schema, new_enum.name
@@ -1157,6 +1315,7 @@ pub fn compute_migration_plan(
                 table: None,
                 object: new_enum.name.clone(),
                 object_type: "enum".into(),
+                from_object: None,
                 description: format!("Create enum type \"{}\".\"{}\"", schema, new_enum.name),
                 ddl: Some(format!("CREATE TYPE {}.{} AS ENUM ({})", quote(&schema), quote(&new_enum.name), values.join(", "))),
                 safety: MigrationSafety::BestEffort,
@@ -1176,6 +1335,7 @@ pub fn compute_migration_plan(
                 table: None,
                 object: old_enum.name.clone(),
                 object_type: "enum".into(),
+                from_object: None,
                 description: format!("Enum \"{}\".\"{}\" removed from config", schema, old_enum.name),
                 ddl: None,
                 safety: MigrationSafety::WarnOnly,
@@ -1269,6 +1429,7 @@ pub fn compute_migration_plan(
             table: Some(new_table.name.clone()),
             object: new_table.name.clone(),
             object_type: "table".into(),
+            from_object: None,
             description: format!("Create table \"{}\".\"{}\"", schema, new_table.name),
             ddl: Some(format!(
                 "CREATE TABLE IF NOT EXISTS {} (\n  {}\n)",
@@ -1288,6 +1449,7 @@ pub fn compute_migration_plan(
                 table: Some(format!("{}_audit", new_table.name)),
                 object: format!("{}_audit", new_table.name),
                 object_type: "table".into(),
+                from_object: None,
                 description: format!(
                     "Create audit table \"{}\".\"{}_audit\"",
                     schema, new_table.name
@@ -1329,6 +1491,7 @@ pub fn compute_migration_plan(
                 table: Some(format!("{}_history", new_table.name)),
                 object: format!("{}_history", new_table.name),
                 object_type: "table".into(),
+                from_object: None,
                 description: format!(
                     "Create history table \"{}\".\"{}_history\" (versioning)",
                     schema, new_table.name
@@ -1345,6 +1508,7 @@ pub fn compute_migration_plan(
                 table: Some(format!("{}_history", new_table.name)),
                 object: format!("{}_history_{}_idx", new_table.name, pk_col),
                 object_type: "index".into(),
+                from_object: None,
                 description: format!(
                     "Create index on history table \"{}\".\"{}\" ({pk_col}, _version DESC)",
                     schema, new_table.name
@@ -1379,6 +1543,7 @@ pub fn compute_migration_plan(
                     table: Some(format!("{}_audit", new_table.name)),
                     object: format!("{}_audit", new_table.name),
                     object_type: "table".into(),
+                    from_object: None,
                     description: format!(
                         "Enable audit log: create \"{}\".\"{}_audit\"",
                         schema, new_table.name
@@ -1411,6 +1576,7 @@ pub fn compute_migration_plan(
                     table: Some(format!("{}_history", new_table.name)),
                     object: format!("{}_history", new_table.name),
                     object_type: "table".into(),
+                    from_object: None,
                     description: format!(
                         "Enable versioning: create \"{}\".\"{}_history\"",
                         schema, new_table.name
@@ -1427,6 +1593,7 @@ pub fn compute_migration_plan(
                     table: Some(format!("{}_history", new_table.name)),
                     object: format!("{}_history_{}_idx", new_table.name, pk_col),
                     object_type: "index".into(),
+                    from_object: None,
                     description: format!(
                         "Create history index on \"{}\".\"{}\"",
                         schema, new_table.name
@@ -1451,6 +1618,7 @@ pub fn compute_migration_plan(
                 table: Some(old_table.name.clone()),
                 object: old_table.name.clone(),
                 object_type: "table".into(),
+                from_object: None,
                 description: format!("Table \"{}\".\"{}\" removed from config", schema, old_table.name),
                 ddl: None,
                 safety: MigrationSafety::WarnOnly,
@@ -1482,6 +1650,7 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: new_col.name.clone(),
                     object_type: "column".into(),
+                    from_object: None,
                     description: format!("Column \"{}\" (id: {}) appears to have moved tables — manual migration required", new_col.name, new_col.id),
                     ddl: None,
                     safety: MigrationSafety::WarnOnly,
@@ -1500,6 +1669,7 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: new_col.name.clone(),
                     object_type: "column".into(),
+                    from_object: Some(old_col.name.clone()),
                     description: format!(
                         "Rename column \"{}\" → \"{}\" on \"{}\".\"{}\"",
                         old_col.name, new_col.name, schema, table.name
@@ -1521,6 +1691,7 @@ pub fn compute_migration_plan(
                         old: &old_col.name,
                         new: &new_col.name,
                     },
+                    dialect,
                 ));
             }
 
@@ -1536,6 +1707,7 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: col_name.clone(),
                     object_type: "column".into(),
+                    from_object: None,
                     description: format!("Change type of \"{}\".\"{}\".\"{}\": {} → {}", schema, table.name, col_name, old_type, new_type),
                     ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}", full, quote(col_name), new_type, quote(col_name), new_type)),
                     safety: MigrationSafety::BestEffort,
@@ -1549,6 +1721,7 @@ pub fn compute_migration_plan(
                         name: col_name.as_str(),
                         ty: &new_type,
                     },
+                    dialect,
                 ));
             }
 
@@ -1564,6 +1737,7 @@ pub fn compute_migration_plan(
                         table: Some(table.name.clone()),
                         object: new_col.name.clone(),
                         object_type: "column".into(),
+                        from_object: None,
                         description: format!("Backfill NULLs in \"{}\".\"{}\".\"{}\": SET {} = {} WHERE {} IS NULL", schema, table.name, new_col.name, new_col.name, default_val, new_col.name),
                         ddl: Some(format!("UPDATE {} SET {} = {} WHERE {} IS NULL", full, quote(&new_col.name), default_val, quote(&new_col.name))),
                         safety: MigrationSafety::Safe,
@@ -1578,6 +1752,7 @@ pub fn compute_migration_plan(
                         table: Some(table.name.clone()),
                         object: new_col.name.clone(),
                         object_type: "column".into(),
+                        from_object: None,
                         description: format!("Set NOT NULL on \"{}\".\"{}\".\"{}\": NULLs pre-filled with default ({})", schema, table.name, new_col.name, default_val),
                         ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL", full, quote(&new_col.name))),
                         safety: MigrationSafety::Safe,
@@ -1593,6 +1768,7 @@ pub fn compute_migration_plan(
                         table: Some(table.name.clone()),
                         object: new_col.name.clone(),
                         object_type: "column".into(),
+                        from_object: None,
                         description: format!("Set NOT NULL on \"{}\".\"{}\".\"{}\": no default configured — will fail if NULLs exist", schema, table.name, new_col.name),
                         ddl: Some(format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL", full, quote(&new_col.name))),
                         safety: MigrationSafety::BestEffort,
@@ -1614,6 +1790,7 @@ pub fn compute_migration_plan(
                     table: Some(table.name.clone()),
                     object: new_col.name.clone(),
                     object_type: "column".into(),
+                    from_object: None,
                     description: format!(
                         "Drop NOT NULL on \"{}\".\"{}\".\"{}\": column becomes nullable",
                         schema, table.name, new_col.name
@@ -1643,6 +1820,7 @@ pub fn compute_migration_plan(
                             table: Some(table.name.clone()),
                             object: new_col.name.clone(),
                             object_type: "column".into(),
+                            from_object: None,
                             description: format!(
                                 "Set DEFAULT {} on \"{}\".\"{}\".\"{}\": was {}",
                                 val,
@@ -1670,6 +1848,7 @@ pub fn compute_migration_plan(
                             table: Some(table.name.clone()),
                             object: new_col.name.clone(),
                             object_type: "column".into(),
+                            from_object: None,
                             description: format!(
                                 "Drop DEFAULT on \"{}\".\"{}\".\"{}\": was {}",
                                 schema,
@@ -1710,11 +1889,12 @@ pub fn compute_migration_plan(
                 table: Some(table.name.clone()),
                 object: new_col.name.clone(),
                 object_type: "column".into(),
+                from_object: None,
                 description: format!(
                     "Add column \"{}\" {} to \"{}\".\"{}\"",
                     new_col.name, new_type, schema, table.name
                 ),
-                ddl: Some(format!("ALTER TABLE {} ADD COLUMN {}", full, col_def)),
+                ddl: Some(add_column_ddl(dialect, &full, &col_def)),
                 safety: MigrationSafety::Safe,
                 risk: MigrationRisk::None,
                 risk_detail: None,
@@ -1726,6 +1906,7 @@ pub fn compute_migration_plan(
                     name: &new_col.name,
                     ty: &new_type,
                 },
+                dialect,
             ));
         }
     }
@@ -1754,6 +1935,7 @@ pub fn compute_migration_plan(
             table: Some(table_name.to_string()),
             object: old_col.name.clone(),
             object_type: "column".into(),
+            from_object: None,
             description: format!("Column \"{}\" removed from config on \"{}\".\"{}\"", old_col.name, schema, table_name),
             ddl: None,
             safety: MigrationSafety::WarnOnly,
@@ -1776,6 +1958,7 @@ pub fn compute_migration_plan(
                     .map(|t| t.name.clone()),
                 object: old_idx.name.clone(),
                 object_type: "index".into(),
+                from_object: None,
                 description: format!("Drop index \"{}\" in schema \"{}\"", old_idx.name, schema),
                 ddl: Some(format!(
                     "DROP INDEX IF EXISTS {}.{}",
@@ -1847,6 +2030,7 @@ pub fn compute_migration_plan(
             table: Some(table.name.clone()),
             object: new_idx.name.clone(),
             object_type: "index".into(),
+            from_object: None,
             description: format!(
                 "Create {}index \"{}\" on \"{}\".\"{}\"",
                 if new_idx.unique { "unique " } else { "" },
@@ -1891,6 +2075,7 @@ pub fn compute_migration_plan(
                 table: Some(from_table.to_string()),
                 object: constraint.to_string(),
                 object_type: "foreign_key".into(),
+                from_object: None,
                 description: format!(
                     "Drop FK \"{}\" from \"{}\".\"{}\"",
                     constraint,
@@ -2001,6 +2186,7 @@ pub fn compute_migration_plan(
             table: Some(from_table.name.clone()),
             object: constraint.to_string(),
             object_type: "foreign_key".into(),
+            from_object: None,
             description: format!(
                 "Add FK \"{}\" on \"{}\".\"{}\" → \"{}\".\"{}\"",
                 constraint, from_schema_str, from_table.name, to_schema_name, to_table_name
@@ -2023,9 +2209,273 @@ pub fn compute_migration_plan(
     Ok(MigrationPlan { steps })
 }
 
+// ─── Plan reconciliation against the physical database ───────────────────────
+
+/// Whether a plan step still has work to do against a particular database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDecision {
+    /// Run the step's DDL.
+    Execute,
+    /// The step's effect is already present; the payload explains why it was skipped.
+    Skip(String),
+}
+
+/// Decide whether `step` needs to run against the database described by `snap`.
+///
+/// Migration plans are a pure config-vs-config diff, so they assume the database matches the
+/// *old* config exactly. It often does not: an upgrade may have failed halfway and been retried,
+/// one plan is broadcast to many tenant databases at different states, and RLS/companion DDL adds
+/// columns outside the diff. Rather than aborting on `column "x" already exists`, skip the steps
+/// whose outcome is already true.
+///
+/// Negative rules ("the column is missing, so this step cannot run") only fire when the table is
+/// actually known to the snapshot — an empty or failed introspection therefore skips nothing.
+pub fn reconcile_step(step: &MigrationStep, snap: &DbSnapshot) -> StepDecision {
+    if step.ddl.is_none() || !snap.introspected {
+        return StepDecision::Execute;
+    }
+    let schema = step.schema.as_str();
+    let object = step.object.as_str();
+    let table = match step.table.as_deref() {
+        Some(t) => t,
+        None => return StepDecision::Execute,
+    };
+    let table_known = snap.has_table(schema, table);
+
+    match step.operation {
+        MigrationOperation::CreateTable => {
+            if table_known {
+                return StepDecision::Skip(format!(
+                    "table \"{}\".\"{}\" already exists",
+                    schema, table
+                ));
+            }
+        }
+        MigrationOperation::AddColumn => {
+            if snap.has_column(schema, table, object) {
+                return StepDecision::Skip(format!(
+                    "column \"{}\" already exists on \"{}\".\"{}\"",
+                    object, schema, table
+                ));
+            }
+        }
+        MigrationOperation::RenameColumn => {
+            let from = match step.from_object.as_deref() {
+                Some(f) => f,
+                // Plans saved before `from_object` existed carry no previous name; nothing to
+                // check, so let the statement run.
+                None => return StepDecision::Execute,
+            };
+            if !table_known {
+                return StepDecision::Execute;
+            }
+            let has_old = snap.has_column(schema, table, from);
+            let has_new = snap.has_column(schema, table, object);
+            if !has_old && has_new {
+                return StepDecision::Skip(format!(
+                    "column \"{}\".\"{}\".\"{}\" is already named \"{}\"",
+                    schema, table, from, object
+                ));
+            }
+            if !has_old && !has_new {
+                return StepDecision::Skip(format!(
+                    "neither \"{}\" nor \"{}\" exists on \"{}\".\"{}\" — nothing to rename",
+                    from, object, schema, table
+                ));
+            }
+        }
+        MigrationOperation::AlterColumnType
+        | MigrationOperation::BackfillNulls
+        | MigrationOperation::SetDefault => {
+            if table_known && !snap.has_column(schema, table, object) {
+                return StepDecision::Skip(format!(
+                    "column \"{}\" does not exist on \"{}\".\"{}\"",
+                    object, schema, table
+                ));
+            }
+        }
+        MigrationOperation::SetNotNull => match snap.column(schema, table, object) {
+            Some(facts) if !facts.nullable => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\".\"{}\".\"{}\" is already NOT NULL",
+                    schema, table, object
+                ))
+            }
+            None if table_known => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\" does not exist on \"{}\".\"{}\"",
+                    object, schema, table
+                ))
+            }
+            _ => {}
+        },
+        MigrationOperation::DropNotNull => match snap.column(schema, table, object) {
+            Some(facts) if facts.nullable => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\".\"{}\".\"{}\" is already nullable",
+                    schema, table, object
+                ))
+            }
+            None if table_known => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\" does not exist on \"{}\".\"{}\"",
+                    object, schema, table
+                ))
+            }
+            _ => {}
+        },
+        MigrationOperation::DropDefault => match snap.column(schema, table, object) {
+            Some(facts) if !facts.has_default => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\".\"{}\".\"{}\" has no DEFAULT",
+                    schema, table, object
+                ))
+            }
+            None if table_known => {
+                return StepDecision::Skip(format!(
+                    "column \"{}\" does not exist on \"{}\".\"{}\"",
+                    object, schema, table
+                ))
+            }
+            _ => {}
+        },
+        MigrationOperation::CreateIndex => {
+            if snap.indexes_known && snap.has_index(schema, object) {
+                return StepDecision::Skip(format!(
+                    "index \"{}\".\"{}\" already exists",
+                    schema, object
+                ));
+            }
+        }
+        MigrationOperation::AddForeignKey => {
+            if snap.constraints_known && snap.has_constraint(schema, table, object) {
+                return StepDecision::Skip(format!(
+                    "constraint \"{}\" already exists on \"{}\".\"{}\"",
+                    object, schema, table
+                ));
+            }
+        }
+        // Drops already carry IF EXISTS, and enum steps are either IF NOT EXISTS or part of a
+        // rename/recreate sequence whose intermediate state a pre-flight snapshot cannot describe.
+        _ => {}
+    }
+
+    StepDecision::Execute
+}
+
+/// Fold a successfully executed step into `snap` so later steps in the same plan see the state
+/// the earlier ones produced (e.g. a column added and then made NOT NULL).
+///
+/// `CreateTable` is deliberately not recorded: registering a table with no known columns would
+/// make later column steps look impossible and get them wrongly skipped.
+fn apply_step_to_snapshot(step: &MigrationStep, snap: &mut DbSnapshot) {
+    let schema = step.schema.as_str();
+    let object = step.object.as_str();
+    let table = step.table.as_deref();
+    match (step.operation.clone(), table) {
+        (MigrationOperation::AddColumn, Some(t)) => {
+            let ddl = step.ddl.as_deref().unwrap_or("").to_uppercase();
+            snap.add_column(
+                schema,
+                t,
+                object,
+                ColumnFacts {
+                    data_type: String::new(),
+                    nullable: !ddl.contains(" NOT NULL"),
+                    has_default: ddl.contains(" DEFAULT "),
+                },
+            );
+        }
+        (MigrationOperation::RenameColumn, Some(t)) => {
+            if let Some(from) = step.from_object.as_deref() {
+                snap.rename_column(schema, t, from, object);
+            }
+        }
+        (MigrationOperation::SetNotNull, Some(t)) => snap.set_nullable(schema, t, object, false),
+        (MigrationOperation::DropNotNull, Some(t)) => snap.set_nullable(schema, t, object, true),
+        (MigrationOperation::SetDefault, Some(t)) => snap.set_has_default(schema, t, object, true),
+        (MigrationOperation::DropDefault, Some(t)) => {
+            snap.set_has_default(schema, t, object, false)
+        }
+        (MigrationOperation::CreateIndex, _) => snap.add_index(schema, object),
+        (MigrationOperation::DropIndex, _) => snap.remove_index(schema, object),
+        (MigrationOperation::AddForeignKey, Some(t)) => snap.add_constraint(schema, t, object),
+        (MigrationOperation::DropForeignKey, Some(t)) => snap.remove_constraint(schema, t, object),
+        _ => {}
+    }
+}
+
+/// Recognise "the object I tried to create already exists" errors.
+///
+/// Backstop for whatever pre-flight introspection could not see: a schema it had no privileges
+/// on, an object created by a concurrent migration, or a dialect that reports no index and
+/// constraint catalogs.
+fn duplicate_object_reason(dialect: &dyn Dialect, e: &sqlx::Error) -> Option<String> {
+    let dbe = e.as_database_error()?;
+    if let Some(code) = dbe.code() {
+        if dialect.is_duplicate_object_code(code.as_ref()) {
+            return Some(format!(
+                "object already exists (SQLSTATE {}): {}",
+                code,
+                dbe.message()
+            ));
+        }
+    }
+    let msg = dbe.message().to_ascii_lowercase();
+    if msg.contains("already exists")
+        || msg.contains("duplicate column name")
+        || msg.contains("duplicate key name")
+    {
+        return Some(format!("object already exists: {}", dbe.message()));
+    }
+    None
+}
+
 // ─── execute_migration_plan ──────────────────────────────────────────────────
 
+/// Identifiers of the migration being executed, threaded into every audit row.
+struct AuditContext<'a> {
+    migration_plan_id: &'a str,
+    package_id: &'a str,
+    tenant_id: &'a str,
+    from_version: Option<&'a str>,
+    to_version: &'a str,
+}
+
+async fn audit_step(
+    config_pool: &Pool,
+    ctx: &AuditContext<'_>,
+    step: &MigrationStep,
+    status: &str,
+    error_message: Option<&str>,
+) {
+    let _ = crate::store::insert_migration_audit(
+        config_pool,
+        ctx.migration_plan_id,
+        ctx.package_id,
+        ctx.tenant_id,
+        ctx.from_version,
+        ctx.to_version,
+        step.step as i32,
+        &step.operation.to_string(),
+        &step.schema,
+        step.table.as_deref(),
+        &step.object,
+        &step.object_type,
+        &step.description,
+        step.ddl.as_deref(),
+        &format!("{:?}", step.safety),
+        &format!("{:?}", step.risk),
+        status,
+        error_message,
+    )
+    .await;
+}
+
 /// Execute a pre-computed `MigrationPlan` against the tenant database.
+///
+/// The plan is reconciled against the database's actual state first (see [`reconcile_step`]), so
+/// steps whose effect is already present are skipped instead of failing the whole migration.
 /// Writes per-step audit records to the config (architect) database.
 /// Returns counts and any warning messages collected from best-effort failures.
 #[allow(clippy::too_many_arguments)]
@@ -2038,15 +2488,37 @@ pub async fn execute_migration_plan(
     tenant_id: &str,
     from_version: Option<&str>,
     to_version: &str,
+    dialect: &dyn Dialect,
 ) -> Result<MigrationExecutionResult, AppError> {
     let mut applied = 0usize;
     let mut warned = 0usize;
+    let mut skipped = 0usize;
     let mut warnings: Vec<String> = Vec::new();
+    let mut skips: Vec<String> = Vec::new();
+
+    let ctx = AuditContext {
+        migration_plan_id,
+        package_id,
+        tenant_id,
+        from_version,
+        to_version,
+    };
+
+    // Pre-flight: what does this database actually look like? Best-effort — on failure the
+    // snapshot stays empty, nothing is skipped, and execution behaves exactly as before.
+    let schemas: Vec<String> = {
+        let mut seen: Vec<String> = Vec::new();
+        for step in &plan.steps {
+            if step.ddl.is_some() && !seen.iter().any(|s| s == &step.schema) {
+                seen.push(step.schema.clone());
+            }
+        }
+        seen
+    };
+    let mut snapshot = crate::db::introspect(migration_pool, dialect, &schemas).await;
 
     for step in &plan.steps {
         let op = step.operation.to_string();
-        let safety_str = format!("{:?}", step.safety);
-        let risk_str = format!("{:?}", step.risk);
 
         match step.safety {
             MigrationSafety::WarnOnly => {
@@ -2056,112 +2528,61 @@ pub async fn execute_migration_plan(
                     .unwrap_or_else(|| step.description.clone());
                 tracing::warn!(step = step.step, %op, "migration plan warning (no DDL)");
                 warnings.push(format!("[Step {}] {}", step.step, msg));
-                let _ = crate::store::insert_migration_audit(
-                    config_pool,
-                    migration_plan_id,
-                    package_id,
-                    tenant_id,
-                    from_version,
-                    to_version,
-                    step.step as i32,
-                    &op,
-                    &step.schema,
-                    step.table.as_deref(),
-                    &step.object,
-                    &step.object_type,
-                    &step.description,
-                    step.ddl.as_deref(),
-                    &safety_str,
-                    &risk_str,
-                    "skipped",
-                    None,
-                )
-                .await;
+                audit_step(config_pool, &ctx, step, "skipped", None).await;
                 warned += 1;
             }
             MigrationSafety::Safe | MigrationSafety::BestEffort => {
-                if let Some(ref sql) = step.ddl {
-                    tracing::info!(step = step.step, %op, %sql, "executing migration step");
-                    match sqlx::query(sql).execute(migration_pool).await {
-                        Ok(_) => {
-                            let _ = crate::store::insert_migration_audit(
-                                config_pool,
-                                migration_plan_id,
-                                package_id,
-                                tenant_id,
-                                from_version,
-                                to_version,
-                                step.step as i32,
-                                &op,
-                                &step.schema,
-                                step.table.as_deref(),
-                                &step.object,
-                                &step.object_type,
-                                &step.description,
-                                step.ddl.as_deref(),
-                                &safety_str,
-                                &risk_str,
-                                "applied",
-                                None,
-                            )
-                            .await;
-                            applied += 1;
+                let sql = match step.ddl {
+                    Some(ref sql) => sql,
+                    None => continue,
+                };
+
+                if let StepDecision::Skip(reason) = reconcile_step(step, &snapshot) {
+                    tracing::info!(step = step.step, %op, %reason, "migration step already satisfied — skipping");
+                    skips.push(format!(
+                        "[Step {}] {} — {}",
+                        step.step, step.description, reason
+                    ));
+                    audit_step(config_pool, &ctx, step, "skipped_exists", Some(&reason)).await;
+                    skipped += 1;
+                    continue;
+                }
+
+                tracing::info!(step = step.step, %op, %sql, "executing migration step");
+                match sqlx::query(sql).execute(migration_pool).await {
+                    Ok(_) => {
+                        apply_step_to_snapshot(step, &mut snapshot);
+                        audit_step(config_pool, &ctx, step, "applied", None).await;
+                        applied += 1;
+                    }
+                    Err(e) => {
+                        // The object already exists: the step's effect is in place, whatever the
+                        // config diff believed. Record it and carry on.
+                        if let Some(reason) = duplicate_object_reason(dialect, &e) {
+                            tracing::info!(step = step.step, %op, %reason, "migration step already satisfied — skipping");
+                            skips.push(format!(
+                                "[Step {}] {} — {}",
+                                step.step, step.description, reason
+                            ));
+                            audit_step(config_pool, &ctx, step, "skipped_exists", Some(&reason))
+                                .await;
+                            apply_step_to_snapshot(step, &mut snapshot);
+                            skipped += 1;
+                            continue;
                         }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if matches!(step.safety, MigrationSafety::BestEffort) {
-                                tracing::warn!(step = step.step, %op, error = %e, "migration step failed (best-effort, continuing)");
-                                let msg = format!(
-                                    "[Step {}] {} — Error: {}",
-                                    step.step, step.description, err_str
-                                );
-                                warnings.push(msg);
-                                let _ = crate::store::insert_migration_audit(
-                                    config_pool,
-                                    migration_plan_id,
-                                    package_id,
-                                    tenant_id,
-                                    from_version,
-                                    to_version,
-                                    step.step as i32,
-                                    &op,
-                                    &step.schema,
-                                    step.table.as_deref(),
-                                    &step.object,
-                                    &step.object_type,
-                                    &step.description,
-                                    step.ddl.as_deref(),
-                                    &safety_str,
-                                    &risk_str,
-                                    "warned",
-                                    Some(&err_str),
-                                )
-                                .await;
-                                warned += 1;
-                            } else {
-                                let _ = crate::store::insert_migration_audit(
-                                    config_pool,
-                                    migration_plan_id,
-                                    package_id,
-                                    tenant_id,
-                                    from_version,
-                                    to_version,
-                                    step.step as i32,
-                                    &op,
-                                    &step.schema,
-                                    step.table.as_deref(),
-                                    &step.object,
-                                    &step.object_type,
-                                    &step.description,
-                                    step.ddl.as_deref(),
-                                    &safety_str,
-                                    &risk_str,
-                                    "failed",
-                                    Some(&err_str),
-                                )
-                                .await;
-                                return Err(AppError::Db(e));
-                            }
+
+                        let err_str = e.to_string();
+                        if matches!(step.safety, MigrationSafety::BestEffort) {
+                            tracing::warn!(step = step.step, %op, error = %e, "migration step failed (best-effort, continuing)");
+                            warnings.push(format!(
+                                "[Step {}] {} — Error: {}",
+                                step.step, step.description, err_str
+                            ));
+                            audit_step(config_pool, &ctx, step, "warned", Some(&err_str)).await;
+                            warned += 1;
+                        } else {
+                            audit_step(config_pool, &ctx, step, "failed", Some(&err_str)).await;
+                            return Err(AppError::Db(e));
                         }
                     }
                 }
@@ -2172,7 +2593,9 @@ pub async fn execute_migration_plan(
     Ok(MigrationExecutionResult {
         applied,
         warned,
+        skipped,
         warnings,
+        skips,
     })
 }
 
@@ -2295,23 +2718,21 @@ fn companion_column_steps(
     schema: &str,
     table: &TableConfig,
     op: &CompanionColumnOp<'_>,
+    dialect: &dyn Dialect,
 ) -> Vec<MigrationStep> {
     let mut steps = Vec::new();
     for suffix in enabled_companion_suffixes(table) {
         let companion = format!("{}_{}", table.name, suffix);
         let full = format!("{}.{}", quote(schema), quote(&companion));
-        let (operation, object, ddl, description, safety, risk, risk_detail) = match op {
+        let (operation, object, from_object, ddl, description, safety, risk, risk_detail) = match op
+        {
             CompanionColumnOp::Add { name, ty } => (
                 MigrationOperation::AddColumn,
                 name.to_string(),
-                // IF NOT EXISTS guards against collisions with synthetic columns the companion
-                // table may already carry (e.g. created_at/updated_by).
-                format!(
-                    "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
-                    full,
-                    quote(name),
-                    ty
-                ),
+                None,
+                // The IF NOT EXISTS guard (where supported) covers collisions with synthetic
+                // columns the companion table may already carry (e.g. created_at/updated_by).
+                add_column_ddl(dialect, &full, &format!("{} {}", quote(name), ty)),
                 format!(
                     "Sync {} table: add column \"{}\" to \"{}\".\"{}\"",
                     suffix, name, schema, companion
@@ -2323,6 +2744,7 @@ fn companion_column_steps(
             CompanionColumnOp::Rename { old, new } => (
                 MigrationOperation::RenameColumn,
                 new.to_string(),
+                Some(old.to_string()),
                 format!(
                     "ALTER TABLE {} RENAME COLUMN {} TO {}",
                     full,
@@ -2340,6 +2762,7 @@ fn companion_column_steps(
             CompanionColumnOp::AlterType { name, ty } => (
                 MigrationOperation::AlterColumnType,
                 name.to_string(),
+                None,
                 format!(
                     "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}",
                     full,
@@ -2367,6 +2790,7 @@ fn companion_column_steps(
             table: Some(companion.clone()),
             object,
             object_type: "column".into(),
+            from_object,
             description,
             ddl: Some(ddl),
             safety,
@@ -2654,17 +3078,17 @@ mod companion_sync_tests {
         let mut new = base(true, true);
         new.columns.push(col("c2", "note", "text"));
 
+        // SQLite has no ADD COLUMN IF NOT EXISTS, so the guard must not appear here.
         let sql = plan(&old, &new);
         assert!(sql
             .iter()
             .any(|s| s == r#"ALTER TABLE "app"."orders" ADD COLUMN "note" TEXT"#));
-        assert!(sql.iter().any(
-            |s| s == r#"ALTER TABLE "app"."orders_audit" ADD COLUMN IF NOT EXISTS "note" TEXT"#
-        ));
         assert!(sql
             .iter()
-            .any(|s| s
-                == r#"ALTER TABLE "app"."orders_history" ADD COLUMN IF NOT EXISTS "note" TEXT"#));
+            .any(|s| s == r#"ALTER TABLE "app"."orders_audit" ADD COLUMN "note" TEXT"#));
+        assert!(sql
+            .iter()
+            .any(|s| s == r#"ALTER TABLE "app"."orders_history" ADD COLUMN "note" TEXT"#));
     }
 
     #[test]
@@ -2720,5 +3144,305 @@ mod companion_sync_tests {
         assert!(sql.iter().any(|s| s.contains("SET NOT NULL")));
         assert!(!sql.iter().any(|s| s.contains("orders_audit")));
         assert!(!sql.iter().any(|s| s.contains("orders_history")));
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn snapshot() -> DbSnapshot {
+        let mut snap = DbSnapshot::default();
+        snap.introspected = true;
+        snap.indexes_known = true;
+        snap.constraints_known = true;
+        snap
+    }
+
+    fn facts(nullable: bool, has_default: bool) -> ColumnFacts {
+        ColumnFacts {
+            data_type: "text".into(),
+            nullable,
+            has_default,
+        }
+    }
+
+    fn step(op: MigrationOperation, table: Option<&str>, object: &str) -> MigrationStep {
+        MigrationStep {
+            step: 1,
+            operation: op,
+            schema: "app".into(),
+            table: table.map(String::from),
+            object: object.into(),
+            object_type: "column".into(),
+            from_object: None,
+            description: "test step".into(),
+            ddl: Some("SELECT 1".into()),
+            safety: MigrationSafety::Safe,
+            risk: MigrationRisk::None,
+            risk_detail: None,
+        }
+    }
+
+    fn skipped(d: StepDecision) -> bool {
+        matches!(d, StepDecision::Skip(_))
+    }
+
+    #[test]
+    fn add_column_is_skipped_when_the_column_already_exists() {
+        // The regression this whole path exists for: an upgrade plan that adds a column the
+        // physical table already has must not fail the migration.
+        let mut snap = snapshot();
+        snap.add_column("app", "transport_units", "project_id", facts(true, false));
+
+        let s = step(
+            MigrationOperation::AddColumn,
+            Some("transport_units"),
+            "project_id",
+        );
+        assert!(skipped(reconcile_step(&s, &snap)));
+    }
+
+    #[test]
+    fn add_column_runs_when_the_column_is_absent() {
+        let mut snap = snapshot();
+        snap.add_column("app", "transport_units", "id", facts(false, false));
+
+        let s = step(
+            MigrationOperation::AddColumn,
+            Some("transport_units"),
+            "project_id",
+        );
+        assert_eq!(reconcile_step(&s, &snap), StepDecision::Execute);
+    }
+
+    #[test]
+    fn nothing_is_skipped_when_introspection_produced_nothing() {
+        // A failed or empty introspection must never be read as "the object does not exist".
+        let snap = DbSnapshot::default();
+        for op in [
+            MigrationOperation::AddColumn,
+            MigrationOperation::SetNotNull,
+            MigrationOperation::CreateIndex,
+        ] {
+            let s = step(op, Some("orders"), "note");
+            assert_eq!(reconcile_step(&s, &snap), StepDecision::Execute);
+        }
+    }
+
+    #[test]
+    fn create_table_is_skipped_when_the_table_exists() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "id", facts(false, false));
+
+        let s = step(MigrationOperation::CreateTable, Some("orders"), "orders");
+        assert!(skipped(reconcile_step(&s, &snap)));
+    }
+
+    #[test]
+    fn rename_is_skipped_once_it_has_been_applied() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "state", facts(true, false));
+
+        let mut s = step(MigrationOperation::RenameColumn, Some("orders"), "state");
+        s.from_object = Some("status".into());
+        assert!(skipped(reconcile_step(&s, &snap)));
+    }
+
+    #[test]
+    fn rename_runs_while_the_old_column_is_still_there() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "status", facts(true, false));
+
+        let mut s = step(MigrationOperation::RenameColumn, Some("orders"), "state");
+        s.from_object = Some("status".into());
+        assert_eq!(reconcile_step(&s, &snap), StepDecision::Execute);
+    }
+
+    #[test]
+    fn rename_is_skipped_when_neither_name_exists() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "id", facts(false, false));
+
+        let mut s = step(MigrationOperation::RenameColumn, Some("orders"), "state");
+        s.from_object = Some("status".into());
+        assert!(skipped(reconcile_step(&s, &snap)));
+    }
+
+    #[test]
+    fn nullability_and_default_steps_respect_the_current_column_state() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "not_null_col", facts(false, false));
+        snap.add_column("app", "orders", "nullable_col", facts(true, true));
+
+        assert!(skipped(reconcile_step(
+            &step(
+                MigrationOperation::SetNotNull,
+                Some("orders"),
+                "not_null_col"
+            ),
+            &snap
+        )));
+        assert_eq!(
+            reconcile_step(
+                &step(
+                    MigrationOperation::SetNotNull,
+                    Some("orders"),
+                    "nullable_col"
+                ),
+                &snap
+            ),
+            StepDecision::Execute
+        );
+        assert!(skipped(reconcile_step(
+            &step(
+                MigrationOperation::DropNotNull,
+                Some("orders"),
+                "nullable_col"
+            ),
+            &snap
+        )));
+        assert!(skipped(reconcile_step(
+            &step(
+                MigrationOperation::DropDefault,
+                Some("orders"),
+                "not_null_col"
+            ),
+            &snap
+        )));
+        assert_eq!(
+            reconcile_step(
+                &step(
+                    MigrationOperation::DropDefault,
+                    Some("orders"),
+                    "nullable_col"
+                ),
+                &snap
+            ),
+            StepDecision::Execute
+        );
+    }
+
+    #[test]
+    fn column_steps_are_skipped_when_the_column_is_gone_from_a_known_table() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "id", facts(false, false));
+
+        for op in [
+            MigrationOperation::AlterColumnType,
+            MigrationOperation::SetDefault,
+            MigrationOperation::SetNotNull,
+            MigrationOperation::BackfillNulls,
+        ] {
+            assert!(
+                skipped(reconcile_step(&step(op, Some("orders"), "dropped"), &snap)),
+                "expected a skip for a column that no longer exists"
+            );
+        }
+    }
+
+    #[test]
+    fn index_and_foreign_key_steps_are_skipped_when_the_object_exists() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "user_id", facts(true, false));
+        snap.add_index("app", "orders_user_idx");
+        snap.add_constraint("app", "orders", "fk_orders_user");
+
+        let mut idx = step(
+            MigrationOperation::CreateIndex,
+            Some("orders"),
+            "orders_user_idx",
+        );
+        idx.object_type = "index".into();
+        assert!(skipped(reconcile_step(&idx, &snap)));
+
+        let mut fk = step(
+            MigrationOperation::AddForeignKey,
+            Some("orders"),
+            "fk_orders_user",
+        );
+        fk.object_type = "foreign_key".into();
+        assert!(skipped(reconcile_step(&fk, &snap)));
+    }
+
+    #[test]
+    fn index_steps_run_when_the_dialect_cannot_report_indexes() {
+        let mut snap = snapshot();
+        snap.indexes_known = false;
+        snap.add_column("app", "orders", "user_id", facts(true, false));
+
+        let s = step(
+            MigrationOperation::CreateIndex,
+            Some("orders"),
+            "orders_user_idx",
+        );
+        assert_eq!(reconcile_step(&s, &snap), StepDecision::Execute);
+    }
+
+    #[test]
+    fn executed_steps_are_folded_into_the_snapshot() {
+        // Later steps must see what earlier ones did, or a plan that adds a column and then
+        // constrains it would skip the second half.
+        let mut snap = snapshot();
+        snap.add_table("app", "orders");
+
+        let mut add = step(MigrationOperation::AddColumn, Some("orders"), "note");
+        add.ddl = Some(r#"ALTER TABLE "app"."orders" ADD COLUMN "note" TEXT NOT NULL"#.into());
+        apply_step_to_snapshot(&add, &mut snap);
+        assert!(snap.has_column("app", "orders", "note"));
+
+        // Re-running the same step is now a no-op.
+        assert!(skipped(reconcile_step(&add, &snap)));
+
+        // …and the recorded nullability matches the DDL that was executed.
+        assert!(skipped(reconcile_step(
+            &step(MigrationOperation::SetNotNull, Some("orders"), "note"),
+            &snap
+        )));
+    }
+
+    #[test]
+    fn drops_and_enum_steps_are_never_skipped() {
+        let mut snap = snapshot();
+        snap.add_column("app", "orders", "note", facts(true, false));
+
+        for op in [
+            MigrationOperation::DropIndex,
+            MigrationOperation::DropForeignKey,
+            MigrationOperation::CreateEnum,
+            MigrationOperation::AddEnumValue,
+        ] {
+            assert_eq!(
+                reconcile_step(&step(op, Some("orders"), "note"), &snap),
+                StepDecision::Execute
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_idempotent_ddl_tests {
+    use super::*;
+    use crate::db::postgres::PostgresDialect;
+
+    #[test]
+    fn add_column_carries_an_if_not_exists_guard() {
+        let ddl = add_column_ddl(&PostgresDialect, r#""app"."orders""#, r#""note" TEXT"#);
+        assert_eq!(
+            ddl,
+            r#"ALTER TABLE "app"."orders" ADD COLUMN IF NOT EXISTS "note" TEXT"#
+        );
+    }
+
+    #[test]
+    fn duplicate_object_sqlstates_are_recognised() {
+        let d = PostgresDialect;
+        // duplicate_column — what "column already exists" reports.
+        assert!(d.is_duplicate_object_code("42701"));
+        // duplicate_table / duplicate_object.
+        assert!(d.is_duplicate_object_code("42P07"));
+        assert!(d.is_duplicate_object_code("42710"));
+        // undefined_column must still be a real failure.
+        assert!(!d.is_duplicate_object_code("42703"));
     }
 }

@@ -207,4 +207,31 @@ impl Dialect for SqliteDialect {
     fn set_tenant_session_sql(&self, _tenant_id: &str) -> Option<String> {
         None
     }
+
+    // ── Idempotent DDL / introspection ────────────────────────────────────────
+
+    fn is_duplicate_object_code(&self, _code: &str) -> bool {
+        // SQLite reports every error as SQLITE_ERROR (code "1"); the executor falls back to
+        // message matching ("duplicate column name", "already exists") for this dialect.
+        false
+    }
+
+    fn introspect_columns_sql(&self, _schema: &str) -> String {
+        // SQLite has no schemas — every table lives in the connected database file.
+        "SELECT m.name, p.name, p.type, \
+                CASE WHEN p.\"notnull\" = 0 THEN 'YES' ELSE 'NO' END, \
+                CASE WHEN p.dflt_value IS NULL THEN 'NO' ELSE 'YES' END \
+         FROM sqlite_master m JOIN pragma_table_info(m.name) p \
+         WHERE m.type = 'table'"
+            .to_string()
+    }
+
+    fn introspect_indexes_sql(&self, _schema: &str) -> Option<String> {
+        Some("SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL".to_string())
+    }
+
+    fn introspect_constraints_sql(&self, _schema: &str) -> Option<String> {
+        // SQLite does not expose constraint names in a queryable catalog.
+        None
+    }
 }

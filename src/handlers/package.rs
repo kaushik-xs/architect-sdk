@@ -70,6 +70,9 @@ struct TenantMigrationOutcome {
     /// "applied" | "applied_with_warnings" | "failed"
     status: String,
     warnings: Vec<String>,
+    /// Steps whose effect was already present in this database and were not re-run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -268,6 +271,7 @@ async fn apply_ddl_to_pool(
                 target,
                 from_version,
                 to_version,
+                dialect,
             )
             .await
             {
@@ -285,6 +289,7 @@ async fn apply_ddl_to_pool(
                                 strategy: strategy.to_string(),
                                 status: "failed".to_string(),
                                 warnings: result.warnings,
+                                skipped: result.skips,
                                 error: Some(format!("RLS reconciliation failed: {}", e)),
                             };
                         }
@@ -298,6 +303,7 @@ async fn apply_ddl_to_pool(
                             "applied".to_string()
                         },
                         warnings: result.warnings,
+                        skipped: result.skips,
                         error: None,
                     }
                 }
@@ -308,6 +314,7 @@ async fn apply_ddl_to_pool(
                         strategy: strategy.to_string(),
                         status: "failed".to_string(),
                         warnings: vec![],
+                        skipped: vec![],
                         error: Some(e.to_string()),
                     }
                 }
@@ -330,6 +337,7 @@ async fn apply_ddl_to_pool(
                     strategy: strategy.to_string(),
                     status: "applied".to_string(),
                     warnings: vec![],
+                    skipped: vec![],
                     error: None,
                 },
                 Err(e) => {
@@ -339,6 +347,7 @@ async fn apply_ddl_to_pool(
                         strategy: strategy.to_string(),
                         status: "failed".to_string(),
                         warnings: vec![],
+                        skipped: vec![],
                         error: Some(e.to_string()),
                     }
                 }
@@ -417,6 +426,7 @@ async fn broadcast_ddl(
                         strategy: "n/a".to_string(),
                         status: "failed".to_string(),
                         warnings: vec![],
+                        skipped: vec![],
                         error: Some(format!("migration plan error: {}", e)),
                     }];
                 }
@@ -461,6 +471,7 @@ async fn broadcast_ddl(
                     strategy: "rls".to_string(),
                     status: "failed".to_string(),
                     warnings: vec![],
+                    skipped: vec![],
                     error: Some(format!("connection failed: {}", e)),
                 });
                 continue;
@@ -495,6 +506,7 @@ async fn broadcast_ddl(
                     strategy: "database".to_string(),
                     status: "failed".to_string(),
                     warnings: vec![],
+                    skipped: vec![],
                     error: Some(format!("connection failed: {}", e)),
                 });
                 continue;
@@ -1318,6 +1330,7 @@ pub async fn apply_migration_handler(
         tenant_id,
         row.from_version.as_deref(),
         &row.to_version,
+        state.dialect.as_ref(),
     )
     .await?;
 
@@ -1367,7 +1380,9 @@ pub async fn apply_migration_handler(
                 "to_version": row.to_version,
                 "steps_applied": result.applied,
                 "steps_warned": result.warned,
+                "steps_skipped": result.skipped,
                 "warnings": result.warnings,
+                "skipped": result.skips,
             }),
             meta: None,
         }),

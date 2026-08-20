@@ -11,10 +11,12 @@
 //! 5. Add to Cargo.toml features.
 
 pub mod dialect;
+pub mod introspect;
 pub mod pool;
 pub mod types;
 
 pub use dialect::Dialect;
+pub use introspect::{introspect, ColumnFacts, DbSnapshot};
 pub use types::{
     active_cast_name, parse_canonical, type_category, type_category_from_cast, CanonicalType,
     TypeCategory, TypeSupport,

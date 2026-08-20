@@ -141,4 +141,56 @@ pub trait Dialect: Send + Sync + 'static {
     /// SQL statement that sets a session-local tenant identifier before a query.
     /// Returns `None` when the dialect has no such mechanism.
     fn set_tenant_session_sql(&self, tenant_id: &str) -> Option<String>;
+
+    // ── Idempotent DDL ────────────────────────────────────────────────────────
+
+    /// Whether `ALTER TABLE … ADD COLUMN IF NOT EXISTS` is valid syntax.
+    /// Postgres: true. MySQL/SQLite: false (they need a pre-flight existence check).
+    fn supports_add_column_if_not_exists(&self) -> bool {
+        false
+    }
+
+    /// Whether a database error code (SQLSTATE for Postgres, error number for MySQL) means
+    /// "the object I tried to create already exists" — a migration step that is already applied.
+    fn is_duplicate_object_code(&self, _code: &str) -> bool {
+        false
+    }
+
+    // ── Introspection ─────────────────────────────────────────────────────────
+    //
+    // These queries feed `db::introspect`, which lets the migration executor skip steps whose
+    // effect is already present in the physical database. Every selected value must come back
+    // as text so one decoding path works for all dialects.
+
+    /// One row per column in `schema`:
+    /// `(table_name, column_name, data_type, is_nullable 'YES'/'NO', has_default 'YES'/'NO')`.
+    fn introspect_columns_sql(&self, schema: &str) -> String {
+        format!(
+            "SELECT table_name, column_name, data_type, is_nullable, \
+             CASE WHEN column_default IS NULL THEN 'NO' ELSE 'YES' END \
+             FROM information_schema.columns WHERE table_schema = '{}'",
+            escape_literal(schema)
+        )
+    }
+
+    /// One row per index in `schema`: `(index_name)`. `None` when the dialect cannot report them.
+    fn introspect_indexes_sql(&self, _schema: &str) -> Option<String> {
+        None
+    }
+
+    /// One row per table constraint in `schema`: `(table_name, constraint_name)`.
+    /// `None` when the dialect cannot report them.
+    fn introspect_constraints_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "SELECT table_name, constraint_name FROM information_schema.table_constraints \
+             WHERE constraint_schema = '{}'",
+            escape_literal(schema)
+        ))
+    }
+}
+
+/// Escape a value for inlining into a single-quoted SQL literal.
+/// Introspection queries take schema names from config, never from request input.
+pub fn escape_literal(s: &str) -> String {
+    s.replace('\'', "''")
 }
