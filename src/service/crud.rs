@@ -43,6 +43,19 @@ impl<'a> TenantExecutor<'a> {
 /// child entity, and the list of child bodies to insert under it.
 pub type GraphChild = (IncludeSpec, ResolvedEntity, Vec<HashMap<String, Value>>);
 
+/// Maximum number of items allowed in a single bulk create/update/delete request.
+///
+/// From env `ARCHITECT_BULK_LIMIT` (default 100). A missing, empty, unparseable, or
+/// zero value falls back to the default.
+pub fn bulk_limit() -> usize {
+    const DEFAULT_BULK_LIMIT: usize = 100;
+    std::env::var("ARCHITECT_BULK_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BULK_LIMIT)
+}
+
 pub struct CrudService;
 
 impl CrudService {
@@ -395,11 +408,11 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
-        const BULK_LIMIT: usize = 100;
-        if items.len() > BULK_LIMIT {
+        let bulk_limit = bulk_limit();
+        if items.len() > bulk_limit {
             return Err(AppError::BadRequest(format!(
                 "bulk create limited to {} items",
-                BULK_LIMIT
+                bulk_limit
             )));
         }
         let mut out = Vec::with_capacity(items.len());
@@ -458,11 +471,11 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
-        const BULK_LIMIT: usize = 100;
-        if items.len() > BULK_LIMIT {
+        let bulk_limit = bulk_limit();
+        if items.len() > bulk_limit {
             return Err(AppError::BadRequest(format!(
                 "bulk create limited to {} items",
-                BULK_LIMIT
+                bulk_limit
             )));
         }
         let mut out = Vec::with_capacity(items.len());
@@ -556,11 +569,11 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<Vec<Value>, AppError> {
-        const BULK_LIMIT: usize = 100;
-        if items.len() > BULK_LIMIT {
+        let bulk_limit = bulk_limit();
+        if items.len() > bulk_limit {
             return Err(AppError::BadRequest(format!(
                 "bulk update limited to {} items",
-                BULK_LIMIT
+                bulk_limit
             )));
         }
         let pk = &entity.pk_columns[0];
@@ -624,11 +637,11 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
-        const BULK_LIMIT: usize = 100;
-        if items.len() > BULK_LIMIT {
+        let bulk_limit = bulk_limit();
+        if items.len() > bulk_limit {
             return Err(AppError::BadRequest(format!(
                 "bulk update limited to {} items",
-                BULK_LIMIT
+                bulk_limit
             )));
         }
         let pk = entity.pk_columns[0].clone();
@@ -757,11 +770,11 @@ impl CrudService {
         caller_user_id: Option<&str>,
         dialect: &dyn Dialect,
     ) -> Result<(Vec<Value>, Vec<(usize, AppError)>), AppError> {
-        const BULK_LIMIT: usize = 100;
-        if ids.len() > BULK_LIMIT {
+        let bulk_limit = bulk_limit();
+        if ids.len() > bulk_limit {
             return Err(AppError::BadRequest(format!(
                 "bulk delete limited to {} items",
-                BULK_LIMIT
+                bulk_limit
             )));
         }
         let mut out = Vec::with_capacity(ids.len());
