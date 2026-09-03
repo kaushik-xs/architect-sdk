@@ -47,8 +47,9 @@ pub struct TableConfig {
     pub unique: Vec<Vec<String>>,
     #[serde(default)]
     pub check: Vec<TableCheck>,
-    /// When true, a companion `{table}_audit` table is created and every create/update/delete
-    /// is recorded there with the full row snapshot, action type, timestamp, and actor.
+    /// When true, a companion `{table}_audit` table is created and every
+    /// create/update/delete/archive/unarchive is recorded there with the full row snapshot,
+    /// action type, timestamp, and actor.
     #[serde(default)]
     pub audit_log: bool,
     /// Row-level versioning: when enabled, a `{table}_history` table is created and a snapshot

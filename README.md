@@ -459,7 +459,7 @@ On `POST` (full validation) all `required` fields must be present. On `PATCH` (p
 
 ### 7. Audit Logging
 
-Set `audit_log: true` on any table. The SDK creates a companion `{table}_audit` table and records every INSERT, UPDATE, and DELETE automatically.
+Set `audit_log: true` on any table. The SDK creates a companion `{table}_audit` table and records every INSERT, UPDATE, DELETE, archive, and unarchive automatically.
 
 ```json
 { "id": "t1", "schema_id": "s1", "name": "orders", "audit_log": true }
@@ -467,7 +467,7 @@ Set `audit_log: true` on any table. The SDK creates a companion `{table}_audit` 
 
 Each audit row contains:
 - `audit_id` — UUID primary key
-- `audit_action` — `create`, `update`, or `delete`
+- `audit_action` — `create`, `update`, `delete`, `archive`, or `unarchive`
 - `audit_at` — timestamp of the change
 - `audit_by` — value of `X-User-ID` header
 - `changed_fields` — JSON delta (only columns that changed)

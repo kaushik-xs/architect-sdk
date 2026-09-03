@@ -4383,6 +4383,7 @@ pub async fn archive(
         archive_field,
         &id,
         schema_override,
+        user_id_opt.as_deref(),
         state.dialect.as_ref(),
     )
     .await?
@@ -4479,6 +4480,7 @@ pub async fn unarchive(
         archive_field,
         &id,
         schema_override,
+        user_id_opt.as_deref(),
         state.dialect.as_ref(),
     )
     .await?
@@ -4577,6 +4579,7 @@ pub async fn unarchive_package(
         archive_field,
         &id,
         schema_override,
+        user_id_opt.as_deref(),
         state.dialect.as_ref(),
     )
     .await?
@@ -4676,6 +4679,7 @@ pub async fn archive_package(
         archive_field,
         &id,
         schema_override,
+        user_id_opt.as_deref(),
         state.dialect.as_ref(),
     )
     .await?
