@@ -380,9 +380,12 @@ impl CrudService {
         dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
         let q = archive(entity, archive_field, schema_override, dialect);
-        let result =
-            Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
-                .await?;
+        let result = Self::execute_returning_one_with_params_exec(
+            executor,
+            &q.sql,
+            std::slice::from_ref(id),
+        )
+        .await?;
         if entity.audit_log {
             if let Some(ref row) = result {
                 Self::insert_audit(
@@ -414,9 +417,12 @@ impl CrudService {
         dialect: &dyn Dialect,
     ) -> Result<Option<Value>, AppError> {
         let q = unarchive(entity, archive_field, schema_override, dialect);
-        let result =
-            Self::execute_returning_one_with_params_exec(executor, &q.sql, std::slice::from_ref(id))
-                .await?;
+        let result = Self::execute_returning_one_with_params_exec(
+            executor,
+            &q.sql,
+            std::slice::from_ref(id),
+        )
+        .await?;
         if entity.audit_log {
             if let Some(ref row) = result {
                 Self::insert_audit(
