@@ -1004,6 +1004,8 @@ pub fn delete(
 pub fn unarchive(
     entity: &ResolvedEntity,
     archive_field: &str,
+    id: &Value,
+    caller_user_id: Option<&str>,
     schema_override: Option<&str>,
     dialect: &dyn Dialect,
 ) -> QueryBuf {
@@ -1011,8 +1013,25 @@ pub fn unarchive(
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let ph = pk_placeholder(entity, 1, dialect);
-    q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    let mut sets = vec![format!("{} = NULL", quoted(archive_field))];
+    // Stamp updated_at / updated_by like a normal update, when those columns exist.
+    if entity.columns.iter().any(|c| c.name == "updated_at") {
+        sets.push(format!("{} = {}", quoted("updated_at"), dialect.now_fn()));
+    }
+    if let Some(uid) = caller_user_id {
+        if entity.columns.iter().any(|c| c.name == "updated_by") {
+            let param_num = q.push_param(Value::String(uid.to_string()));
+            sets.push(format!(
+                "{} = {}",
+                quoted("updated_by"),
+                dialect.placeholder(param_num as usize)
+            ));
+        }
+    }
+    // id is bound last so its placeholder position matches its text position (WHERE after SET).
+    let id_param = q.params.len() + 1;
+    q.params.push(id.clone());
+    let ph = pk_placeholder(entity, id_param, dialect);
     let col_list = select_column_list(entity);
     let ret = dialect.returning_clause(&col_list);
     let suffix = if ret.is_empty() {
@@ -1021,9 +1040,9 @@ pub fn unarchive(
         format!(" {}", ret)
     };
     q.sql = format!(
-        "UPDATE {} SET {} = NULL WHERE {} = {} AND {} IS NOT NULL{}",
+        "UPDATE {} SET {} WHERE {} = {} AND {} IS NOT NULL{}",
         table,
-        quoted(archive_field),
+        sets.join(", "),
         quoted(pk),
         ph,
         quoted(archive_field),
@@ -1619,6 +1638,8 @@ mod versioning_tests {
 pub fn archive(
     entity: &ResolvedEntity,
     archive_field: &str,
+    id: &Value,
+    caller_user_id: Option<&str>,
     schema_override: Option<&str>,
     dialect: &dyn Dialect,
 ) -> QueryBuf {
@@ -1626,8 +1647,25 @@ pub fn archive(
     let schema = resolve_schema(entity, schema_override);
     let table = qualified_table(schema, &entity.table_name);
     let pk = &entity.pk_columns[0];
-    let ph = pk_placeholder(entity, 1, dialect);
-    q.params.push(Value::Null); // placeholder; caller passes real id via execute_returning_one_with_params_exec
+    let mut sets = vec![format!("{} = {}", quoted(archive_field), dialect.now_fn())];
+    // Stamp updated_at / updated_by like a normal update, when those columns exist.
+    if entity.columns.iter().any(|c| c.name == "updated_at") {
+        sets.push(format!("{} = {}", quoted("updated_at"), dialect.now_fn()));
+    }
+    if let Some(uid) = caller_user_id {
+        if entity.columns.iter().any(|c| c.name == "updated_by") {
+            let param_num = q.push_param(Value::String(uid.to_string()));
+            sets.push(format!(
+                "{} = {}",
+                quoted("updated_by"),
+                dialect.placeholder(param_num as usize)
+            ));
+        }
+    }
+    // id is bound last so its placeholder position matches its text position (WHERE after SET).
+    let id_param = q.params.len() + 1;
+    q.params.push(id.clone());
+    let ph = pk_placeholder(entity, id_param, dialect);
     let col_list = select_column_list(entity);
     let ret = dialect.returning_clause(&col_list);
     let suffix = if ret.is_empty() {
@@ -1636,10 +1674,9 @@ pub fn archive(
         format!(" {}", ret)
     };
     q.sql = format!(
-        "UPDATE {} SET {} = {} WHERE {} = {} AND {} IS NULL{}",
+        "UPDATE {} SET {} WHERE {} = {} AND {} IS NULL{}",
         table,
-        quoted(archive_field),
-        dialect.now_fn(),
+        sets.join(", "),
         quoted(pk),
         ph,
         quoted(archive_field),
