@@ -451,6 +451,8 @@ impl CrudService {
     /// Bulk create in a transaction (when using pool) or on the same connection (when using conn). Returns vec of created rows.
     /// When rls_tenant_id is Some (RLS strategy), tenant_id column is set automatically on each row.
     /// When caller_user_id is Some, created_by is set on each row.
+    /// Each row is created via [`Self::create`] on the shared transaction/connection, so audit_log
+    /// rows are honored exactly as for single creates.
     pub async fn bulk_create<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -472,38 +474,34 @@ impl CrudService {
             TenantExecutorInner::Pool(pool) => {
                 let mut tx = pool.begin().await?;
                 for body in items {
-                    let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(
+                    let mut ex = TenantExecutor::conn(&mut tx, dialect);
+                    let row = Self::create(
+                        &mut ex,
                         entity,
                         body,
-                        include_pk,
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
                         dialect,
-                    );
-                    let row = Self::execute_returning_one_tx(&mut tx, &q)
-                        .await?
-                        .unwrap_or(Value::Null);
+                    )
+                    .await?;
                     out.push(row);
                 }
                 tx.commit().await?;
             }
             TenantExecutorInner::Conn(ref mut conn) => {
                 for body in items {
-                    let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(
+                    let mut ex = TenantExecutor::conn(conn, dialect);
+                    let row = Self::create(
+                        &mut ex,
                         entity,
                         body,
-                        include_pk,
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
                         dialect,
-                    );
-                    let row = Self::execute_returning_one_conn(conn, &q)
-                        .await?
-                        .unwrap_or(Value::Null);
+                    )
+                    .await?;
                     out.push(row);
                 }
             }
@@ -514,6 +512,8 @@ impl CrudService {
     /// Like `bulk_create` but uses savepoints to isolate per-row DB errors.
     /// Returns `(successful_rows, row_errors)`. If any errors occur the transaction is
     /// rolled back and successful_rows will be empty — call site decides how to surface errors.
+    /// Each row is created via [`Self::create`] on the shared transaction/connection, so audit_log
+    /// rows are honored exactly as for single creates (and roll back with their row on error).
     pub async fn bulk_create_collecting<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -540,22 +540,23 @@ impl CrudService {
                     sqlx::query(&format!("SAVEPOINT {}", sp))
                         .execute(&mut *tx)
                         .await?;
-                    let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(
+                    let mut ex = TenantExecutor::conn(&mut tx, dialect);
+                    match Self::create(
+                        &mut ex,
                         entity,
                         body,
-                        include_pk,
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
                         dialect,
-                    );
-                    match Self::execute_returning_one_tx(&mut tx, &q).await {
+                    )
+                    .await
+                    {
                         Ok(row) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut *tx)
                                 .await?;
-                            out.push(row.unwrap_or(Value::Null));
+                            out.push(row);
                         }
                         Err(e) => {
                             sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
@@ -578,22 +579,23 @@ impl CrudService {
                     sqlx::query(&format!("SAVEPOINT {}", sp))
                         .execute(&mut **conn)
                         .await?;
-                    let include_pk = body.contains_key(&entity.pk_columns[0]);
-                    let q = insert(
+                    let mut ex = TenantExecutor::conn(conn, dialect);
+                    match Self::create(
+                        &mut ex,
                         entity,
                         body,
-                        include_pk,
                         schema_override,
                         rls_tenant_id,
                         caller_user_id,
                         dialect,
-                    );
-                    match Self::execute_returning_one_conn(conn, &q).await {
+                    )
+                    .await
+                    {
                         Ok(row) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut **conn)
                                 .await?;
-                            out.push(row.unwrap_or(Value::Null));
+                            out.push(row);
                         }
                         Err(e) => {
                             sqlx::query(&format!("ROLLBACK TO SAVEPOINT {}", sp))
@@ -613,6 +615,8 @@ impl CrudService {
 
     /// Bulk update in a transaction (when using pool) or on the same connection (when using conn). Each item must have id. Returns vec of updated rows.
     /// When caller_user_id is Some, updated_by is set on each row.
+    /// Each row is updated via [`Self::update`] on the shared transaction/connection, so audit_log
+    /// rows and versioning snapshots are honored exactly as for single updates.
     pub async fn bulk_update<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -639,15 +643,18 @@ impl CrudService {
                     })?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(
+                    let mut ex = TenantExecutor::conn(&mut tx, dialect);
+                    if let Some(row) = Self::update(
+                        &mut ex,
                         entity,
                         id,
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
                         dialect,
-                    );
-                    if let Some(row) = Self::execute_returning_one_tx(&mut tx, &q).await? {
+                    )
+                    .await?
+                    {
                         out.push(row);
                     }
                 }
@@ -660,15 +667,18 @@ impl CrudService {
                     })?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(pk);
-                    let q = update(
+                    let mut ex = TenantExecutor::conn(conn, dialect);
+                    if let Some(row) = Self::update(
+                        &mut ex,
                         entity,
                         id,
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
                         dialect,
-                    );
-                    if let Some(row) = Self::execute_returning_one_conn(conn, &q).await? {
+                    )
+                    .await?
+                    {
                         out.push(row);
                     }
                 }
@@ -681,6 +691,9 @@ impl CrudService {
     /// Missing pk on an item is recorded as a row error rather than aborting early.
     /// Returns `(successful_rows, row_errors)`. If any errors occur the transaction is
     /// rolled back and successful_rows will be empty.
+    /// Each row is updated via [`Self::update`] on the shared transaction/connection, so audit_log
+    /// rows and versioning snapshots are honored exactly as for single updates (and roll back with
+    /// their row on error).
     pub async fn bulk_update_collecting<'a>(
         executor: &mut TenantExecutor<'a>,
         entity: &ResolvedEntity,
@@ -719,15 +732,18 @@ impl CrudService {
                         .await?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(&pk);
-                    let q = update(
+                    let mut ex = TenantExecutor::conn(&mut tx, dialect);
+                    match Self::update(
+                        &mut ex,
                         entity,
                         &id,
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
                         dialect,
-                    );
-                    match Self::execute_returning_one_tx(&mut tx, &q).await {
+                    )
+                    .await
+                    {
                         Ok(Some(row)) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut *tx)
@@ -772,15 +788,18 @@ impl CrudService {
                         .await?;
                     let mut body_without_pk = body.clone();
                     body_without_pk.remove(&pk);
-                    let q = update(
+                    let mut ex = TenantExecutor::conn(conn, dialect);
+                    match Self::update(
+                        &mut ex,
                         entity,
                         &id,
                         &body_without_pk,
                         schema_override,
                         caller_user_id,
                         dialect,
-                    );
-                    match Self::execute_returning_one_conn(conn, &q).await {
+                    )
+                    .await
+                    {
                         Ok(Some(row)) => {
                             sqlx::query(&format!("RELEASE SAVEPOINT {}", sp))
                                 .execute(&mut **conn)
@@ -1019,32 +1038,6 @@ impl CrudService {
             TenantExecutorInner::Pool(pool) => query.fetch_optional(pool).await?,
             TenantExecutorInner::Conn(ref mut conn) => query.fetch_optional(&mut **conn).await?,
         };
-        Ok(row.map(|r| row_to_json(&r)))
-    }
-
-    async fn execute_returning_one_conn(
-        conn: &mut Connection,
-        q: &QueryBuf,
-    ) -> Result<Option<Value>, AppError> {
-        tracing::debug!(sql = %q.sql, params = ?q.params, "query (conn)");
-        let mut query = sqlx::query(&q.sql);
-        for p in &q.params {
-            query = query.bind(Self::to_sqlx_param(p));
-        }
-        let row = query.fetch_optional(conn).await?;
-        Ok(row.map(|r| row_to_json(&r)))
-    }
-
-    async fn execute_returning_one_tx(
-        tx: &mut Connection,
-        q: &QueryBuf,
-    ) -> Result<Option<Value>, AppError> {
-        tracing::debug!(sql = %q.sql, params = ?q.params, "query (tx)");
-        let mut query = sqlx::query(&q.sql);
-        for p in &q.params {
-            query = query.bind(Self::to_sqlx_param(p));
-        }
-        let row = query.fetch_optional(&mut *tx).await?;
         Ok(row.map(|r| row_to_json(&r)))
     }
 
