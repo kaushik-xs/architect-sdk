@@ -167,9 +167,11 @@ fn trigger_matches(
 /// - `lifecycle`: `"create"` | `"update"` | `"delete"`
 /// - `raw_row`: snake_case row used for condition evaluation (post-operation state)
 /// - `api_row`: camelCase row sent as the event context (sensitive columns already stripped)
-/// - `pre_update_row`: snake_case row fetched from DB *before* the update; pass `Some` for the
-///   "update" lifecycle when `changed_to` conditions are present so transitions are detected
-///   accurately. `None` for create/delete or when no `changed_to` conditions exist.
+/// - `pre_update_row`: snake_case row fetched from DB *before* the update. Used both to detect
+///   genuine `changed_to` transitions and, for the "update" lifecycle, to emit a `previous`
+///   snapshot in the event context (sensitive columns stripped, camelCased — same shape as
+///   `entity`). Pass `Some` for updates to get accurate transitions and old→new deltas; `None`
+///   for create/delete or when no pre-read was performed.
 ///
 /// Returns immediately; the HTTP publish happens after the response is sent.
 pub fn spawn_events(
@@ -262,6 +264,19 @@ pub fn spawn_events_with(
 
     let package_id = entity.package_id.clone();
     let table_name = entity.table_name.clone();
+    let sensitive_columns = entity.sensitive_columns.clone();
+
+    // Old→new deltas: only the "update" lifecycle carries a `previous` snapshot, and only when the
+    // handler supplied the pre-update row. Process it exactly like `entity` (sensitive columns
+    // stripped, keys camelCased) so both sides of the delta are shaped identically.
+    let previous = match (lifecycle, pre_update_row) {
+        ("update", Some(mut old)) => {
+            crate::handlers::entity::strip_sensitive_columns(&mut old, &sensitive_columns);
+            crate::case::value_keys_to_camel_case(&mut old);
+            Some(old)
+        }
+        _ => None,
+    };
 
     tokio::spawn(async move {
         // Cache expansions across triggers: several triggers on one entity usually name the same
@@ -303,10 +318,14 @@ pub fn spawn_events_with(
                 }
             };
 
-            let context = serde_json::json!({
+            let mut context = serde_json::json!({
                 "entity": entity_value,
                 "operation": lifecycle,
             });
+            // Present only on updates; carries the pre-update state for old→new comparison.
+            if let Some(prev) = &previous {
+                context["previous"] = prev.clone();
+            }
             client.publish(&tenant_id, &event_type, context).await;
         }
     });

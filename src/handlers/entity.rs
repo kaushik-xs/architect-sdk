@@ -2374,13 +2374,15 @@ pub async fn update(
 
     // Pre-fetch the current DB row when needed:
     //   • entity has asset columns + storage configured → hard-delete dropped files after update
-    //   • event triggers with changed_to conditions → detect genuine field transitions
+    //   • update/archive event triggers → emit the `previous` snapshot in the event context and
+    //     detect genuine `changed_to` field transitions
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
     let needs_pre_read = (entity_has_assets && state.storage.is_some())
         || (state.event_client.is_some()
-            && entity.events.iter().any(|e| {
-                e.on == "update" && e.condition.as_ref().is_some_and(|c| c.changed_to.is_some())
-            }));
+            && entity
+                .events
+                .iter()
+                .any(|e| e.on == "update" || e.on == "archive"));
     let pre_update_row = if needs_pre_read {
         CrudService::read(
             &mut executor,
@@ -3749,9 +3751,16 @@ pub async fn update_package(
         validate_extensible_fields(&body, &entity, &reg, ValidateMode::Partial)?;
     }
 
-    // Pre-read for asset hard-delete on PATCH.
+    // Pre-read for asset hard-delete on PATCH, and to emit the `previous` snapshot / detect
+    // `changed_to` transitions for update & archive event triggers.
     let entity_has_assets = entity.columns.iter().any(|c| c.is_asset);
-    let pre_update_row = if entity_has_assets && state.storage.is_some() {
+    let needs_pre_read = (entity_has_assets && state.storage.is_some())
+        || (state.event_client.is_some()
+            && entity
+                .events
+                .iter()
+                .any(|e| e.on == "update" || e.on == "archive"));
+    let pre_update_row = if needs_pre_read {
         CrudService::read(
             &mut executor,
             &entity,
@@ -3800,7 +3809,7 @@ pub async fn update_package(
             raw_row,
             row.clone(),
             tenant_id_str,
-            None,
+            pre_update_row,
             include_ctx,
         );
     }
