@@ -1097,6 +1097,7 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         ("relationships", "Relationship definitions"),
         ("api_entities", "API entity definitions"),
         ("kv_stores", "KV store definitions"),
+        ("reports", "Report definitions"),
     ];
     for (kind, description) in config_kinds {
         let path = format!("{}/config/{}", base, kind);
@@ -1141,6 +1142,153 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
     builder
 }
 
+/// Report id path parameter (the report config `id`).
+fn report_id_param() -> Parameter {
+    ParameterBuilder::new()
+        .name("reportId")
+        .parameter_in(ParameterIn::Path)
+        .required(Required::True)
+        .description(Some("Report id (the report config `id`)."))
+        .schema(Some(RefOr::T(Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .into(),
+        ))))
+        .build()
+}
+
+/// X-User-ID header (optional; required by the run endpoint only when authrs is enabled).
+fn x_user_id_header() -> Parameter {
+    ParameterBuilder::new()
+        .name("X-User-ID")
+        .parameter_in(ParameterIn::Header)
+        .required(Required::False)
+        .description(Some(
+            "User id; required when authrs permission checks are enabled on the service.",
+        ))
+        .schema(Some(RefOr::T(Schema::Object(
+            utoipa::openapi::schema::ObjectBuilder::new()
+                .schema_type(SchemaType::new(Type::String))
+                .into(),
+        ))))
+        .build()
+}
+
+/// Report APIs: data-plane run/list/get plus config-plane by-id upsert/delete.
+/// (`GET`/`POST /config/reports` for the whole set are emitted by `add_config_paths`.)
+fn add_report_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
+    // GET /reports — list report metadata (never the SQL).
+    let list_op = OperationBuilder::new()
+        .summary(Some("List reports".to_string()))
+        .description(Some(
+            "List available report metadata (id, name, params). X-Tenant-ID required.".to_string(),
+        ))
+        .operation_id(Some("reports_list".to_string()))
+        .parameters(Some(vec![x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    builder = builder.path(
+        format!("{}/reports", base),
+        PathItemBuilder::new()
+            .operation(HttpMethod::Get, list_op)
+            .build(),
+    );
+
+    // GET /reports/{reportId} — one report's metadata and parameter schema.
+    let get_op = OperationBuilder::new()
+        .summary(Some("Get report".to_string()))
+        .description(Some(
+            "Get one report's metadata and parameter schema. X-Tenant-ID required.".to_string(),
+        ))
+        .operation_id(Some("reports_get".to_string()))
+        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    builder = builder.path(
+        format!("{}/reports/{{reportId}}", base),
+        PathItemBuilder::new()
+            .operation(HttpMethod::Get, get_op)
+            .build(),
+    );
+
+    // POST /reports/{reportId}/run — execute the report read-only.
+    let run_body = RequestBodyBuilder::new()
+        .description(Some(
+            "Runtime parameters: { \"params\": { ... } }.".to_string(),
+        ))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(json_object_schema()))),
+        )
+        .required(Some(Required::False))
+        .build();
+    let run_op = OperationBuilder::new()
+        .summary(Some("Run report".to_string()))
+        .description(Some(
+            "Execute a report read-only and return its rows. Authorized per-run via authrs. \
+             X-Tenant-ID required; X-User-ID required when authrs is enabled."
+                .to_string(),
+        ))
+        .operation_id(Some("reports_run".to_string()))
+        .parameters(Some(vec![
+            report_id_param(),
+            x_tenant_id_header(),
+            x_user_id_header(),
+        ]))
+        .request_body(Some(run_body))
+        .responses(default_responses().build())
+        .build();
+    builder = builder.path(
+        format!("{}/reports/{{reportId}}/run", base),
+        PathItemBuilder::new()
+            .operation(HttpMethod::Post, run_op)
+            .build(),
+    );
+
+    // PUT / DELETE /config/reports/{reportId} — by-id upsert/delete (Platform Admin only).
+    let put_body = RequestBodyBuilder::new()
+        .description(Some(
+            "A single report definition (ReportConfig). The path id is authoritative.".to_string(),
+        ))
+        .content(
+            "application/json",
+            Content::new(Some(RefOr::T(json_object_schema()))),
+        )
+        .required(Some(Required::True))
+        .build();
+    let put_op = OperationBuilder::new()
+        .summary(Some("Upsert report by id".to_string()))
+        .description(Some(
+            "Create or replace one standalone report by id (read-merge-write). \
+             Restricted to the Platform Admin tenant."
+                .to_string(),
+        ))
+        .operation_id(Some("config_put_report".to_string()))
+        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .request_body(Some(put_body))
+        .responses(default_responses().build())
+        .build();
+    let delete_op = OperationBuilder::new()
+        .summary(Some("Delete report by id".to_string()))
+        .description(Some(
+            "Delete one standalone report by id. Restricted to the Platform Admin tenant."
+                .to_string(),
+        ))
+        .operation_id(Some("config_delete_report".to_string()))
+        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .responses(default_responses().build())
+        .build();
+    builder = builder.path(
+        format!("{}/config/reports/{{reportId}}", base),
+        PathItemBuilder::new()
+            .operation(HttpMethod::Put, put_op)
+            .operation(HttpMethod::Delete, delete_op)
+            .build(),
+    );
+
+    builder
+}
+
 /// Build full OpenAPI spec for entity APIs: default model paths plus package-scoped paths
 /// with concrete package ids, plus KV paths with {namespace}/{key} per package.
 pub fn build_spec(
@@ -1152,6 +1300,7 @@ pub fn build_spec(
     let server = build_server();
     let mut builder = PathsBuilder::new();
     builder = add_config_paths(builder, base_path);
+    builder = add_report_paths(builder, base_path);
     builder = add_entity_paths(builder, base_path, default_model, false, None);
     for (package_id, model) in package_models {
         if !model.entities.is_empty() {
@@ -1235,6 +1384,27 @@ mod tests {
             mcp: None,
             extensible_columns,
         }
+    }
+
+    #[test]
+    fn spec_lists_report_paths() {
+        let model = ResolvedModel {
+            entities: vec![],
+            entity_by_path: HashMap::new(),
+            reports: HashMap::new(),
+        };
+        let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
+        let json = serde_json::to_string(&spec).expect("serialize spec");
+
+        // Data-plane report APIs.
+        assert!(json.contains("/api/v1/reports"));
+        assert!(json.contains("/api/v1/reports/{reportId}"));
+        assert!(json.contains("/api/v1/reports/{reportId}/run"));
+        // Config-plane report APIs (whole-set + by-id).
+        assert!(json.contains("/api/v1/config/reports"));
+        assert!(json.contains("/api/v1/config/reports/{reportId}"));
+        assert!(json.contains("reports_run"));
+        assert!(json.contains("config_put_report"));
     }
 
     #[test]
