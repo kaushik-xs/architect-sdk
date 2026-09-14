@@ -2,6 +2,7 @@
 
 use crate::config::resolved::{
     ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel,
+    ResolvedReport,
 };
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
@@ -223,10 +224,198 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         entities.push(ae);
     }
 
+    let mut reports = HashMap::new();
+    for r in &config.reports {
+        let resolved = compile_report(r)?;
+        if reports.insert(resolved.id.clone(), resolved).is_some() {
+            return Err(ConfigError::Validation(format!(
+                "duplicate report id: {}",
+                r.id
+            )));
+        }
+    }
+
     Ok(ResolvedModel {
         entities,
         entity_by_path,
+        reports,
     })
+}
+
+/// Translate a report's named-parameter SQL (`:from`, `:to`) into positional placeholders
+/// (`$1`, `$2`) and build the runtime lookup tables. Repeated named params reuse a single
+/// placeholder. String literals, quoted identifiers, and `::type` casts are skipped so they are
+/// never mistaken for a parameter.
+pub fn compile_report(cfg: &ReportConfig) -> Result<ResolvedReport, ConfigError> {
+    if cfg.id.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "report id must not be empty".into(),
+        ));
+    }
+    if cfg.sql.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "report '{}' has empty sql",
+            cfg.id
+        )));
+    }
+
+    let (mut sql, param_order) =
+        translate_named_params(&cfg.sql).map_err(ConfigError::Validation)?;
+
+    let mut rules = HashMap::new();
+    let mut defaults = HashMap::new();
+    let mut casts = HashMap::new();
+    for p in &cfg.params {
+        rules.insert(p.name.clone(), p.rule.clone());
+        if let Some(d) = &p.default {
+            defaults.insert(p.name.clone(), d.clone());
+        }
+        if let Some(t) = &p.db_type {
+            casts.insert(p.name.clone(), t.clone());
+        }
+    }
+
+    // Inject declared casts onto the positional placeholders (`$1` → `$1::timestamptz`). All params
+    // bind as TEXT, so numeric/temporal comparisons need a cast; authors may also cast inline.
+    let casts_by_pos: HashMap<usize, String> = param_order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| casts.get(name).map(|c| (i + 1, c.clone())))
+        .collect();
+    if !casts_by_pos.is_empty() {
+        sql = apply_param_casts(&sql, &casts_by_pos);
+    }
+
+    Ok(ResolvedReport {
+        id: cfg.id.clone(),
+        name: cfg.name.clone(),
+        description: cfg.description.clone(),
+        package_id: crate::store::DEFAULT_PACKAGE_ID.to_string(),
+        schemas: cfg.schemas.clone(),
+        sql,
+        param_order,
+        rules,
+        defaults,
+        casts,
+        validate_on_register: cfg.validate_on_register.unwrap_or(true),
+        cache_ttl_secs: cfg.cache_ttl_secs,
+    })
+}
+
+/// Replace `:name` tokens with `$N` positional placeholders, returning the rewritten SQL and the
+/// ordered list of distinct param names. Skips single-quoted strings, double-quoted identifiers,
+/// and the `::` cast operator.
+fn translate_named_params(sql: &str) -> Result<(String, Vec<String>), String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut order: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                // Single-quoted string literal: copy verbatim, honoring '' escapes.
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == '\'' {
+                        if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                            out.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                // Double-quoted identifier: copy verbatim, honoring "" escapes.
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == '"' {
+                        if i + 1 < chars.len() && chars[i + 1] == '"' {
+                            out.push(chars[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            ':' if i + 1 < chars.len() && chars[i + 1] == ':' => {
+                // `::` cast operator — not a named param.
+                out.push(':');
+                out.push(':');
+                i += 2;
+            }
+            ':' if i + 1 < chars.len() && is_param_start(chars[i + 1]) => {
+                let mut j = i + 1;
+                let mut name = String::new();
+                while j < chars.len() && is_param_char(chars[j]) {
+                    name.push(chars[j]);
+                    j += 1;
+                }
+                let pos = match order.iter().position(|n| n == &name) {
+                    Some(p) => p + 1,
+                    None => {
+                        order.push(name.clone());
+                        order.len()
+                    }
+                };
+                out.push_str(&format!("${}", pos));
+                i = j;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok((out, order))
+}
+
+fn is_param_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_param_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Rewrite each `$<n>` placeholder to `$<n>::<cast>` when `casts_by_pos` has an entry for `n`.
+/// Matches the full number so `$1` is never confused with `$10`.
+fn apply_param_casts(sql: &str, casts_by_pos: &HashMap<usize, String>) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            let mut num = String::new();
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                num.push(chars[j]);
+                j += 1;
+            }
+            out.push('$');
+            out.push_str(&num);
+            if let Some(cast) = num.parse::<usize>().ok().and_then(|n| casts_by_pos.get(&n)) {
+                out.push_str("::");
+                out.push_str(cast);
+            }
+            i = j;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn build_includes_for_table(
@@ -551,6 +740,9 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
         package_id,
     )
     .await?;
+    let reports =
+        load_config_table::<ReportConfig>(pool, &qualified_sys_table("_sys_reports"), package_id)
+            .await?;
 
     let config = FullConfig {
         schemas,
@@ -561,6 +753,7 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
         relationships,
         api_entities,
         kv_stores,
+        reports,
     };
     Ok(config)
 }
@@ -590,6 +783,102 @@ where
         out.push(value);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn translates_named_params_to_positional() {
+        let (sql, order) =
+            translate_named_params("SELECT * FROM t WHERE a >= :from AND b < :to").unwrap();
+        assert_eq!(sql, "SELECT * FROM t WHERE a >= $1 AND b < $2");
+        assert_eq!(order, vec!["from".to_string(), "to".to_string()]);
+    }
+
+    #[test]
+    fn repeated_named_param_reuses_placeholder() {
+        let (sql, order) =
+            translate_named_params("SELECT * FROM t WHERE a = :x OR b = :x").unwrap();
+        assert_eq!(sql, "SELECT * FROM t WHERE a = $1 OR b = $1");
+        assert_eq!(order, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn preserves_cast_operator_and_string_literals() {
+        // `::date` is a cast, not a param; ':x' inside a string literal is literal text.
+        let (sql, order) = translate_named_params(
+            "SELECT created_at::date, ':notaparam' AS lit FROM t WHERE d = :day",
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT created_at::date, ':notaparam' AS lit FROM t WHERE d = $1"
+        );
+        assert_eq!(order, vec!["day".to_string()]);
+    }
+
+    #[test]
+    fn injects_declared_casts_onto_placeholders() {
+        let cfg = ReportConfig {
+            id: "r1".into(),
+            name: "R1".into(),
+            description: None,
+            schemas: vec![],
+            sql: "SELECT * FROM t WHERE created_at >= :from AND n > :min".into(),
+            params: vec![
+                ReportParam {
+                    name: "from".into(),
+                    default: None,
+                    db_type: Some("timestamptz".into()),
+                    rule: ValidationRule::default(),
+                },
+                ReportParam {
+                    name: "min".into(),
+                    default: None,
+                    db_type: Some("numeric".into()),
+                    rule: ValidationRule::default(),
+                },
+            ],
+            validate_on_register: None,
+            cache_ttl_secs: None,
+        };
+        let resolved = compile_report(&cfg).unwrap();
+        assert_eq!(
+            resolved.sql,
+            "SELECT * FROM t WHERE created_at >= $1::timestamptz AND n > $2::numeric"
+        );
+        assert_eq!(
+            resolved.param_order,
+            vec!["from".to_string(), "min".to_string()]
+        );
+        assert!(resolved.validate_on_register); // defaults to true
+    }
+
+    #[test]
+    fn cast_injection_distinguishes_1_from_10() {
+        let mut casts = HashMap::new();
+        casts.insert(1usize, "int".to_string());
+        // $10 must not be rewritten when only $1 has a cast.
+        let out = apply_param_casts("$1 $10", &casts);
+        assert_eq!(out, "$1::int $10");
+    }
+
+    #[test]
+    fn empty_sql_is_rejected() {
+        let cfg = ReportConfig {
+            id: "r".into(),
+            name: "R".into(),
+            description: None,
+            schemas: vec![],
+            sql: "   ".into(),
+            params: vec![],
+            validate_on_register: None,
+            cache_ttl_secs: None,
+        };
+        assert!(compile_report(&cfg).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ const CONFIG_TABLES: &[&str] = &[
     "_sys_relationships",
     "_sys_api_entities",
     "_sys_kv_stores",
+    "_sys_reports",
 ];
 
 /// Package id used when config is posted directly (no package install). Ensures (id, package_id) is unique per package.
@@ -232,6 +233,81 @@ pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(),
 
     ensure_migration_tables(pool, dialect).await?;
 
+    Ok(())
+}
+
+/// Reserved `_sys_kv_data` namespace holding cached report results. Not a configured KV store, so
+/// the normal namespace-existence check is bypassed for these rows.
+pub const REPORT_CACHE_NAMESPACE: &str = "__report_cache__";
+
+/// Fetch a cached report envelope (the JSON value stored under the reserved cache namespace), or
+/// `None` when absent. Expiry and request-match verification are the caller's responsibility — the
+/// TTL lives as a field inside the returned envelope, not as a column. The lookup key is a bounded
+/// hash, so a collision (astronomically unlikely) surfaces as an envelope that fails the caller's
+/// verification and is treated as a miss, never a wrong hit.
+pub async fn report_cache_get(
+    pool: &Pool,
+    tenant_id: &str,
+    package_id: &str,
+    cache_key: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let q = qualified_sys_table("_sys_kv_data");
+    let sql = format!(
+        "SELECT value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
+        q
+    );
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
+        .bind(tenant_id)
+        .bind(package_id)
+        .bind(REPORT_CACHE_NAMESPACE)
+        .bind(cache_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::Db)?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Upsert a cached report envelope into `_sys_kv_data` under the reserved cache namespace. Uses the
+/// UPDATE-then-INSERT pattern (like `kv_put`) to stay dialect-portable.
+pub async fn report_cache_put(
+    pool: &Pool,
+    dialect: &dyn Dialect,
+    tenant_id: &str,
+    package_id: &str,
+    cache_key: &str,
+    envelope: &serde_json::Value,
+) -> Result<(), AppError> {
+    let q = qualified_sys_table("_sys_kv_data");
+    let update_sql = format!(
+        "UPDATE {} SET value = $5, updated_at = {} \
+         WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
+        q,
+        dialect.now_fn()
+    );
+    let res = sqlx::query(&update_sql)
+        .bind(tenant_id)
+        .bind(package_id)
+        .bind(REPORT_CACHE_NAMESPACE)
+        .bind(cache_key)
+        .bind(envelope)
+        .execute(pool)
+        .await
+        .map_err(AppError::Db)?;
+    if res.rows_affected() == 0 {
+        let insert_sql = format!(
+            "INSERT INTO {} (tenant_id, package_id, namespace, key, value) VALUES ($1, $2, $3, $4, $5)",
+            q
+        );
+        sqlx::query(&insert_sql)
+            .bind(tenant_id)
+            .bind(package_id)
+            .bind(REPORT_CACHE_NAMESPACE)
+            .bind(cache_key)
+            .bind(envelope)
+            .execute(pool)
+            .await
+            .map_err(AppError::Db)?;
+    }
     Ok(())
 }
 
@@ -893,6 +969,7 @@ pub fn sys_table_for_kind(kind: &str) -> Option<&'static str> {
         "relationships" => Some("_sys_relationships"),
         "api_entities" => Some("_sys_api_entities"),
         "kv_stores" => Some("_sys_kv_stores"),
+        "reports" => Some("_sys_reports"),
         _ => None,
     }
 }

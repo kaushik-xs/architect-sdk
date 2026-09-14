@@ -991,6 +991,20 @@ impl CrudService {
         Ok(row.map(|r| row_to_json(&r)))
     }
 
+    /// Execute an arbitrary read-only query with positional params, returning rows as JSON.
+    ///
+    /// Used by the reports feature. The caller is responsible for opening a read-only, sandboxed
+    /// transaction (SET TRANSACTION READ ONLY + statement_timeout, and RLS `app.tenant_id`) and
+    /// passing a `TenantExecutor::conn` bound to it; this method only binds params and serializes
+    /// rows via the same `row_to_json` used for entity CRUD.
+    pub async fn run_readonly_query<'a>(
+        executor: &mut TenantExecutor<'a>,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Value>, AppError> {
+        Self::query_many_exec(executor, sql, params).await
+    }
+
     async fn query_many_exec<'a>(
         executor: &mut TenantExecutor<'a>,
         sql: &str,

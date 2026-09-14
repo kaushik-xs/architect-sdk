@@ -7,7 +7,7 @@
 //! Action format:   `{httpVerb}{PascalCaseTableName}` e.g. `getMaterials`, `postMaterials`
 
 use crate::case::to_camel_case;
-use crate::config::ResolvedEntity;
+use crate::config::{ResolvedEntity, ResolvedReport};
 use crate::error::AppError;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -141,6 +141,68 @@ pub async fn check_entity_permission_opt(
             resource = %resource,
             action = %action,
             "permission denied"
+        );
+        return Err(AppError::Unauthorized(format!(
+            "action '{}' not permitted on '{}'",
+            action, resource
+        )));
+    }
+
+    Ok(())
+}
+
+/// Check report permission against authrs. No-op when authrs is not configured (client_opt is None).
+///
+/// Mirrors [`check_entity_permission_opt`] for the reports feature. Requires `X-User-ID` when
+/// authrs is configured.
+///
+/// Resource format: `service:{SERVICE_NAME}/package:{package_id}/report:{report_id}`
+/// Action format:   `{action}` (e.g. `run`).
+pub async fn check_report_permission_opt(
+    client_opt: &Option<Arc<AuthrsClient>>,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    report: &ResolvedReport,
+    action: &str,
+) -> Result<(), AppError> {
+    let client = match client_opt {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    let user_id =
+        user_id.ok_or_else(|| AppError::Unauthorized("X-User-ID header is required".into()))?;
+    let tenant_id = tenant_id.unwrap_or("");
+
+    let resource = format!(
+        "service:{}/package:{}/report:{}",
+        client.service_name, report.package_id, report.id
+    );
+
+    tracing::debug!(
+        user_id = %user_id,
+        resource = %resource,
+        action = %action,
+        "checking authrs report permission"
+    );
+
+    let allowed = client.check(tenant_id, user_id, &resource, action).await?;
+
+    if allowed {
+        tracing::info!(
+            user_id = %user_id,
+            tenant_id = %tenant_id,
+            resource = %resource,
+            action = %action,
+            "report permission granted"
+        );
+    } else {
+        tracing::warn!(
+            user_id = %user_id,
+            tenant_id = %tenant_id,
+            resource = %resource,
+            action = %action,
+            "report permission denied"
         );
         return Err(AppError::Unauthorized(format!(
             "action '{}' not permitted on '{}'",

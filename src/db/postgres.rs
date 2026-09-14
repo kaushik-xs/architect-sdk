@@ -272,6 +272,18 @@ impl Dialect for PostgresDialect {
         ))
     }
 
+    fn set_read_only_sql(&self) -> Option<String> {
+        Some("SET TRANSACTION READ ONLY".to_string())
+    }
+
+    fn set_statement_timeout_sql(&self, ms: u64) -> Option<String> {
+        Some(format!("SET LOCAL statement_timeout = {}", ms))
+    }
+
+    fn set_role_sql(&self, role: &str) -> Option<String> {
+        Some(format!("SET LOCAL ROLE {}", self.quote_ident(role)))
+    }
+
     // ── Idempotent DDL / introspection ────────────────────────────────────────
 
     fn supports_add_column_if_not_exists(&self) -> bool {

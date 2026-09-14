@@ -92,10 +92,43 @@ pub struct ResolvedEntity {
     pub extensible_columns: Vec<String>,
 }
 
+/// A report whose named params have been translated to positional placeholders and whose
+/// validation rules/defaults are indexed by param name. Built from [`crate::config::types::ReportConfig`]
+/// during `resolve()`. Reports produce no [`ResolvedEntity`] — they are data-plane only, looked up
+/// by id when a run request arrives.
+#[derive(Clone, Debug)]
+pub struct ResolvedReport {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// Package id this report belongs to. Set via ResolvedModel::with_package_id().
+    pub package_id: String,
+    /// SQL schemas the query references.
+    pub schemas: Vec<String>,
+    /// SQL with named params already translated to positional placeholders (`$1`, `$2`, …).
+    pub sql: String,
+    /// Param names in positional order (index 0 → `$1`). Repeated named params are deduplicated
+    /// and share a single placeholder.
+    pub param_order: Vec<String>,
+    /// Validation rules per param name (reuses the entity ValidationRule engine).
+    pub rules: HashMap<String, ValidationRule>,
+    /// Default values per param name, applied when the param is absent from the request.
+    pub defaults: HashMap<String, serde_json::Value>,
+    /// Optional SQL cast per param name (e.g. "timestamptz").
+    pub casts: HashMap<String, String>,
+    /// Whether to EXPLAIN-validate the SQL at registration time.
+    pub validate_on_register: bool,
+    /// Per-report result-cache TTL override (seconds). `None` = use the global default TTL;
+    /// `Some(0)` = never cache this report.
+    pub cache_ttl_secs: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedModel {
     pub entities: Vec<ResolvedEntity>,
     pub entity_by_path: HashMap<String, ResolvedEntity>,
+    /// Reports available for execution, keyed by report id.
+    pub reports: HashMap<String, ResolvedReport>,
 }
 
 impl ResolvedModel {
@@ -103,14 +136,22 @@ impl ResolvedModel {
         self.entity_by_path.get(path)
     }
 
-    /// Backfill `package_id` on all contained entities. Call this after `resolve()` when the
-    /// package id is known (e.g. from manifest.id or the route parameter).
+    /// Look up a report by id.
+    pub fn report(&self, id: &str) -> Option<&ResolvedReport> {
+        self.reports.get(id)
+    }
+
+    /// Backfill `package_id` on all contained entities and reports. Call this after `resolve()`
+    /// when the package id is known (e.g. from manifest.id or the route parameter).
     pub fn with_package_id(mut self, package_id: &str) -> Self {
         for e in &mut self.entities {
             e.package_id = package_id.to_string();
         }
         for e in self.entity_by_path.values_mut() {
             e.package_id = package_id.to_string();
+        }
+        for r in self.reports.values_mut() {
+            r.package_id = package_id.to_string();
         }
         self
     }
