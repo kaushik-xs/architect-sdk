@@ -1,0 +1,29 @@
+[
+  {
+    "id": "orders_daily_revenue",
+    "name": "Daily Revenue",
+    "description": "Order count and revenue per day within a date range, for a given order status.",
+    "schemas": ["ecommerce"],
+    "sql": "SELECT date_trunc('day', o.created_at)::date AS day, count(*) AS order_count, sum(oi.quantity * oi.unit_price) AS revenue FROM ecommerce.orders o JOIN ecommerce.order_items oi ON oi.order_id = o.id WHERE o.created_at >= :from AND o.created_at < :to AND o.status = :status GROUP BY 1 ORDER BY 1",
+    "params": [
+      { "name": "from", "db_type": "timestamptz", "required": true },
+      { "name": "to", "db_type": "timestamptz", "required": true },
+      {
+        "name": "status",
+        "default": "delivered",
+        "allowed": ["draft", "pending", "confirmed", "processing", "shipped", "delivered", "cancelled", "refunded"]
+      }
+    ]
+  },
+  {
+    "id": "top_products_by_revenue",
+    "name": "Top Products by Revenue",
+    "description": "Highest-grossing products, limited to the top N.",
+    "schemas": ["ecommerce"],
+    "cache_ttl_secs": 600,
+    "sql": "SELECT p.sku, p.name, sum(oi.quantity) AS units_sold, sum(oi.total_price) AS revenue FROM ecommerce.order_items oi JOIN ecommerce.products p ON p.id = oi.product_id GROUP BY p.sku, p.name ORDER BY revenue DESC LIMIT :limit",
+    "params": [
+      { "name": "limit", "db_type": "int", "default": 10, "minimum": 1, "maximum": 100 }
+    ]
+  }
+]

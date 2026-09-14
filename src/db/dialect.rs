@@ -142,6 +142,27 @@ pub trait Dialect: Send + Sync + 'static {
     /// Returns `None` when the dialect has no such mechanism.
     fn set_tenant_session_sql(&self, tenant_id: &str) -> Option<String>;
 
+    // ── Read-only query sandbox (reports) ─────────────────────────────────────
+    // Statements issued inside a transaction to sandbox an ad-hoc read-only query. Each returns
+    // `None` when the dialect has no equivalent, in which case the caller simply omits it (the
+    // guarantee then rests on the other layers, e.g. a read-only DB role).
+
+    /// Make the current transaction read-only (blocks writes and writable CTEs).
+    fn set_read_only_sql(&self) -> Option<String> {
+        None
+    }
+
+    /// Bound the running time of statements in the current transaction, in milliseconds.
+    fn set_statement_timeout_sql(&self, _ms: u64) -> Option<String> {
+        None
+    }
+
+    /// Drop to a specific (read-only) DB role for the current transaction. `role` is a bare
+    /// identifier supplied by an operator via env var, quoted by the dialect.
+    fn set_role_sql(&self, _role: &str) -> Option<String> {
+        None
+    }
+
     // ── Idempotent DDL ────────────────────────────────────────────────────────
 
     /// Whether `ALTER TABLE … ADD COLUMN IF NOT EXISTS` is valid syntax.

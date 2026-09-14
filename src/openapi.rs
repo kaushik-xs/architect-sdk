@@ -1245,6 +1245,7 @@ mod tests {
                 entity("orders", vec![]),
             ],
             entity_by_path: HashMap::new(),
+            reports: HashMap::new(),
         };
         let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
         let json = serde_json::to_string(&spec).expect("serialize spec");
@@ -1261,6 +1262,7 @@ mod tests {
         let default_model = ResolvedModel {
             entities: vec![entity("products", vec!["attributes".into()])],
             entity_by_path: HashMap::new(),
+            reports: HashMap::new(),
         };
         let mut package_models = HashMap::new();
         package_models.insert(
@@ -1268,6 +1270,7 @@ mod tests {
             ResolvedModel {
                 entities: vec![entity("invoices", vec!["meta".into()])],
                 entity_by_path: HashMap::new(),
+                reports: HashMap::new(),
             },
         );
         let spec = build_spec(&default_model, "/api/v1", &package_models, &HashMap::new());

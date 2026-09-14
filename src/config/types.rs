@@ -355,6 +355,52 @@ pub struct KvStoreConfig {
     pub comment: Option<String>,
 }
 
+/// A single named parameter of a report. Reuses the entity [`ValidationRule`] engine (flattened
+/// into this struct) so `required`/`allowed`/`minimum`/`pattern`/`format`/etc. all apply to the
+/// value the caller supplies at run time. `default` is applied when the param is absent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportParam {
+    pub name: String,
+    /// Value used when the caller omits this param. Ignored when the param is required.
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    /// Optional SQL cast applied to the bound value (e.g. "timestamptz", "int", "uuid").
+    /// All params bind as TEXT, so numeric/temporal params need a cast to compare correctly.
+    #[serde(default)]
+    pub db_type: Option<String>,
+    #[serde(flatten)]
+    pub rule: ValidationRule,
+}
+
+/// A read-only reporting query. The SQL is trusted (authored at deploy time, admin-gated on
+/// registration); only the declared params are runtime input. Named params (`:from`, `:to`) are
+/// translated to positional placeholders when the model is resolved. Reports carry no DDL — they
+/// are pure metadata and can be added/updated/removed at runtime without touching the schema.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// SQL schemas the query references (used for read-only role grants and a fast pre-check).
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    /// Parameterized SQL using named params, e.g. `SELECT ... WHERE created_at >= :from`.
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<ReportParam>,
+    /// When true (the default), the SQL is validated with `EXPLAIN` at registration time so
+    /// missing tables/columns fail fast rather than at first run. Set false for reports that
+    /// reference packages installed later (lazy validation at run time).
+    #[serde(default)]
+    pub validate_on_register: Option<bool>,
+    /// Per-report result-cache TTL in seconds. Only used when result caching is enabled globally
+    /// (env `ARCHITECT_REPORT_CACHE`). Falls back to `ARCHITECT_REPORT_CACHE_TTL_SECS` when unset;
+    /// a value of 0 disables caching for this report even when the global flag is on.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<i64>,
+}
+
 /// All config types in one struct for in-memory loading.
 #[derive(Clone, Debug, Default)]
 pub struct FullConfig {
@@ -366,4 +412,5 @@ pub struct FullConfig {
     pub relationships: Vec<RelationshipConfig>,
     pub api_entities: Vec<ApiEntityConfig>,
     pub kv_stores: Vec<KvStoreConfig>,
+    pub reports: Vec<ReportConfig>,
 }
