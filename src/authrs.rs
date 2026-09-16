@@ -61,13 +61,10 @@ impl AuthrsClient {
         if let Some(tp) = crate::middleware::outbound_traceparent() {
             request = request.header(crate::middleware::TRACEPARENT_HEADER, tp);
         }
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "authrs request failed");
-                AppError::Unauthorized(format!("permission service unavailable: {}", e))
-            })?;
+        let resp = request.send().await.map_err(|e| {
+            tracing::error!(error = %e, "authrs request failed");
+            AppError::Unauthorized(format!("permission service unavailable: {}", e))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();

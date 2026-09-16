@@ -208,7 +208,9 @@ mod tests {
     }
 
     fn app() -> Router {
-        Router::new().route("/x", get(handler)).layer(trace_id_layer())
+        Router::new()
+            .route("/x", get(handler))
+            .layer(trace_id_layer())
     }
 
     /// Parse the trace-id out of a response `traceparent` header value.
