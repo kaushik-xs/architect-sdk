@@ -18,7 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("architect_sdk=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .flatten_event(true)
+        .with_env_filter(filter)
+        .init();
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://architect.db".into());
@@ -84,7 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/api/v1", report_routes(state.clone()))
         .nest("/api/v1", entity_routes(state));
 
-    let app = Router::new().nest("/", api);
+    let app = Router::new()
+        .nest("/", api)
+        .layer(architect_sdk::trace_id_layer());
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
     tracing::info!("listening on {}", listener.local_addr()?);

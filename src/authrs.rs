@@ -52,11 +52,16 @@ impl AuthrsClient {
             "resource": resource,
             "action": action,
         });
-        let resp = self
+        let mut request = self
             .client
             .post(&url)
             .header("X-Tenant-ID", tenant_id)
-            .json(&body)
+            .json(&body);
+        // Continue the current request's trace downstream (W3C traceparent), if any.
+        if let Some(tp) = crate::middleware::outbound_traceparent() {
+            request = request.header(crate::middleware::TRACEPARENT_HEADER, tp);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| {

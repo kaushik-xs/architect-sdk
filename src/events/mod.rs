@@ -41,7 +41,12 @@ impl DecisionHubClient {
         });
         let url = format!("{}/evaluate", self.base_url);
         log_curl(&url, &payload);
-        match self.client.post(&url).json(&payload).send().await {
+        let mut request = self.client.post(&url).json(&payload);
+        // Continue the current request's trace downstream (W3C traceparent), if any.
+        if let Some(tp) = crate::middleware::outbound_traceparent() {
+            request = request.header(crate::middleware::TRACEPARENT_HEADER, tp);
+        }
+        match request.send().await {
             Ok(resp) if !resp.status().is_success() => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();

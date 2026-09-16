@@ -26,6 +26,7 @@ pub mod events;
 pub mod extensible_fields;
 pub mod extractors;
 pub mod handlers;
+pub mod middleware;
 pub mod migration;
 pub mod openapi;
 pub mod response;
@@ -42,6 +43,9 @@ pub use config::{
 };
 pub use db::{introspect, DbSnapshot};
 pub use error::{AppError, ConfigError};
+pub use middleware::{
+    current_trace_id, outbound_traceparent, trace_id_layer, TraceId, TRACEPARENT_HEADER,
+};
 pub use migration::{
     apply_migrations, compute_migration_plan, execute_migration_plan, reconcile_step,
     MigrationOperation, MigrationPlan, MigrationRisk, MigrationSafety, MigrationStep,

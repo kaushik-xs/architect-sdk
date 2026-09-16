@@ -14,6 +14,10 @@ use tokio::net::TcpListener;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .flatten_event(true)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("architect_sdk=info")),
@@ -47,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cross_package_index: Arc::new(std::sync::RwLock::new(None)),
     };
 
-    let app = common_routes_with_ready(state);
+    let app = common_routes_with_ready(state).layer(architect_sdk::trace_id_layer());
     let listener = TcpListener::bind("127.0.0.1:3000").await?;
     let port = listener.local_addr()?.port();
     tracing::info!("Example consumer listening on http://127.0.0.1:{}", port);
