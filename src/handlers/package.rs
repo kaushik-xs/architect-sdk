@@ -19,7 +19,7 @@ use crate::store::{
     upsert_package,
 };
 use crate::tenant::TenantStrategy;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -277,6 +277,9 @@ async fn apply_ddl_to_pool(
                 from_version,
                 to_version,
                 dialect,
+                // Direct install/upgrade has no confirmation step, so destructive drops never run
+                // here — dropping a column requires the explicit preview → apply flow.
+                false,
             )
             .await
             {
@@ -1203,6 +1206,7 @@ pub async fn preview_migration_handler(
                     "safe": summary.safe,
                     "best_effort": summary.best_effort,
                     "warn_only": summary.warn_only,
+                    "destructive": summary.destructive,
                 },
                 "steps": plan.steps,
             }),
@@ -1216,14 +1220,28 @@ pub struct MigrationIdPath {
     pub migration_id: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ApplyMigrationQuery {
+    /// When true, `Destructive` steps in the plan (e.g. DROP COLUMN) are executed, permanently
+    /// dropping the column and its data. Defaults to false — destructive steps are warned and the
+    /// column is retained. This is the confirmation gate for irreversible drops.
+    #[serde(default)]
+    pub confirm_destructive: bool,
+}
+
 /// POST /api/v1/config/package/migration/apply/:migration_id
 /// Apply a previously previewed migration plan. Idempotent: calling twice returns 409.
 /// Applies config changes to _sys_* tables, executes DDL against the tenant DB, and writes audit records.
+/// Pass `?confirm_destructive=true` to also execute destructive steps (drop columns); without it
+/// those steps are skipped with a warning and the columns are retained.
 /// X-Tenant-ID required.
 pub async fn apply_migration_handler(
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
     Path(MigrationIdPath { migration_id }): Path<MigrationIdPath>,
+    Query(ApplyMigrationQuery {
+        confirm_destructive,
+    }): Query<ApplyMigrationQuery>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let tenant_id = tenant_id_opt
         .as_deref()
@@ -1336,6 +1354,7 @@ pub async fn apply_migration_handler(
         row.from_version.as_deref(),
         &row.to_version,
         state.dialect.as_ref(),
+        confirm_destructive,
     )
     .await?;
 
@@ -1383,6 +1402,7 @@ pub async fn apply_migration_handler(
                 "package_id": row.package_id,
                 "from_version": row.from_version,
                 "to_version": row.to_version,
+                "confirm_destructive": confirm_destructive,
                 "steps_applied": result.applied,
                 "steps_warned": result.warned,
                 "steps_skipped": result.skipped,

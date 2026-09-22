@@ -358,6 +358,7 @@ async fn replaying_a_migration_plan_skips_steps_that_are_already_applied() {
         Some("1.0.0"),
         "2.0.0",
         dialect.as_ref(),
+        false,
     )
     .await
     .expect("first execution");
@@ -375,6 +376,7 @@ async fn replaying_a_migration_plan_skips_steps_that_are_already_applied() {
         Some("1.0.0"),
         "2.0.0",
         dialect.as_ref(),
+        false,
     )
     .await
     .expect("replaying a plan must not fail on already-applied steps");
@@ -412,6 +414,7 @@ async fn a_column_the_database_already_has_does_not_fail_the_upgrade() {
         Some("1.0.0"),
         "2.0.0",
         dialect.as_ref(),
+        false,
     )
     .await
     .expect("upgrade must not fail when the column already exists");

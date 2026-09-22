@@ -805,6 +805,10 @@ pub enum MigrationSafety {
     BestEffort,
     /// No DDL generated — config change noted as a warning only (e.g. removed tables/columns).
     WarnOnly,
+    /// Irreversible data loss. DDL *is* generated but is only executed when the caller explicitly
+    /// confirms (`confirm_destructive`). Without confirmation the step behaves like `WarnOnly`:
+    /// a warning is recorded and the object is retained. Used for dropping columns.
+    Destructive,
 }
 
 /// Risk category associated with a migration step.
@@ -820,6 +824,9 @@ pub enum MigrationRisk {
     DataWillBeModified,
     /// Cannot be automated — requires a manual database action.
     ManualActionRequired,
+    /// The object and all data it holds will be permanently dropped. Irreversible.
+    /// Only executed when the apply request sets `confirm_destructive`.
+    DataWillBeDropped,
 }
 
 /// One step in a migration plan: a DDL statement with metadata.
@@ -839,7 +846,8 @@ pub struct MigrationStep {
     /// "column" | "table" | "index" | "foreign_key" | "enum" | "enum_value" | "schema"
     pub object_type: String,
     pub description: String,
-    /// The SQL to execute. None for WarnOnly steps.
+    /// The SQL to execute. None for WarnOnly steps. A `Destructive` step carries its DDL here but
+    /// runs only when the apply request confirms it.
     pub ddl: Option<String>,
     pub safety: MigrationSafety,
     pub risk: MigrationRisk,
@@ -858,16 +866,19 @@ pub struct MigrationSummary {
     pub safe: usize,
     pub best_effort: usize,
     pub warn_only: usize,
+    /// Steps that will permanently drop data and only run when `confirm_destructive` is set.
+    pub destructive: usize,
 }
 
 impl MigrationPlan {
     pub fn summary(&self) -> MigrationSummary {
-        let (mut safe, mut best_effort, mut warn_only) = (0, 0, 0);
+        let (mut safe, mut best_effort, mut warn_only, mut destructive) = (0, 0, 0, 0);
         for s in &self.steps {
             match s.safety {
                 MigrationSafety::Safe => safe += 1,
                 MigrationSafety::BestEffort => best_effort += 1,
                 MigrationSafety::WarnOnly => warn_only += 1,
+                MigrationSafety::Destructive => destructive += 1,
             }
         }
         MigrationSummary {
@@ -875,6 +886,7 @@ impl MigrationPlan {
             safe,
             best_effort,
             warn_only,
+            destructive,
         }
     }
 }
@@ -1928,6 +1940,7 @@ pub fn compute_migration_plan(
             .and_then(|t| t.schema_id.as_deref())
             .unwrap_or(default_old_sid);
         let schema = schema_name_for(sid, &old_schemas);
+        let full = format!("{}.{}", quote(&schema), quote(table_name));
         steps.push(MigrationStep {
             step: 0,
             operation: MigrationOperation::DropColumn,
@@ -1937,10 +1950,20 @@ pub fn compute_migration_plan(
             object_type: "column".into(),
             from_object: None,
             description: format!("Column \"{}\" removed from config on \"{}\".\"{}\"", old_col.name, schema, table_name),
-            ddl: None,
-            safety: MigrationSafety::WarnOnly,
-            risk: MigrationRisk::ManualActionRequired,
-            risk_detail: Some("Column NOT dropped from database (data safety). Run ALTER TABLE DROP COLUMN manually if intended.".into()),
+            // DDL is generated but only runs when the apply request sets `confirm_destructive`.
+            // Without confirmation this step warns and the column (and its data) is retained.
+            ddl: Some(format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                full,
+                quote(&old_col.name)
+            )),
+            safety: MigrationSafety::Destructive,
+            risk: MigrationRisk::DataWillBeDropped,
+            risk_detail: Some(format!(
+                "Column \"{}\" and all its data will be permanently dropped. Runs only when the apply \
+                 request confirms the destructive change; otherwise the column is retained.",
+                old_col.name
+            )),
         });
     }
 
@@ -2260,6 +2283,11 @@ pub fn reconcile_step(step: &MigrationStep, snap: &DbSnapshot) -> StepDecision {
             "column \"{}\" already exists on \"{}\".\"{}\"",
             object, schema, table
         )),
+        // Confirmed drop whose column is already gone: nothing left to drop.
+        Op::DropColumn if column_gone => Some(format!(
+            "column \"{}\" already dropped from \"{}\".\"{}\"",
+            object, schema, table
+        )),
         Op::RenameColumn => rename_skip_reason(step, snap, schema, table, table_known),
 
         // A column that is gone cannot be retyped, defaulted or backfilled.
@@ -2363,6 +2391,7 @@ fn apply_step_to_snapshot(step: &MigrationStep, snap: &mut DbSnapshot) {
         (MigrationOperation::RenameColumn, Some(t), Some(from)) => {
             snap.rename_column(schema, t, from, object)
         }
+        (MigrationOperation::DropColumn, Some(t), _) => snap.remove_column(schema, t, object),
         (MigrationOperation::SetNotNull, Some(t), _) => snap.set_nullable(schema, t, object, false),
         (MigrationOperation::DropNotNull, Some(t), _) => snap.set_nullable(schema, t, object, true),
         (MigrationOperation::SetDefault, Some(t), _) => {
@@ -2466,6 +2495,7 @@ pub async fn execute_migration_plan(
     from_version: Option<&str>,
     to_version: &str,
     dialect: &dyn Dialect,
+    confirm_destructive: bool,
 ) -> Result<MigrationExecutionResult, AppError> {
     let mut applied = 0usize;
     let mut warned = 0usize;
@@ -2497,7 +2527,15 @@ pub async fn execute_migration_plan(
     for step in &plan.steps {
         let op = step.operation.to_string();
 
-        match step.safety {
+        // A destructive step (e.g. DROP COLUMN) carries executable DDL but only runs when the
+        // caller explicitly confirmed it. Unconfirmed, it degrades to a warn-only step: the object
+        // and its data are retained and a warning is recorded.
+        let effective_safety = match step.safety {
+            MigrationSafety::Destructive if !confirm_destructive => &MigrationSafety::WarnOnly,
+            ref other => other,
+        };
+
+        match effective_safety {
             MigrationSafety::WarnOnly => {
                 let msg = step
                     .risk_detail
@@ -2508,7 +2546,7 @@ pub async fn execute_migration_plan(
                 audit_step(config_pool, &ctx, step, "skipped", None).await;
                 warned += 1;
             }
-            MigrationSafety::Safe | MigrationSafety::BestEffort => {
+            MigrationSafety::Safe | MigrationSafety::BestEffort | MigrationSafety::Destructive => {
                 let Some(ref sql) = step.ddl else {
                     continue;
                 };
@@ -3121,6 +3159,31 @@ mod companion_sync_tests {
         assert!(!sql.iter().any(|s| s.contains("orders_audit")));
         assert!(!sql.iter().any(|s| s.contains("orders_history")));
     }
+
+    #[test]
+    fn dropped_column_is_a_destructive_step_with_real_ddl() {
+        // A column removed from config now emits an executable DROP COLUMN gated behind
+        // `confirm_destructive`, instead of the old warn-only-with-no-DDL step.
+        let old = base(false, false);
+        let mut new = base(false, false);
+        new.columns.retain(|c| c.name != "status"); // drop "status"
+
+        let dialect = SqliteDialect;
+        let steps = compute_migration_plan(&old, &new, None, None, &dialect, &HashMap::new())
+            .unwrap()
+            .steps;
+        let drop = steps
+            .iter()
+            .find(|s| matches!(s.operation, MigrationOperation::DropColumn))
+            .expect("expected a DropColumn step");
+
+        assert!(matches!(drop.safety, MigrationSafety::Destructive));
+        assert!(matches!(drop.risk, MigrationRisk::DataWillBeDropped));
+        assert_eq!(
+            drop.ddl.as_deref(),
+            Some(r#"ALTER TABLE "app"."orders" DROP COLUMN IF EXISTS "status""#)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3393,6 +3456,21 @@ mod reconcile_tests {
                 StepDecision::Execute
             );
         }
+    }
+
+    #[test]
+    fn drop_column_runs_when_present_and_is_skipped_once_gone() {
+        // Column present on a known table: the drop must run.
+        let mut snap = snapshot();
+        snap.add_table("app", "orders");
+        snap.add_column("app", "orders", "note", facts(true, false));
+        let s = step(MigrationOperation::DropColumn, Some("orders"), "note");
+        assert_eq!(reconcile_step(&s, &snap), StepDecision::Execute);
+
+        // After the drop folds into the snapshot, re-running is a no-op.
+        apply_step_to_snapshot(&s, &mut snap);
+        assert!(!snap.has_column("app", "orders", "note"));
+        assert!(skipped(reconcile_step(&s, &snap)));
     }
 }
 
