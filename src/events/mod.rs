@@ -34,14 +34,18 @@ impl DecisionHubClient {
     }
 
     async fn publish(&self, tenant_id: &str, event_type: &str, context: Value) {
+        // Tenant travels in the X-Tenant-ID header only, not the body.
         let payload = serde_json::json!({
-            "tenant_id": tenant_id,
             "event_type": event_type,
             "context": context,
         });
         let url = format!("{}/evaluate", self.base_url);
-        log_curl(&url, &payload);
-        let mut request = self.client.post(&url).json(&payload);
+        log_curl(&url, tenant_id, &payload);
+        let mut request = self
+            .client
+            .post(&url)
+            .header("X-Tenant-ID", tenant_id)
+            .json(&payload);
         // Continue the current request's trace downstream (W3C traceparent), if any.
         if let Some(tp) = crate::middleware::outbound_traceparent() {
             request = request.header(crate::middleware::TRACEPARENT_HEADER, tp);
@@ -80,7 +84,7 @@ impl DecisionHubClient {
 ///
 /// The payload has already had `sensitive_columns` stripped, but it still carries full row data —
 /// keep this off in production unless you are actively debugging.
-fn log_curl(url: &str, payload: &Value) {
+fn log_curl(url: &str, tenant_id: &str, payload: &Value) {
     let force = std::env::var("DECISION_HUB_LOG_CURL")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
         .unwrap_or(false);
@@ -89,10 +93,12 @@ fn log_curl(url: &str, payload: &Value) {
     }
     let body = serde_json::to_string(payload).unwrap_or_default();
     // Single-quoted shell literal: the only byte needing care is `'` itself.
+    let quote = |s: &str| s.replace('\'', r#"'\''"#);
     let curl = format!(
-        "curl -sS -X POST '{}' -H 'Content-Type: application/json' --data-raw '{}'",
+        "curl -sS -X POST '{}' -H 'Content-Type: application/json' -H 'X-Tenant-ID: {}' --data-raw '{}'",
         url,
-        body.replace('\'', r#"'\''"#),
+        quote(tenant_id),
+        quote(&body),
     );
     if force {
         tracing::info!(curl = %curl, "decision-hub request");
