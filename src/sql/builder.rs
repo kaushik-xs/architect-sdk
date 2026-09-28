@@ -75,6 +75,22 @@ fn resolve_schema<'a>(entity: &'a ResolvedEntity, schema_override: Option<&'a st
     schema_override.unwrap_or(&entity.schema_name)
 }
 
+/// Normalize a request value before binding it to a column in INSERT/UPDATE.
+///
+/// Columns with a `pg_type` are non-text (numeric, boolean, uuid, date/time, jsonb, enum, …) and
+/// are bound as TEXT then cast (`$n::numeric`). An empty or whitespace-only string can't be cast
+/// to any of those (`invalid input syntax for type numeric: ""`), and forms commonly send `""` to
+/// mean "cleared", so it becomes NULL. Text columns (`pg_type == None`) keep `""` as-is; array
+/// columns go through [`coerce_json_value_for_pg_array`] (where `""` becomes an empty array).
+pub fn coerce_json_value_for_column(val: Value, pg_type: Option<&str>) -> Value {
+    if let (Value::String(s), Some(t)) = (&val, pg_type) {
+        if s.trim().is_empty() && !t.ends_with("[]") && t != "bytea" {
+            return Value::Null;
+        }
+    }
+    coerce_json_value_for_pg_array(val, pg_type)
+}
+
 /// Postgres array columns: API accepts JSON `["a","b"]`; bind as array literal + `$n::varchar(255)[]` etc.
 pub fn coerce_json_value_for_pg_array(val: Value, pg_type: Option<&str>) -> Value {
     if !pg_type.is_some_and(|t| t.ends_with("[]")) {
@@ -849,7 +865,7 @@ pub fn insert(
             continue;
         }
         let val = val.unwrap_or(Value::Null);
-        let val = coerce_json_value_for_pg_array(val, c.pg_type.as_deref());
+        let val = coerce_json_value_for_column(val, c.pg_type.as_deref());
         let param_num = q.push_param(val);
         let ph = c
             .pg_type
@@ -915,7 +931,7 @@ pub fn update(
         let Some(c) = col_by_name.get(k.as_str()) else {
             continue;
         };
-        let v = coerce_json_value_for_pg_array(v.clone(), c.pg_type.as_deref());
+        let v = coerce_json_value_for_column(v.clone(), c.pg_type.as_deref());
         let param_num = q.push_param(v);
         let rhs = c
             .pg_type
@@ -1396,6 +1412,36 @@ mod versioning_tests {
         let q = select_history_list(&entity, Some("tenant1"), &d);
         assert!(q.sql.contains("\"tenant1\""));
         assert!(!q.sql.contains("\"myschema\""));
+    }
+
+    #[test]
+    fn coerce_column_empty_string_is_null_for_typed_columns() {
+        for t in [
+            "numeric",
+            "integer",
+            "boolean",
+            "uuid",
+            "date",
+            "timestamptz",
+            "jsonb",
+        ] {
+            let v = coerce_json_value_for_column(Value::String(String::new()), Some(t));
+            assert_eq!(v, Value::Null, "type {t}");
+            let v = coerce_json_value_for_column(Value::String("  ".to_string()), Some(t));
+            assert_eq!(v, Value::Null, "type {t} (whitespace)");
+        }
+    }
+
+    #[test]
+    fn coerce_column_empty_string_kept_for_text_columns() {
+        let v = coerce_json_value_for_column(Value::String(String::new()), None);
+        assert_eq!(v, Value::String(String::new()));
+    }
+
+    #[test]
+    fn coerce_column_non_empty_numeric_string_unchanged() {
+        let v = coerce_json_value_for_column(Value::String("12.5".to_string()), Some("numeric"));
+        assert_eq!(v, Value::String("12.5".to_string()));
     }
 
     #[test]
