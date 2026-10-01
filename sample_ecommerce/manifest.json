@@ -1,7 +1,0 @@
-{
-  "id": "sample_ecommerce",
-  "name": "Sample E‑commerce",
-  "version": "1.0.0",
-  "schema": "ecommerce",
-  "description": "Sample package: multi-tenant e-commerce with organizations, customers, products, orders, payments, and inventory"
-}

@@ -227,6 +227,53 @@ async fn migration_creates_sys_tables() {
 }
 
 #[tokio::test]
+async fn ensure_sys_tables_renames_legacy_reports_table() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    ensure_sys_tables(&pool, dialect.as_ref())
+        .await
+        .expect("ensure_sys_tables");
+
+    // Simulate a database created before the `reports` kind was renamed to `queries`.
+    for (new, old) in [
+        ("_sys_queries", "_sys_reports"),
+        ("_sys_queries_history", "_sys_reports_history"),
+    ] {
+        sqlx::query(&format!("ALTER TABLE main.{} RENAME TO {}", new, old))
+            .execute(&pool)
+            .await
+            .expect("rename to legacy name");
+    }
+    sqlx::query(
+        "INSERT INTO main._sys_reports (id, package_id, payload) VALUES ('r1', '_default', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy row");
+
+    // Run twice: the first carries the rows over, the second must be a no-op.
+    for _ in 0..2 {
+        ensure_sys_tables(&pool, dialect.as_ref())
+            .await
+            .expect("ensure_sys_tables");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM main._sys_queries WHERE id = 'r1'")
+        .fetch_one(&pool)
+        .await
+        .expect("_sys_queries should exist");
+    assert_eq!(count, 1);
+    sqlx::query("SELECT 1 FROM main._sys_queries_history")
+        .fetch_optional(&pool)
+        .await
+        .expect("_sys_queries_history should exist");
+    assert!(sqlx::query("SELECT 1 FROM main._sys_reports")
+        .fetch_optional(&pool)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn migration_creates_app_table() {
     let pool = memory_pool().await;
     let dialect = active_dialect();
