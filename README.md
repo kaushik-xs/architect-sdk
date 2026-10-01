@@ -107,7 +107,7 @@ No database or network connection required — all tests are in-process.
 
 ### Coverage
 
-Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **182 tests** (159 unit + 23 SQLite integration):
+Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **183 tests** (159 unit + 24 SQLite integration):
 
 ```
 TOTAL   lines: 33.28%   functions: 36.30%   regions: 34.05%
