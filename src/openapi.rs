@@ -1097,7 +1097,7 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         ("relationships", "Relationship definitions"),
         ("api_entities", "API entity definitions"),
         ("kv_stores", "KV store definitions"),
-        ("reports", "Report definitions"),
+        ("queries", "Query definitions"),
     ];
     for (kind, description) in config_kinds {
         let path = format!("{}/config/{}", base, kind);
@@ -1142,13 +1142,13 @@ fn add_config_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
     builder
 }
 
-/// Report id path parameter (the report config `id`).
-fn report_id_param() -> Parameter {
+/// Query id path parameter (the query config `id`).
+fn query_id_param() -> Parameter {
     ParameterBuilder::new()
-        .name("reportId")
+        .name("queryId")
         .parameter_in(ParameterIn::Path)
         .required(Required::True)
-        .description(Some("Report id (the report config `id`)."))
+        .description(Some("Query id (the query config `id`)."))
         .schema(Some(RefOr::T(Schema::Object(
             utoipa::openapi::schema::ObjectBuilder::new()
                 .schema_type(SchemaType::new(Type::String))
@@ -1174,44 +1174,44 @@ fn x_user_id_header() -> Parameter {
         .build()
 }
 
-/// Report APIs: data-plane run/list/get plus config-plane by-id upsert/delete.
-/// (`GET`/`POST /config/reports` for the whole set are emitted by `add_config_paths`.)
-fn add_report_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
-    // GET /reports — list report metadata (never the SQL).
+/// Query APIs: data-plane run/list/get plus config-plane by-id upsert/delete.
+/// (`GET`/`POST /config/queries` for the whole set are emitted by `add_config_paths`.)
+fn add_query_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
+    // GET /queries — list query metadata (never the SQL).
     let list_op = OperationBuilder::new()
-        .summary(Some("List reports".to_string()))
+        .summary(Some("List queries".to_string()))
         .description(Some(
-            "List available report metadata (id, name, params). X-Tenant-ID required.".to_string(),
+            "List available query metadata (id, name, params). X-Tenant-ID required.".to_string(),
         ))
-        .operation_id(Some("reports_list".to_string()))
+        .operation_id(Some("queries_list".to_string()))
         .parameters(Some(vec![x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
     builder = builder.path(
-        format!("{}/reports", base),
+        format!("{}/queries", base),
         PathItemBuilder::new()
             .operation(HttpMethod::Get, list_op)
             .build(),
     );
 
-    // GET /reports/{reportId} — one report's metadata and parameter schema.
+    // GET /queries/{queryId} — one query's metadata and parameter schema.
     let get_op = OperationBuilder::new()
-        .summary(Some("Get report".to_string()))
+        .summary(Some("Get query".to_string()))
         .description(Some(
-            "Get one report's metadata and parameter schema. X-Tenant-ID required.".to_string(),
+            "Get one query's metadata and parameter schema. X-Tenant-ID required.".to_string(),
         ))
-        .operation_id(Some("reports_get".to_string()))
-        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .operation_id(Some("queries_get".to_string()))
+        .parameters(Some(vec![query_id_param(), x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
     builder = builder.path(
-        format!("{}/reports/{{reportId}}", base),
+        format!("{}/queries/{{queryId}}", base),
         PathItemBuilder::new()
             .operation(HttpMethod::Get, get_op)
             .build(),
     );
 
-    // POST /reports/{reportId}/run — execute the report read-only.
+    // POST /queries/{queryId}/run — execute the query read-only.
     let run_body = RequestBodyBuilder::new()
         .description(Some(
             "Runtime parameters: { \"params\": { ... } }.".to_string(),
@@ -1223,15 +1223,15 @@ fn add_report_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         .required(Some(Required::False))
         .build();
     let run_op = OperationBuilder::new()
-        .summary(Some("Run report".to_string()))
+        .summary(Some("Run query".to_string()))
         .description(Some(
-            "Execute a report read-only and return its rows. Authorized per-run via authrs. \
+            "Execute a query read-only and return its rows. Authorized per-run via authrs. \
              X-Tenant-ID required; X-User-ID required when authrs is enabled."
                 .to_string(),
         ))
-        .operation_id(Some("reports_run".to_string()))
+        .operation_id(Some("queries_run".to_string()))
         .parameters(Some(vec![
-            report_id_param(),
+            query_id_param(),
             x_tenant_id_header(),
             x_user_id_header(),
         ]))
@@ -1239,16 +1239,16 @@ fn add_report_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         .responses(default_responses().build())
         .build();
     builder = builder.path(
-        format!("{}/reports/{{reportId}}/run", base),
+        format!("{}/queries/{{queryId}}/run", base),
         PathItemBuilder::new()
             .operation(HttpMethod::Post, run_op)
             .build(),
     );
 
-    // PUT / DELETE /config/reports/{reportId} — by-id upsert/delete (Platform Admin only).
+    // PUT / DELETE /config/queries/{queryId} — by-id upsert/delete (Platform Admin only).
     let put_body = RequestBodyBuilder::new()
         .description(Some(
-            "A single report definition (ReportConfig). The path id is authoritative.".to_string(),
+            "A single query definition (QueryConfig). The path id is authoritative.".to_string(),
         ))
         .content(
             "application/json",
@@ -1257,29 +1257,29 @@ fn add_report_paths(mut builder: PathsBuilder, base: &str) -> PathsBuilder {
         .required(Some(Required::True))
         .build();
     let put_op = OperationBuilder::new()
-        .summary(Some("Upsert report by id".to_string()))
+        .summary(Some("Upsert query by id".to_string()))
         .description(Some(
-            "Create or replace one standalone report by id (read-merge-write). \
+            "Create or replace one standalone query by id (read-merge-write). \
              Restricted to the Platform Admin tenant."
                 .to_string(),
         ))
-        .operation_id(Some("config_put_report".to_string()))
-        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .operation_id(Some("config_put_query".to_string()))
+        .parameters(Some(vec![query_id_param(), x_tenant_id_header()]))
         .request_body(Some(put_body))
         .responses(default_responses().build())
         .build();
     let delete_op = OperationBuilder::new()
-        .summary(Some("Delete report by id".to_string()))
+        .summary(Some("Delete query by id".to_string()))
         .description(Some(
-            "Delete one standalone report by id. Restricted to the Platform Admin tenant."
+            "Delete one standalone query by id. Restricted to the Platform Admin tenant."
                 .to_string(),
         ))
-        .operation_id(Some("config_delete_report".to_string()))
-        .parameters(Some(vec![report_id_param(), x_tenant_id_header()]))
+        .operation_id(Some("config_delete_query".to_string()))
+        .parameters(Some(vec![query_id_param(), x_tenant_id_header()]))
         .responses(default_responses().build())
         .build();
     builder = builder.path(
-        format!("{}/config/reports/{{reportId}}", base),
+        format!("{}/config/queries/{{queryId}}", base),
         PathItemBuilder::new()
             .operation(HttpMethod::Put, put_op)
             .operation(HttpMethod::Delete, delete_op)
@@ -1300,7 +1300,7 @@ pub fn build_spec(
     let server = build_server();
     let mut builder = PathsBuilder::new();
     builder = add_config_paths(builder, base_path);
-    builder = add_report_paths(builder, base_path);
+    builder = add_query_paths(builder, base_path);
     builder = add_entity_paths(builder, base_path, default_model, false, None);
     for (package_id, model) in package_models {
         if !model.entities.is_empty() {
@@ -1387,24 +1387,24 @@ mod tests {
     }
 
     #[test]
-    fn spec_lists_report_paths() {
+    fn spec_lists_query_paths() {
         let model = ResolvedModel {
             entities: vec![],
             entity_by_path: HashMap::new(),
-            reports: HashMap::new(),
+            queries: HashMap::new(),
         };
         let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
         let json = serde_json::to_string(&spec).expect("serialize spec");
 
-        // Data-plane report APIs.
-        assert!(json.contains("/api/v1/reports"));
-        assert!(json.contains("/api/v1/reports/{reportId}"));
-        assert!(json.contains("/api/v1/reports/{reportId}/run"));
-        // Config-plane report APIs (whole-set + by-id).
-        assert!(json.contains("/api/v1/config/reports"));
-        assert!(json.contains("/api/v1/config/reports/{reportId}"));
-        assert!(json.contains("reports_run"));
-        assert!(json.contains("config_put_report"));
+        // Data-plane query APIs.
+        assert!(json.contains("/api/v1/queries"));
+        assert!(json.contains("/api/v1/queries/{queryId}"));
+        assert!(json.contains("/api/v1/queries/{queryId}/run"));
+        // Config-plane query APIs (whole-set + by-id).
+        assert!(json.contains("/api/v1/config/queries"));
+        assert!(json.contains("/api/v1/config/queries/{queryId}"));
+        assert!(json.contains("queries_run"));
+        assert!(json.contains("config_put_query"));
     }
 
     #[test]
@@ -1415,7 +1415,7 @@ mod tests {
                 entity("orders", vec![]),
             ],
             entity_by_path: HashMap::new(),
-            reports: HashMap::new(),
+            queries: HashMap::new(),
         };
         let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
         let json = serde_json::to_string(&spec).expect("serialize spec");
@@ -1432,7 +1432,7 @@ mod tests {
         let default_model = ResolvedModel {
             entities: vec![entity("products", vec!["attributes".into()])],
             entity_by_path: HashMap::new(),
-            reports: HashMap::new(),
+            queries: HashMap::new(),
         };
         let mut package_models = HashMap::new();
         package_models.insert(
@@ -1440,7 +1440,7 @@ mod tests {
             ResolvedModel {
                 entities: vec![entity("invoices", vec!["meta".into()])],
                 entity_by_path: HashMap::new(),
-                reports: HashMap::new(),
+                queries: HashMap::new(),
             },
         );
         let spec = build_spec(&default_model, "/api/v1", &package_models, &HashMap::new());

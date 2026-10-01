@@ -1,8 +1,7 @@
 //! Load config from in-memory structs or from architect._sys_* tables in DB.
 
 use crate::config::resolved::{
-    ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel,
-    ResolvedReport,
+    ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel, ResolvedQuery,
 };
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
@@ -224,12 +223,12 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         entities.push(ae);
     }
 
-    let mut reports = HashMap::new();
-    for r in &config.reports {
-        let resolved = compile_report(r)?;
-        if reports.insert(resolved.id.clone(), resolved).is_some() {
+    let mut queries = HashMap::new();
+    for r in &config.queries {
+        let resolved = compile_query(r)?;
+        if queries.insert(resolved.id.clone(), resolved).is_some() {
             return Err(ConfigError::Validation(format!(
-                "duplicate report id: {}",
+                "duplicate query id: {}",
                 r.id
             )));
         }
@@ -238,23 +237,21 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
     Ok(ResolvedModel {
         entities,
         entity_by_path,
-        reports,
+        queries,
     })
 }
 
-/// Translate a report's named-parameter SQL (`:from`, `:to`) into positional placeholders
+/// Translate a query's named-parameter SQL (`:from`, `:to`) into positional placeholders
 /// (`$1`, `$2`) and build the runtime lookup tables. Repeated named params reuse a single
 /// placeholder. String literals, quoted identifiers, and `::type` casts are skipped so they are
 /// never mistaken for a parameter.
-pub fn compile_report(cfg: &ReportConfig) -> Result<ResolvedReport, ConfigError> {
+pub fn compile_query(cfg: &QueryConfig) -> Result<ResolvedQuery, ConfigError> {
     if cfg.id.trim().is_empty() {
-        return Err(ConfigError::Validation(
-            "report id must not be empty".into(),
-        ));
+        return Err(ConfigError::Validation("query id must not be empty".into()));
     }
     if cfg.sql.trim().is_empty() {
         return Err(ConfigError::Validation(format!(
-            "report '{}' has empty sql",
+            "query '{}' has empty sql",
             cfg.id
         )));
     }
@@ -286,7 +283,7 @@ pub fn compile_report(cfg: &ReportConfig) -> Result<ResolvedReport, ConfigError>
         sql = apply_param_casts(&sql, &casts_by_pos);
     }
 
-    Ok(ResolvedReport {
+    Ok(ResolvedQuery {
         id: cfg.id.clone(),
         name: cfg.name.clone(),
         description: cfg.description.clone(),
@@ -740,8 +737,8 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
         package_id,
     )
     .await?;
-    let reports =
-        load_config_table::<ReportConfig>(pool, &qualified_sys_table("_sys_reports"), package_id)
+    let queries =
+        load_config_table::<QueryConfig>(pool, &qualified_sys_table("_sys_queries"), package_id)
             .await?;
 
     let config = FullConfig {
@@ -753,7 +750,7 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
         relationships,
         api_entities,
         kv_stores,
-        reports,
+        queries,
     };
     Ok(config)
 }
@@ -786,7 +783,7 @@ where
 }
 
 #[cfg(test)]
-mod report_tests {
+mod query_tests {
     use super::*;
 
     #[test]
@@ -821,20 +818,20 @@ mod report_tests {
 
     #[test]
     fn injects_declared_casts_onto_placeholders() {
-        let cfg = ReportConfig {
+        let cfg = QueryConfig {
             id: "r1".into(),
             name: "R1".into(),
             description: None,
             schemas: vec![],
             sql: "SELECT * FROM t WHERE created_at >= :from AND n > :min".into(),
             params: vec![
-                ReportParam {
+                QueryParam {
                     name: "from".into(),
                     default: None,
                     db_type: Some("timestamptz".into()),
                     rule: ValidationRule::default(),
                 },
-                ReportParam {
+                QueryParam {
                     name: "min".into(),
                     default: None,
                     db_type: Some("numeric".into()),
@@ -844,7 +841,7 @@ mod report_tests {
             validate_on_register: None,
             cache_ttl_secs: None,
         };
-        let resolved = compile_report(&cfg).unwrap();
+        let resolved = compile_query(&cfg).unwrap();
         assert_eq!(
             resolved.sql,
             "SELECT * FROM t WHERE created_at >= $1::timestamptz AND n > $2::numeric"
@@ -867,7 +864,7 @@ mod report_tests {
 
     #[test]
     fn empty_sql_is_rejected() {
-        let cfg = ReportConfig {
+        let cfg = QueryConfig {
             id: "r".into(),
             name: "R".into(),
             description: None,
@@ -877,7 +874,7 @@ mod report_tests {
             validate_on_register: None,
             cache_ttl_secs: None,
         };
-        assert!(compile_report(&cfg).is_err());
+        assert!(compile_query(&cfg).is_err());
     }
 }
 

@@ -1,16 +1,16 @@
-//! Read-only reporting-query handlers.
+//! Read-only saved-query handlers.
 //!
-//! A *report* is a config kind (`_sys_reports`) holding trusted, parameterized SQL. Registration
+//! A *query* is a config kind (`_sys_queries`) holding trusted, parameterized SQL. Registration
 //! is restricted to the Platform Admin tenant; execution is authorized per-run via authrs (same
 //! model as generated entity APIs) and runs inside a sandboxed, read-only transaction:
 //! `SET TRANSACTION READ ONLY` + `statement_timeout` + an SDK-enforced row cap, plus RLS
 //! `app.tenant_id` for RLS tenants and an optional `SET LOCAL ROLE` to a dedicated read-only role.
 //!
-//! Registration/CRUD of report definitions lives here too (`POST /config/reports`,
-//! `PUT`/`DELETE /config/reports/:id`); reports carry no DDL so these are pure metadata writes.
+//! Registration/CRUD of query definitions lives here too (`POST /config/queries`,
+//! `PUT`/`DELETE /config/queries/:id`); queries carry no DDL so these are pure metadata writes.
 
 use crate::case::value_keys_to_camel_case;
-use crate::config::{compile_report, ReportConfig, ResolvedReport};
+use crate::config::{compile_query, QueryConfig, ResolvedQuery};
 use crate::error::AppError;
 use crate::extractors::tenant::{ActAsTenant, TenantId};
 use crate::extractors::user::UserId;
@@ -27,37 +27,37 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// `statement_timeout` (ms) applied to report queries. Env `ARCHITECT_REPORT_TIMEOUT_MS`, default 30000.
-fn report_timeout_ms() -> u64 {
+/// `statement_timeout` (ms) applied to saved queries. Env `ARCHITECT_QUERY_TIMEOUT_MS`, default 30000.
+fn query_timeout_ms() -> u64 {
     const DEFAULT: u64 = 30_000;
-    std::env::var("ARCHITECT_REPORT_TIMEOUT_MS")
+    std::env::var("ARCHITECT_QUERY_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT)
 }
 
-/// SDK-enforced maximum rows returned by a report. Env `ARCHITECT_REPORT_MAX_ROWS`, default 10000.
-fn report_max_rows() -> usize {
+/// SDK-enforced maximum rows returned by a query. Env `ARCHITECT_QUERY_MAX_ROWS`, default 10000.
+fn query_max_rows() -> usize {
     const DEFAULT: usize = 10_000;
-    std::env::var("ARCHITECT_REPORT_MAX_ROWS")
+    std::env::var("ARCHITECT_QUERY_MAX_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT)
 }
 
-/// Optional dedicated read-only DB role for report execution. Env `ARCHITECT_REPORT_ROLE`.
-fn report_role() -> Option<String> {
-    std::env::var("ARCHITECT_REPORT_ROLE")
+/// Optional dedicated read-only DB role for query execution. Env `ARCHITECT_QUERY_ROLE`.
+fn query_role() -> Option<String> {
+    std::env::var("ARCHITECT_QUERY_ROLE")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// Whether result caching is enabled globally. Env `ARCHITECT_REPORT_CACHE` in {1,true,yes,on}.
-fn report_cache_enabled() -> bool {
-    std::env::var("ARCHITECT_REPORT_CACHE")
+/// Whether result caching is enabled globally. Env `ARCHITECT_QUERY_CACHE` in {1,true,yes,on}.
+fn query_cache_enabled() -> bool {
+    std::env::var("ARCHITECT_QUERY_CACHE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -67,26 +67,24 @@ fn report_cache_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Default cache TTL (seconds) when a report does not specify its own. Env
-/// `ARCHITECT_REPORT_CACHE_TTL_SECS`, default 300.
-fn report_cache_default_ttl() -> i64 {
+/// Default cache TTL (seconds) when a query does not specify its own. Env
+/// `ARCHITECT_QUERY_CACHE_TTL_SECS`, default 300.
+fn query_cache_default_ttl() -> i64 {
     const DEFAULT: i64 = 300;
-    std::env::var("ARCHITECT_REPORT_CACHE_TTL_SECS")
+    std::env::var("ARCHITECT_QUERY_CACHE_TTL_SECS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|&n| n >= 0)
         .unwrap_or(DEFAULT)
 }
 
-/// Effective TTL for a report: its own `cache_ttl_secs` override, else the global default.
+/// Effective TTL for a query: its own `cache_ttl_secs` override, else the global default.
 /// Returns `None` when caching is disabled globally or the effective TTL is 0 (never cache).
-fn effective_cache_ttl(report: &ResolvedReport) -> Option<i64> {
-    if !report_cache_enabled() {
+fn effective_cache_ttl(query: &ResolvedQuery) -> Option<i64> {
+    if !query_cache_enabled() {
         return None;
     }
-    let ttl = report
-        .cache_ttl_secs
-        .unwrap_or_else(report_cache_default_ttl);
+    let ttl = query.cache_ttl_secs.unwrap_or_else(query_cache_default_ttl);
     if ttl > 0 {
         Some(ttl)
     } else {
@@ -95,7 +93,7 @@ fn effective_cache_ttl(report: &ResolvedReport) -> Option<i64> {
 }
 
 /// 64-bit FNV-1a hash rendered as 16 hex chars — a bounded, deterministic cache key. Collisions are
-/// astronomically unlikely and, because the cached envelope records the exact report/tenant/params,
+/// astronomically unlikely and, because the cached envelope records the exact query/tenant/params,
 /// a collision fails verification and is treated as a miss (never a wrong hit).
 fn fnv1a_hex(s: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -112,32 +110,32 @@ fn canonical_params(params: &HashMap<String, Value>) -> String {
     serde_json::to_string(&sorted).unwrap_or_default()
 }
 
-/// Build the cache key from report identity, effective tenant, SQL (so a definition change
+/// Build the cache key from query identity, effective tenant, SQL (so a definition change
 /// invalidates), and the merged params.
 fn cache_key_for(
-    report: &ResolvedReport,
+    query: &ResolvedQuery,
     tenant_id: &str,
     params: &HashMap<String, Value>,
 ) -> String {
     let material = format!(
         "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
-        report.package_id,
+        query.package_id,
         tenant_id,
-        report.id,
-        report.sql,
+        query.id,
+        query.sql,
         canonical_params(params),
     );
     fnv1a_hex(&material)
 }
 
 #[derive(Deserialize, Default)]
-pub struct RunReportRequest {
+pub struct RunQueryRequest {
     #[serde(default)]
     pub params: HashMap<String, Value>,
 }
 
-/// Registration/mutation of report definitions is restricted to the Platform Admin tenant, since
-/// the report body is trusted SQL executed verbatim.
+/// Registration/mutation of query definitions is restricted to the Platform Admin tenant, since
+/// the query body is trusted SQL executed verbatim.
 fn require_platform_admin(
     state: &AppState,
     tenant_id_opt: &Option<String>,
@@ -152,7 +150,7 @@ fn require_platform_admin(
         .ok_or_else(|| AppError::NotFound(format!("tenant not found: {}", tenant_id)))?;
     if tenant_id != crate::tenant::platform_tenant_id() {
         return Err(AppError::Forbidden(
-            "report registration is restricted to the Platform Admin tenant".into(),
+            "query registration is restricted to the Platform Admin tenant".into(),
         ));
     }
     Ok(())
@@ -171,10 +169,10 @@ async fn begin_readonly_tx(
     if let Some(sql) = state.dialect.set_read_only_sql() {
         sqlx::query(&sql).execute(&mut *tx).await?;
     }
-    if let Some(sql) = state.dialect.set_statement_timeout_sql(report_timeout_ms()) {
+    if let Some(sql) = state.dialect.set_statement_timeout_sql(query_timeout_ms()) {
         sqlx::query(&sql).execute(&mut *tx).await?;
     }
-    if let Some(role) = report_role() {
+    if let Some(role) = query_role() {
         if let Some(sql) = state.dialect.set_role_sql(&role) {
             sqlx::query(&sql).execute(&mut *tx).await?;
         }
@@ -187,20 +185,20 @@ async fn begin_readonly_tx(
     Ok(tx)
 }
 
-/// Clone the resolved report out of the active model (dropping the read lock before any await).
-fn lookup_report(state: &AppState, report_id: &str) -> Result<ResolvedReport, AppError> {
+/// Clone the resolved query out of the active model (dropping the read lock before any await).
+fn lookup_query(state: &AppState, query_id: &str) -> Result<ResolvedQuery, AppError> {
     let guard = state
         .model
         .read()
         .map_err(|_| AppError::BadRequest("state lock".into()))?;
     guard
-        .report(report_id)
+        .query(query_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("report not found: {}", report_id)))
+        .ok_or_else(|| AppError::NotFound(format!("query not found: {}", query_id)))
 }
 
-/// Serialize a report's public metadata (never the SQL) for list/get responses.
-fn report_metadata(r: &ResolvedReport) -> Value {
+/// Serialize a query's public metadata (never the SQL) for list/get responses.
+fn query_metadata(r: &ResolvedQuery) -> Value {
     let params: Vec<Value> = r
         .param_order
         .iter()
@@ -226,10 +224,10 @@ fn report_metadata(r: &ResolvedReport) -> Value {
 
 /// Validate a cached envelope against the current request and, if fresh and matching, build the
 /// run response. Returns `None` (a miss) when the envelope is expired, malformed, or does not match
-/// the exact report/tenant/params (guards against the astronomically unlikely key collision).
+/// the exact query/tenant/params (guards against the astronomically unlikely key collision).
 fn cache_hit_response(
     envelope: &Value,
-    report: &ResolvedReport,
+    query: &ResolvedQuery,
     effective_tenant: &str,
     params: &HashMap<String, Value>,
 ) -> Option<Value> {
@@ -238,7 +236,7 @@ fn cache_hit_response(
     if expires <= chrono::Utc::now() {
         return None;
     }
-    if envelope.get("report_id").and_then(Value::as_str) != Some(report.id.as_str()) {
+    if envelope.get("query_id").and_then(Value::as_str) != Some(query.id.as_str()) {
         return None;
     }
     if envelope.get("tenant_id").and_then(Value::as_str) != Some(effective_tenant) {
@@ -261,18 +259,18 @@ fn cache_hit_response(
         .unwrap_or(false);
     Some(json!({
         "data": result,
-        "meta": { "count": count, "report": report.id, "truncated": truncated, "cached": true },
+        "meta": { "count": count, "query": query.id, "truncated": truncated, "cached": true },
     }))
 }
 
-/// POST /api/v1/reports/:report_id/run — execute a report and return its rows.
-pub async fn run_report(
-    Path(report_id): Path<String>,
+/// POST /api/v1/queries/:query_id/run — execute a query and return its rows.
+pub async fn run_query(
+    Path(query_id): Path<String>,
     TenantId(tenant_id_opt): TenantId,
     ActAsTenant(act_as_opt): ActAsTenant,
     UserId(user_id_opt): UserId,
     State(state): State<AppState>,
-    body: Option<Json<RunReportRequest>>,
+    body: Option<Json<RunQueryRequest>>,
 ) -> Result<impl IntoResponse, AppError> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
@@ -284,25 +282,25 @@ pub async fn run_report(
     )
     .await?;
 
-    let report = lookup_report(&state, &report_id)?;
+    let query = lookup_query(&state, &query_id)?;
 
-    crate::authrs::check_report_permission_opt(
+    crate::authrs::check_query_permission_opt(
         &state.authrs_client,
         tenant_id_opt.as_deref(),
         user_id_opt.as_deref(),
-        &report,
+        &query,
         "run",
     )
     .await?;
 
     // Merge declared defaults for absent params, then validate the merged set.
     let mut params = req.params;
-    for (name, default) in &report.defaults {
+    for (name, default) in &query.defaults {
         params
             .entry(name.clone())
             .or_insert_with(|| default.clone());
     }
-    RequestValidator::validate(&params, &report.rules)?;
+    RequestValidator::validate(&params, &query.rules)?;
 
     // Effective tenant (an act-as target when impersonating, else the caller) scopes the cache.
     let effective_tenant = act_as_opt
@@ -313,25 +311,25 @@ pub async fn run_report(
         .to_string();
 
     // Cache lookup (when enabled): a fresh, verified envelope short-circuits execution.
-    let ttl = effective_cache_ttl(&report);
-    let cache_key = ttl.map(|_| cache_key_for(&report, &effective_tenant, &params));
+    let ttl = effective_cache_ttl(&query);
+    let cache_key = ttl.map(|_| cache_key_for(&query, &effective_tenant, &params));
     if let Some(key) = &cache_key {
-        if let Some(env) = crate::store::report_cache_get(
+        if let Some(env) = crate::store::query_cache_get(
             ctx.config_pool(),
             &effective_tenant,
-            &report.package_id,
+            &query.package_id,
             key,
         )
         .await?
         {
-            if let Some(resp) = cache_hit_response(&env, &report, &effective_tenant, &params) {
+            if let Some(resp) = cache_hit_response(&env, &query, &effective_tenant, &params) {
                 return Ok((StatusCode::OK, Json(resp)));
             }
         }
     }
 
     // Bind values in positional order; a referenced-but-absent param binds NULL.
-    let binds: Vec<Value> = report
+    let binds: Vec<Value> = query
         .param_order
         .iter()
         .map(|name| params.get(name).cloned().unwrap_or(Value::Null))
@@ -339,13 +337,9 @@ pub async fn run_report(
 
     // Wrap the trusted SQL in an outer LIMIT so the SDK caps result size; fetch one extra row to
     // detect truncation.
-    let max_rows = report_max_rows();
-    let inner = report.sql.trim().trim_end_matches(';');
-    let wrapped = format!(
-        "SELECT * FROM ({}) AS _report LIMIT {}",
-        inner,
-        max_rows + 1
-    );
+    let max_rows = query_max_rows();
+    let inner = query.sql.trim().trim_end_matches(';');
+    let wrapped = format!("SELECT * FROM ({}) AS _query LIMIT {}", inner, max_rows + 1);
 
     let mut tx = begin_readonly_tx(&state, &ctx).await?;
     let mut rows = {
@@ -369,24 +363,24 @@ pub async fn run_report(
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl);
         let envelope = json!({
             "expires_at": expires_at.to_rfc3339(),
-            "report_id": report.id,
+            "query_id": query.id,
             "tenant_id": effective_tenant,
             "params": canonical_params(&params),
             "result": rows,
             "row_count": count,
             "truncated": truncated,
         });
-        if let Err(e) = crate::store::report_cache_put(
+        if let Err(e) = crate::store::query_cache_put(
             ctx.config_pool(),
             state.dialect.as_ref(),
             &effective_tenant,
-            &report.package_id,
+            &query.package_id,
             key,
             &envelope,
         )
         .await
         {
-            tracing::warn!(report = %report.id, error = %e, "report cache write failed");
+            tracing::warn!(query = %query.id, error = %e, "query cache write failed");
         }
     }
 
@@ -394,13 +388,13 @@ pub async fn run_report(
         StatusCode::OK,
         Json(json!({
             "data": rows,
-            "meta": { "count": count, "report": report.id, "truncated": truncated, "cached": false },
+            "meta": { "count": count, "query": query.id, "truncated": truncated, "cached": false },
         })),
     ))
 }
 
-/// GET /api/v1/reports — list report metadata (never the SQL).
-pub async fn list_reports(
+/// GET /api/v1/queries — list query metadata (never the SQL).
+pub async fn list_queries(
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -410,7 +404,7 @@ pub async fn list_reports(
         .model
         .read()
         .map_err(|_| AppError::BadRequest("state lock".into()))?;
-    let mut data: Vec<Value> = guard.reports.values().map(report_metadata).collect();
+    let mut data: Vec<Value> = guard.queries.values().map(query_metadata).collect();
     data.sort_by(|a, b| {
         a["id"]
             .as_str()
@@ -424,27 +418,27 @@ pub async fn list_reports(
     ))
 }
 
-/// GET /api/v1/reports/:report_id — metadata for one report.
-pub async fn get_report(
-    Path(report_id): Path<String>,
+/// GET /api/v1/queries/:query_id — metadata for one query.
+pub async fn get_query(
+    Path(query_id): Path<String>,
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     resolve_tenant_context(&state, tenant_id_opt.as_deref(), None, None).await?;
-    let report = lookup_report(&state, &report_id)?;
+    let query = lookup_query(&state, &query_id)?;
     Ok((
         StatusCode::OK,
-        Json(json!({ "data": report_metadata(&report) })),
+        Json(json!({ "data": query_metadata(&query) })),
     ))
 }
 
-/// GET /api/v1/config/reports — raw stored report definitions (Platform Admin only, includes SQL).
-pub async fn get_reports_config(
+/// GET /api/v1/config/queries — raw stored query definitions (Platform Admin only, includes SQL).
+pub async fn get_queries_config(
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     require_platform_admin(&state, &tenant_id_opt)?;
-    let out = get_config(&state.pool, "reports", DEFAULT_PACKAGE_ID).await?;
+    let out = get_config(&state.pool, "queries", DEFAULT_PACKAGE_ID).await?;
     let count = out.len();
     Ok((
         StatusCode::OK,
@@ -452,17 +446,17 @@ pub async fn get_reports_config(
     ))
 }
 
-/// Compile + optionally EXPLAIN-validate a set of report definitions before persisting.
-async fn validate_reports(
+/// Compile + optionally EXPLAIN-validate a set of query definitions before persisting.
+async fn validate_queries(
     state: &AppState,
     tenant_id_opt: &Option<String>,
     bodies: &[Value],
-) -> Result<Vec<ResolvedReport>, AppError> {
-    let cfgs: Vec<ReportConfig> = serde_json::from_value(Value::Array(bodies.to_vec()))
-        .map_err(|e| AppError::BadRequest(format!("invalid reports: {}", e)))?;
-    let compiled: Vec<ResolvedReport> = cfgs
+) -> Result<Vec<ResolvedQuery>, AppError> {
+    let cfgs: Vec<QueryConfig> = serde_json::from_value(Value::Array(bodies.to_vec()))
+        .map_err(|e| AppError::BadRequest(format!("invalid queries: {}", e)))?;
+    let compiled: Vec<ResolvedQuery> = cfgs
         .iter()
-        .map(compile_report)
+        .map(compile_query)
         .collect::<Result<_, _>>()
         .map_err(AppError::Config)?;
 
@@ -480,25 +474,25 @@ async fn validate_reports(
             CrudService::run_readonly_query(&mut exec, &explain, &nulls)
                 .await
                 .map_err(|e| {
-                    AppError::Validation(format!("report '{}' failed validation: {}", r.id, e))
+                    AppError::Validation(format!("query '{}' failed validation: {}", r.id, e))
                 })?;
         }
     }
     Ok(compiled)
 }
 
-/// POST /api/v1/config/reports — replace the whole standalone (`_default`) report set.
-pub async fn post_reports(
+/// POST /api/v1/config/queries — replace the whole standalone (`_default`) query set.
+pub async fn post_queries(
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
     Json(body): Json<Vec<Value>>,
 ) -> Result<impl IntoResponse, AppError> {
     require_platform_admin(&state, &tenant_id_opt)?;
-    validate_reports(&state, &tenant_id_opt, &body).await?;
+    validate_queries(&state, &tenant_id_opt, &body).await?;
 
     let (out, num) = replace_config(
         &state.pool,
-        "reports",
+        "queries",
         body,
         false,
         DEFAULT_PACKAGE_ID,
@@ -515,10 +509,10 @@ pub async fn post_reports(
     ))
 }
 
-/// PUT /api/v1/config/reports/:report_id — upsert a single standalone report by id
+/// PUT /api/v1/config/queries/:query_id — upsert a single standalone query by id
 /// (read-merge-write, preserving the rest of the set).
-pub async fn put_report_by_id(
-    Path(report_id): Path<String>,
+pub async fn put_query_by_id(
+    Path(query_id): Path<String>,
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
@@ -527,24 +521,24 @@ pub async fn put_report_by_id(
 
     let obj = body
         .as_object_mut()
-        .ok_or_else(|| AppError::BadRequest("report body must be a JSON object".into()))?;
+        .ok_or_else(|| AppError::BadRequest("query body must be a JSON object".into()))?;
     // Path id is authoritative.
-    obj.insert("id".into(), Value::String(report_id.clone()));
+    obj.insert("id".into(), Value::String(query_id.clone()));
 
-    // Compile + EXPLAIN-validate this one report.
-    validate_reports(&state, &tenant_id_opt, std::slice::from_ref(&body)).await?;
+    // Compile + EXPLAIN-validate this one query.
+    validate_queries(&state, &tenant_id_opt, std::slice::from_ref(&body)).await?;
 
     // Merge into the current _default set.
-    let current = get_config(&state.pool, "reports", DEFAULT_PACKAGE_ID).await?;
+    let current = get_config(&state.pool, "queries", DEFAULT_PACKAGE_ID).await?;
     let mut merged: Vec<Value> = current
         .into_iter()
-        .filter(|r| r.get("id").and_then(Value::as_str) != Some(report_id.as_str()))
+        .filter(|r| r.get("id").and_then(Value::as_str) != Some(query_id.as_str()))
         .collect();
     merged.push(body.clone());
 
     let (_out, num) = replace_config(
         &state.pool,
-        "reports",
+        "queries",
         merged,
         false,
         DEFAULT_PACKAGE_ID,
@@ -557,32 +551,29 @@ pub async fn put_report_by_id(
     Ok((StatusCode::OK, Json(json!({ "data": body }))))
 }
 
-/// DELETE /api/v1/config/reports/:report_id — remove a single standalone report by id.
-pub async fn delete_report_by_id(
-    Path(report_id): Path<String>,
+/// DELETE /api/v1/config/queries/:query_id — remove a single standalone query by id.
+pub async fn delete_query_by_id(
+    Path(query_id): Path<String>,
     TenantId(tenant_id_opt): TenantId,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     require_platform_admin(&state, &tenant_id_opt)?;
 
-    let current = get_config(&state.pool, "reports", DEFAULT_PACKAGE_ID).await?;
+    let current = get_config(&state.pool, "queries", DEFAULT_PACKAGE_ID).await?;
     let existed = current
         .iter()
-        .any(|r| r.get("id").and_then(Value::as_str) == Some(report_id.as_str()));
+        .any(|r| r.get("id").and_then(Value::as_str) == Some(query_id.as_str()));
     if !existed {
-        return Err(AppError::NotFound(format!(
-            "report not found: {}",
-            report_id
-        )));
+        return Err(AppError::NotFound(format!("query not found: {}", query_id)));
     }
     let merged: Vec<Value> = current
         .into_iter()
-        .filter(|r| r.get("id").and_then(Value::as_str) != Some(report_id.as_str()))
+        .filter(|r| r.get("id").and_then(Value::as_str) != Some(query_id.as_str()))
         .collect();
 
     let (_out, num) = replace_config(
         &state.pool,
-        "reports",
+        "queries",
         merged,
         false,
         DEFAULT_PACKAGE_ID,
@@ -594,6 +585,6 @@ pub async fn delete_report_by_id(
     }
     Ok((
         StatusCode::OK,
-        Json(json!({ "data": { "id": report_id, "deleted": true } })),
+        Json(json!({ "data": { "id": query_id, "deleted": true } })),
     ))
 }

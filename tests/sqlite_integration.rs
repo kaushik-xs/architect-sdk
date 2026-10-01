@@ -114,7 +114,7 @@ fn notes_config() -> FullConfig {
             mcp: None,
         }],
         kv_stores: vec![],
-        reports: vec![],
+        queries: vec![],
     }
 }
 
@@ -204,7 +204,7 @@ fn users_config() -> FullConfig {
             mcp: None,
         }],
         kv_stores: vec![],
-        reports: vec![],
+        queries: vec![],
     }
 }
 

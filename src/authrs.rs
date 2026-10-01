@@ -7,7 +7,7 @@
 //! Action format:   `{httpVerb}{PascalCaseTableName}` e.g. `getMaterials`, `postMaterials`
 
 use crate::case::to_camel_case;
-use crate::config::{ResolvedEntity, ResolvedReport};
+use crate::config::{ResolvedEntity, ResolvedQuery};
 use crate::error::AppError;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -153,18 +153,18 @@ pub async fn check_entity_permission_opt(
     Ok(())
 }
 
-/// Check report permission against authrs. No-op when authrs is not configured (client_opt is None).
+/// Check query permission against authrs. No-op when authrs is not configured (client_opt is None).
 ///
-/// Mirrors [`check_entity_permission_opt`] for the reports feature. Requires `X-User-ID` when
+/// Mirrors [`check_entity_permission_opt`] for the queries feature. Requires `X-User-ID` when
 /// authrs is configured.
 ///
-/// Resource format: `service:{SERVICE_NAME}/package:{package_id}/report:{report_id}`
+/// Resource format: `service:{SERVICE_NAME}/package:{package_id}/query:{query_id}`
 /// Action format:   `{action}` (e.g. `run`).
-pub async fn check_report_permission_opt(
+pub async fn check_query_permission_opt(
     client_opt: &Option<Arc<AuthrsClient>>,
     tenant_id: Option<&str>,
     user_id: Option<&str>,
-    report: &ResolvedReport,
+    query: &ResolvedQuery,
     action: &str,
 ) -> Result<(), AppError> {
     let client = match client_opt {
@@ -177,15 +177,15 @@ pub async fn check_report_permission_opt(
     let tenant_id = tenant_id.unwrap_or("");
 
     let resource = format!(
-        "service:{}/package:{}/report:{}",
-        client.service_name, report.package_id, report.id
+        "service:{}/package:{}/query:{}",
+        client.service_name, query.package_id, query.id
     );
 
     tracing::debug!(
         user_id = %user_id,
         resource = %resource,
         action = %action,
-        "checking authrs report permission"
+        "checking authrs query permission"
     );
 
     let allowed = client.check(tenant_id, user_id, &resource, action).await?;
@@ -196,7 +196,7 @@ pub async fn check_report_permission_opt(
             tenant_id = %tenant_id,
             resource = %resource,
             action = %action,
-            "report permission granted"
+            "query permission granted"
         );
     } else {
         tracing::warn!(
@@ -204,7 +204,7 @@ pub async fn check_report_permission_opt(
             tenant_id = %tenant_id,
             resource = %resource,
             action = %action,
-            "report permission denied"
+            "query permission denied"
         );
         return Err(AppError::Unauthorized(format!(
             "action '{}' not permitted on '{}'",

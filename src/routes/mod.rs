@@ -3,8 +3,8 @@
 mod common;
 mod config;
 mod entity;
-mod reports;
+mod queries;
 pub use common::*;
 pub use config::*;
 pub use entity::*;
-pub use reports::*;
+pub use queries::*;

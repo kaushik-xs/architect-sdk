@@ -993,7 +993,7 @@ impl CrudService {
 
     /// Execute an arbitrary read-only query with positional params, returning rows as JSON.
     ///
-    /// Used by the reports feature. The caller is responsible for opening a read-only, sandboxed
+    /// Used by the queries feature. The caller is responsible for opening a read-only, sandboxed
     /// transaction (SET TRANSACTION READ ONLY + statement_timeout, and RLS `app.tenant_id`) and
     /// passing a `TenantExecutor::conn` bound to it; this method only binds params and serializes
     /// rows via the same `row_to_json` used for entity CRUD.

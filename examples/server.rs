@@ -3,7 +3,7 @@
 
 use architect_sdk::{
     apply_migrations, common_routes_with_ready, config_routes, create_pool, ensure_database_exists,
-    ensure_sys_tables, entity_routes, load_from_pool, load_registry_from_pool, report_routes,
+    ensure_sys_tables, entity_routes, load_from_pool, load_registry_from_pool, query_routes,
     resolve, AppState, FullConfig, DEFAULT_PACKAGE_ID,
 };
 use axum::Router;
@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api = Router::new()
         .merge(common_routes_with_ready(state.clone()))
         .nest("/api/v1", config_routes(state.clone()))
-        .nest("/api/v1", report_routes(state.clone()))
+        .nest("/api/v1", query_routes(state.clone()))
         .nest("/api/v1", entity_routes(state));
 
     let app = Router::new()
@@ -254,9 +254,9 @@ async fn load_config_from_package_path(
     let kv_stores: Vec<architect_sdk::config::KvStoreConfig> =
         serde_json::from_value(serde_json::Value::Array(kv_stores_raw))?;
 
-    let reports_raw = read_kind_from_dir(&dir, "reports").await?;
-    let reports: Vec<architect_sdk::config::ReportConfig> =
-        serde_json::from_value(serde_json::Value::Array(reports_raw))?;
+    let queries_raw = read_kind_from_dir(&dir, "queries").await?;
+    let queries: Vec<architect_sdk::config::QueryConfig> =
+        serde_json::from_value(serde_json::Value::Array(queries_raw))?;
 
     Ok((
         FullConfig {
@@ -268,7 +268,7 @@ async fn load_config_from_package_path(
             relationships,
             api_entities,
             kv_stores,
-            reports,
+            queries,
         },
         package_id,
     ))

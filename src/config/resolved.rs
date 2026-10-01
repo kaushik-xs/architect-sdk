@@ -92,16 +92,16 @@ pub struct ResolvedEntity {
     pub extensible_columns: Vec<String>,
 }
 
-/// A report whose named params have been translated to positional placeholders and whose
-/// validation rules/defaults are indexed by param name. Built from [`crate::config::types::ReportConfig`]
-/// during `resolve()`. Reports produce no [`ResolvedEntity`] — they are data-plane only, looked up
+/// A query whose named params have been translated to positional placeholders and whose
+/// validation rules/defaults are indexed by param name. Built from [`crate::config::types::QueryConfig`]
+/// during `resolve()`. Queries produce no [`ResolvedEntity`] — they are data-plane only, looked up
 /// by id when a run request arrives.
 #[derive(Clone, Debug)]
-pub struct ResolvedReport {
+pub struct ResolvedQuery {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    /// Package id this report belongs to. Set via ResolvedModel::with_package_id().
+    /// Package id this query belongs to. Set via ResolvedModel::with_package_id().
     pub package_id: String,
     /// SQL schemas the query references.
     pub schemas: Vec<String>,
@@ -118,8 +118,8 @@ pub struct ResolvedReport {
     pub casts: HashMap<String, String>,
     /// Whether to EXPLAIN-validate the SQL at registration time.
     pub validate_on_register: bool,
-    /// Per-report result-cache TTL override (seconds). `None` = use the global default TTL;
-    /// `Some(0)` = never cache this report.
+    /// Per-query result-cache TTL override (seconds). `None` = use the global default TTL;
+    /// `Some(0)` = never cache this query.
     pub cache_ttl_secs: Option<i64>,
 }
 
@@ -127,8 +127,8 @@ pub struct ResolvedReport {
 pub struct ResolvedModel {
     pub entities: Vec<ResolvedEntity>,
     pub entity_by_path: HashMap<String, ResolvedEntity>,
-    /// Reports available for execution, keyed by report id.
-    pub reports: HashMap<String, ResolvedReport>,
+    /// Queries available for execution, keyed by query id.
+    pub queries: HashMap<String, ResolvedQuery>,
 }
 
 impl ResolvedModel {
@@ -136,12 +136,12 @@ impl ResolvedModel {
         self.entity_by_path.get(path)
     }
 
-    /// Look up a report by id.
-    pub fn report(&self, id: &str) -> Option<&ResolvedReport> {
-        self.reports.get(id)
+    /// Look up a query by id.
+    pub fn query(&self, id: &str) -> Option<&ResolvedQuery> {
+        self.queries.get(id)
     }
 
-    /// Backfill `package_id` on all contained entities and reports. Call this after `resolve()`
+    /// Backfill `package_id` on all contained entities and queries. Call this after `resolve()`
     /// when the package id is known (e.g. from manifest.id or the route parameter).
     pub fn with_package_id(mut self, package_id: &str) -> Self {
         for e in &mut self.entities {
@@ -150,7 +150,7 @@ impl ResolvedModel {
         for e in self.entity_by_path.values_mut() {
             e.package_id = package_id.to_string();
         }
-        for r in self.reports.values_mut() {
+        for r in self.queries.values_mut() {
             r.package_id = package_id.to_string();
         }
         self

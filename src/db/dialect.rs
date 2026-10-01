@@ -142,7 +142,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// Returns `None` when the dialect has no such mechanism.
     fn set_tenant_session_sql(&self, tenant_id: &str) -> Option<String>;
 
-    // ── Read-only query sandbox (reports) ─────────────────────────────────────
+    // ── Read-only query sandbox (saved queries) ─────────────────────────────────────
     // Statements issued inside a transaction to sandbox an ad-hoc read-only query. Each returns
     // `None` when the dialect has no equivalent, in which case the caller simply omits it (the
     // guarantee then rests on the other layers, e.g. a read-only DB role).

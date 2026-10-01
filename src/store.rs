@@ -25,7 +25,13 @@ const CONFIG_TABLES: &[&str] = &[
     "_sys_relationships",
     "_sys_api_entities",
     "_sys_kv_stores",
-    "_sys_reports",
+    "_sys_queries",
+];
+
+/// `(old, new)` _sys_* table names renamed in place by `ensure_sys_tables`.
+const LEGACY_TABLE_RENAMES: &[(&str, &str)] = &[
+    ("_sys_reports", "_sys_queries"),
+    ("_sys_reports_history", "_sys_queries_history"),
 ];
 
 /// Package id used when config is posted directly (no package install). Ensures (id, package_id) is unique per package.
@@ -39,6 +45,23 @@ pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(),
         sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
             .execute(pool)
             .await?;
+    }
+
+    // The `reports` config kind was renamed to `queries`. Carry an existing `_sys_reports` table
+    // (and its history) over before the CREATE below, so stored definitions are not orphaned.
+    // Best-effort: fails harmlessly when the old table is absent or the new one already exists.
+    for (old, new) in LEGACY_TABLE_RENAMES {
+        let target = if dialect.name() == "mysql" {
+            qualified_sys_table(new)
+        } else {
+            (*new).to_string()
+        };
+        let rename = format!(
+            "ALTER TABLE {} RENAME TO {}",
+            qualified_sys_table(old),
+            target
+        );
+        let _ = sqlx::query(&rename).execute(pool).await;
     }
 
     for table in CONFIG_TABLES {
@@ -236,16 +259,16 @@ pub async fn ensure_sys_tables(pool: &Pool, dialect: &dyn Dialect) -> Result<(),
     Ok(())
 }
 
-/// Reserved `_sys_kv_data` namespace holding cached report results. Not a configured KV store, so
+/// Reserved `_sys_kv_data` namespace holding cached query results. Not a configured KV store, so
 /// the normal namespace-existence check is bypassed for these rows.
-pub const REPORT_CACHE_NAMESPACE: &str = "__report_cache__";
+pub const QUERY_CACHE_NAMESPACE: &str = "__query_cache__";
 
-/// Fetch a cached report envelope (the JSON value stored under the reserved cache namespace), or
+/// Fetch a cached query envelope (the JSON value stored under the reserved cache namespace), or
 /// `None` when absent. Expiry and request-match verification are the caller's responsibility — the
 /// TTL lives as a field inside the returned envelope, not as a column. The lookup key is a bounded
 /// hash, so a collision (astronomically unlikely) surfaces as an envelope that fails the caller's
 /// verification and is treated as a miss, never a wrong hit.
-pub async fn report_cache_get(
+pub async fn query_cache_get(
     pool: &Pool,
     tenant_id: &str,
     package_id: &str,
@@ -259,7 +282,7 @@ pub async fn report_cache_get(
     let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
         .bind(tenant_id)
         .bind(package_id)
-        .bind(REPORT_CACHE_NAMESPACE)
+        .bind(QUERY_CACHE_NAMESPACE)
         .bind(cache_key)
         .fetch_optional(pool)
         .await
@@ -267,9 +290,9 @@ pub async fn report_cache_get(
     Ok(row.map(|(v,)| v))
 }
 
-/// Upsert a cached report envelope into `_sys_kv_data` under the reserved cache namespace. Uses the
+/// Upsert a cached query envelope into `_sys_kv_data` under the reserved cache namespace. Uses the
 /// UPDATE-then-INSERT pattern (like `kv_put`) to stay dialect-portable.
-pub async fn report_cache_put(
+pub async fn query_cache_put(
     pool: &Pool,
     dialect: &dyn Dialect,
     tenant_id: &str,
@@ -287,7 +310,7 @@ pub async fn report_cache_put(
     let res = sqlx::query(&update_sql)
         .bind(tenant_id)
         .bind(package_id)
-        .bind(REPORT_CACHE_NAMESPACE)
+        .bind(QUERY_CACHE_NAMESPACE)
         .bind(cache_key)
         .bind(envelope)
         .execute(pool)
@@ -301,7 +324,7 @@ pub async fn report_cache_put(
         sqlx::query(&insert_sql)
             .bind(tenant_id)
             .bind(package_id)
-            .bind(REPORT_CACHE_NAMESPACE)
+            .bind(QUERY_CACHE_NAMESPACE)
             .bind(cache_key)
             .bind(envelope)
             .execute(pool)
@@ -969,7 +992,7 @@ pub fn sys_table_for_kind(kind: &str) -> Option<&'static str> {
         "relationships" => Some("_sys_relationships"),
         "api_entities" => Some("_sys_api_entities"),
         "kv_stores" => Some("_sys_kv_stores"),
-        "reports" => Some("_sys_reports"),
+        "queries" => Some("_sys_queries"),
         _ => None,
     }
 }

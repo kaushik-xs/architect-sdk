@@ -87,7 +87,7 @@ const CONFIG_KINDS: &[&str] = &[
     "relationships",
     "api_entities",
     "kv_stores",
-    "reports",
+    "queries",
 ];
 
 /// Dependencies for each config kind: these must be applied before this kind.
@@ -102,9 +102,9 @@ fn dependencies(kind: &str) -> &'static [&'static str] {
         "relationships" => &["schemas", "tables", "columns"],
         "api_entities" => &["tables"],
         "kv_stores" => &[],
-        // Reports reference tables/columns; ordering them last lets EXPLAIN-on-install
+        // Queries reference tables/columns; ordering them last lets EXPLAIN-on-install
         // (when enabled) plan against schema that already exists.
-        "reports" => &["tables", "columns"],
+        "queries" => &["tables", "columns"],
         _ => &[],
     }
 }
@@ -162,7 +162,7 @@ fn assemble_config(bodies: &[(&'static str, Vec<Value>)]) -> Result<FullConfig, 
         relationships: de(bodies, "relationships")?,
         api_entities: de(bodies, "api_entities")?,
         kv_stores: de(bodies, "kv_stores")?,
-        reports: de(bodies, "reports")?,
+        queries: de(bodies, "queries")?,
     })
 }
 
@@ -1528,6 +1528,6 @@ fn build_full_config_from_values(
         relationships: parse_kind(values, "relationships")?,
         api_entities: parse_kind(values, "api_entities")?,
         kv_stores: parse_kind(values, "kv_stores")?,
-        reports: parse_kind(values, "reports")?,
+        queries: parse_kind(values, "queries")?,
     })
 }

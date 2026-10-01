@@ -39,7 +39,7 @@ pub mod store;
 pub mod tenant;
 
 pub use config::{
-    load_from_pool, resolve, FullConfig, ResolvedEntity, ResolvedModel, ResolvedReport,
+    load_from_pool, resolve, FullConfig, ResolvedEntity, ResolvedModel, ResolvedQuery,
 };
 pub use db::{introspect, DbSnapshot};
 pub use error::{AppError, ConfigError};
@@ -53,7 +53,7 @@ pub use migration::{
 };
 pub use response::{error_body, success_many, success_one};
 pub use routes::{
-    common_routes, common_routes_with_ready, config_routes, entity_routes, report_routes,
+    common_routes, common_routes_with_ready, config_routes, entity_routes, query_routes,
 };
 pub use service::{CrudService, TenantExecutor};
 pub use state::AppState;
