@@ -28,6 +28,7 @@
           "authentication": "bearer",
           "method": "POST",
           "path": "/api/v1/views/refresh-stale",
+          "timeout": "10m",
           "headers": {
             "X-Tenant-ID": "{{ global.PLATFORM_TENANT_ID }}"
           },
