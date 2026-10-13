@@ -8,9 +8,11 @@ use crate::error::AppError;
 use crate::extractors::tenant::TenantId;
 use crate::handlers::config::{reload_model, replace_config};
 use crate::handlers::entity::{get_or_create_tenant_pool, resolve_tenant_context};
+use crate::handlers::package_deps::{manifest_dependencies, satisfies};
+use crate::handlers::views::refresh_scope_for;
 use crate::migration::{
     apply_migrations, apply_rls_to_tables, compute_migration_plan, execute_migration_plan,
-    revert_migrations, MigrationPlan,
+    find_external_dependent_views, find_views_blocking_upgrade, revert_migrations, MigrationPlan,
 };
 use crate::state::AppState;
 use crate::store::{
@@ -88,6 +90,7 @@ const CONFIG_KINDS: &[&str] = &[
     "api_entities",
     "kv_stores",
     "queries",
+    "views",
 ];
 
 /// Dependencies for each config kind: these must be applied before this kind.
@@ -100,7 +103,9 @@ fn dependencies(kind: &str) -> &'static [&'static str] {
         "columns" => &["tables"],
         "indexes" => &["schemas", "tables"],
         "relationships" => &["schemas", "tables", "columns"],
-        "api_entities" => &["tables"],
+        // Views read tables (and FK-related data), so they follow every table-level kind.
+        "views" => &["schemas", "tables", "columns", "relationships"],
+        "api_entities" => &["tables", "views"],
         "kv_stores" => &[],
         // Queries reference tables/columns; ordering them last lets EXPLAIN-on-install
         // (when enabled) plan against schema that already exists.
@@ -163,7 +168,17 @@ fn assemble_config(bodies: &[(&'static str, Vec<Value>)]) -> Result<FullConfig, 
         api_entities: de(bodies, "api_entities")?,
         kv_stores: de(bodies, "kv_stores")?,
         queries: de(bodies, "queries")?,
+        views: de(bodies, "views")?,
     })
+}
+
+/// Default the schema references of a package config kind to the manifest's schema.
+fn default_schema_ids(kind: &str, body: &mut [Value]) {
+    match kind {
+        "enums" | "tables" | "indexes" | "views" => inject_schema_id(body, DEFAULT_SCHEMA_ID),
+        "relationships" => inject_relationship_schema_ids(body, DEFAULT_SCHEMA_ID),
+        _ => {}
+    }
 }
 
 fn inject_schema_id(body: &mut [Value], schema_id: &str) {
@@ -267,65 +282,80 @@ async fn apply_ddl_to_pool(
         // Upgrade path: execute the pre-computed diff plan.
         Some(p) => {
             let migration_id = Uuid::new_v4().to_string();
-            match execute_migration_plan(
-                migration_pool,
-                config_pool,
-                p,
-                &migration_id,
-                package_id,
-                target,
-                from_version,
-                to_version,
-                dialect,
-                // Direct install/upgrade has no confirmation step, so destructive drops never run
-                // here — dropping a column requires the explicit preview → apply flow.
-                false,
-            )
-            .await
-            {
-                Ok(result) => {
-                    // The diff-based migration plan does not add the RLS tenant column / policies
-                    // to newly created (or pre-existing) tables. For RLS targets, reconcile them
-                    // here so inserts that inject `tenant_id` don't fail with "column does not exist".
-                    if let Some(col) = rls_tenant_column {
-                        if let Err(e) =
-                            apply_rls_to_tables(migration_pool, config, None, col, dialect).await
-                        {
-                            tracing::warn!(target, strategy, error = %e, "RLS reconciliation failed after upgrade");
-                            return TenantMigrationOutcome {
-                                target: target.to_string(),
-                                strategy: strategy.to_string(),
-                                status: "failed".to_string(),
-                                warnings: result.warnings,
-                                skipped: result.skips,
-                                error: Some(format!("RLS reconciliation failed: {}", e)),
-                            };
-                        }
-                    }
-                    TenantMigrationOutcome {
-                        target: target.to_string(),
-                        strategy: strategy.to_string(),
-                        status: if result.warned > 0 {
-                            "applied_with_warnings".to_string()
-                        } else {
-                            "applied".to_string()
-                        },
-                        warnings: result.warnings,
-                        skipped: result.skips,
-                        error: None,
-                    }
+            let target_plan = p.for_target(rls_tenant_column.is_some(), dialect);
+            // RLS targets reconcile the tenant column / policies between the table steps and
+            // the view creations: the diff plan never adds them, and views may read them.
+            let (before_views, view_creates) = match rls_tenant_column {
+                Some(_) => target_plan.split_view_creates(),
+                None => (target_plan, MigrationPlan { steps: vec![] }),
+            };
+            let failed = |warnings: Vec<String>, skipped: Vec<String>, error: String| {
+                tracing::warn!(target, strategy, error = %error, "DDL broadcast failed (upgrade)");
+                TenantMigrationOutcome {
+                    target: target.to_string(),
+                    strategy: strategy.to_string(),
+                    status: "failed".to_string(),
+                    warnings,
+                    skipped,
+                    error: Some(error),
                 }
-                Err(e) => {
-                    tracing::warn!(target, strategy, error = %e, "DDL broadcast failed (upgrade)");
-                    TenantMigrationOutcome {
-                        target: target.to_string(),
-                        strategy: strategy.to_string(),
-                        status: "failed".to_string(),
-                        warnings: vec![],
-                        skipped: vec![],
-                        error: Some(e.to_string()),
-                    }
+            };
+            let run = |plan: MigrationPlan| {
+                let migration_id = migration_id.clone();
+                async move {
+                    execute_migration_plan(
+                        migration_pool,
+                        config_pool,
+                        &plan,
+                        &migration_id,
+                        package_id,
+                        target,
+                        from_version,
+                        to_version,
+                        dialect,
+                        // Direct install/upgrade has no confirmation step, so destructive drops
+                        // never run here — dropping a column requires the preview → apply flow.
+                        false,
+                    )
+                    .await
                 }
+            };
+            let mut result = match run(before_views).await {
+                Ok(r) => r,
+                Err(e) => return failed(vec![], vec![], e.to_string()),
+            };
+            if let Some(col) = rls_tenant_column {
+                if let Err(e) =
+                    apply_rls_to_tables(migration_pool, config, None, col, dialect).await
+                {
+                    return failed(
+                        result.warnings,
+                        result.skips,
+                        format!("RLS reconciliation failed: {}", e),
+                    );
+                }
+            }
+            if !view_creates.steps.is_empty() {
+                match run(view_creates).await {
+                    Ok(r) => {
+                        result.warned += r.warned;
+                        result.warnings.extend(r.warnings);
+                        result.skips.extend(r.skips);
+                    }
+                    Err(e) => return failed(result.warnings, result.skips, e.to_string()),
+                }
+            }
+            TenantMigrationOutcome {
+                target: target.to_string(),
+                strategy: strategy.to_string(),
+                status: if result.warned > 0 {
+                    "applied_with_warnings".to_string()
+                } else {
+                    "applied".to_string()
+                },
+                warnings: result.warnings,
+                skipped: result.skips,
+                error: None,
             }
         }
         // Fresh install path: apply the full schema.
@@ -364,15 +394,11 @@ async fn apply_ddl_to_pool(
     }
 }
 
-/// Apply DDL for a package to every registered tenant database.
+/// Apply DDL for a package to every registered tenant database (see [`ddl_targets`]).
 ///
-/// Targets (in order):
-/// 1. Central architect DB — once, if any RLS tenants share it (no dedicated database_url).
-/// 2. RLS tenants with a dedicated database_url — per unique URL, with RLS column enabled.
-/// 3. Database-strategy tenants — per tenant, without RLS column.
-///
-/// Failures on individual targets are collected as outcomes and do NOT abort the broadcast;
-/// the `_sys_*` config has already been committed and must not be rolled back here.
+/// Failures on individual targets are collected as outcomes and do NOT abort the broadcast.
+/// The one exception is checked before any target changes: an upgrade that would retype or drop
+/// a column views in other packages read is rejected with 409.
 async fn broadcast_ddl(
     state: &AppState,
     config_pool: &Pool,
@@ -381,7 +407,7 @@ async fn broadcast_ddl(
     package_id: &str,
     from_version: Option<&str>,
     to_version: &str,
-) -> Vec<TenantMigrationOutcome> {
+) -> Result<Vec<TenantMigrationOutcome>, AppError> {
     let mut outcomes = Vec::new();
 
     // Load all other installed packages so cross-package FK resolution works.
@@ -429,33 +455,59 @@ async fn broadcast_ddl(
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::error!(error = %e, "could not compute migration plan for broadcast");
-                    return vec![TenantMigrationOutcome {
+                    return Ok(vec![TenantMigrationOutcome {
                         target: "all".to_string(),
                         strategy: "n/a".to_string(),
                         status: "failed".to_string(),
                         warnings: vec![],
                         skipped: vec![],
                         error: Some(format!("migration plan error: {}", e)),
-                    }];
+                    }]);
                 }
             }
         }
         None => None,
     };
 
-    // ── 1. Central DB — covers all RLS tenants without a dedicated database_url ──
-    if state.tenant_registry.has_shared_rls_tenants() {
+    let targets = ddl_targets(state).await;
+
+    // An upgrade must not retype or drop a column that views in other packages read: Postgres
+    // refuses the ALTER, which would leave the stored config ahead of the database. Check every
+    // target before any of them changes.
+    if let (Some(p), Some(old)) = (plan.as_ref(), old_config) {
+        for t in &targets {
+            if let Ok(pool) = &t.pool {
+                reject_upgrade_blocked_by_views(state, pool, old, p, package_id).await?;
+            }
+        }
+    }
+
+    for t in targets {
+        let pool = match t.pool {
+            Ok(p) => p,
+            Err(e) => {
+                outcomes.push(TenantMigrationOutcome {
+                    target: t.name,
+                    strategy: t.strategy.to_string(),
+                    status: "failed".to_string(),
+                    warnings: vec![],
+                    skipped: vec![],
+                    error: Some(format!("connection failed: {}", e)),
+                });
+                continue;
+            }
+        };
         let outcome = apply_ddl_to_pool(
-            &state.pool,
+            &pool,
             config_pool,
             config,
             plan.as_ref(),
             package_id,
-            "central_rls_db",
-            "rls",
+            &t.name,
+            t.strategy,
             from_version,
             to_version,
-            Some(crate::migration::RLS_TENANT_COLUMN),
+            t.rls_column,
             state.dialect.as_ref(),
             &cross_package_configs,
         )
@@ -463,82 +515,94 @@ async fn broadcast_ddl(
         outcomes.push(outcome);
     }
 
-    // ── 2. RLS tenants with their own dedicated DB ──
+    Ok(outcomes)
+}
+
+/// 409 when views in other packages read a column `plan` retypes or drops (single target).
+async fn reject_upgrade_blocked_by_views(
+    state: &AppState,
+    pool: &Pool,
+    installed: &FullConfig,
+    plan: &MigrationPlan,
+    package_id: &str,
+) -> Result<(), AppError> {
+    let blockers =
+        find_views_blocking_upgrade(pool, state.dialect.as_ref(), installed, plan).await?;
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "cannot upgrade '{}': views in other packages read columns this upgrade retypes or \
+         drops: [{}]; update or uninstall those packages first",
+        package_id,
+        blockers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// A database a package's DDL is applied to.
+pub(crate) struct DdlTarget {
+    /// Tenant id, or "central_rls_db" for the shared architect DB.
+    pub name: String,
+    pub strategy: &'static str,
+    pub rls_column: Option<&'static str>,
+    /// The connection, or why it could not be made.
+    pub pool: Result<Pool, String>,
+    /// Key for this database's materialized-view refresh status (see
+    /// [`crate::handlers::views::refresh_scope_for`]).
+    pub refresh_scope: String,
+}
+
+/// Every database a package's DDL goes to, in order:
+/// 1. Central architect DB — once, if any RLS tenants share it (no dedicated database_url).
+/// 2. RLS tenants with a dedicated database_url — once per unique URL, with the RLS column.
+/// 3. Database-strategy tenants — one each, without the RLS column.
+pub(crate) async fn ddl_targets(state: &AppState) -> Vec<DdlTarget> {
+    let mut targets = Vec::new();
+    if state.tenant_registry.has_shared_rls_tenants() {
+        targets.push(DdlTarget {
+            name: "central_rls_db".to_string(),
+            strategy: "rls",
+            rls_column: Some(crate::migration::RLS_TENANT_COLUMN),
+            pool: Ok(state.pool.clone()),
+            refresh_scope: refresh_scope_for(true, "", None),
+        });
+    }
     // Deduplicate by URL — multiple RLS tenants may share the same DB.
     let mut seen_rls_urls: HashSet<String> = HashSet::new();
     for (tid, db_url) in state.tenant_registry.rls_dedicated_db_targets() {
         if !seen_rls_urls.insert(db_url.clone()) {
-            continue; // already migrated this DB
+            continue;
         }
-        let pool = match get_or_create_tenant_pool(state, &tid, &db_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(target = %tid, error = %e, "could not connect to dedicated RLS tenant DB");
-                outcomes.push(TenantMigrationOutcome {
-                    target: tid.clone(),
-                    strategy: "rls".to_string(),
-                    status: "failed".to_string(),
-                    warnings: vec![],
-                    skipped: vec![],
-                    error: Some(format!("connection failed: {}", e)),
-                });
-                continue;
-            }
-        };
-        let outcome = apply_ddl_to_pool(
-            &pool,
-            config_pool,
-            config,
-            plan.as_ref(),
-            package_id,
-            &tid,
-            "rls",
-            from_version,
-            to_version,
-            Some(crate::migration::RLS_TENANT_COLUMN),
-            state.dialect.as_ref(),
-            &cross_package_configs,
-        )
-        .await;
-        outcomes.push(outcome);
+        let pool = get_or_create_tenant_pool(state, &tid, &db_url).await;
+        if let Err(e) = &pool {
+            tracing::warn!(target = %tid, error = %e, "could not connect to dedicated RLS tenant DB");
+        }
+        targets.push(DdlTarget {
+            refresh_scope: refresh_scope_for(true, &tid, Some(&db_url)),
+            name: tid,
+            strategy: "rls",
+            rls_column: Some(crate::migration::RLS_TENANT_COLUMN),
+            pool: pool.map_err(|e| e.to_string()),
+        });
     }
-
-    // ── 3. Database-strategy tenants (each has their own DB, no RLS column) ──
     for (tid, db_url) in state.tenant_registry.database_tenant_targets() {
-        let pool = match get_or_create_tenant_pool(state, &tid, &db_url).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(target = %tid, error = %e, "could not connect to Database tenant DB");
-                outcomes.push(TenantMigrationOutcome {
-                    target: tid.clone(),
-                    strategy: "database".to_string(),
-                    status: "failed".to_string(),
-                    warnings: vec![],
-                    skipped: vec![],
-                    error: Some(format!("connection failed: {}", e)),
-                });
-                continue;
-            }
-        };
-        let outcome = apply_ddl_to_pool(
-            &pool,
-            config_pool,
-            config,
-            plan.as_ref(),
-            package_id,
-            &tid,
-            "database",
-            from_version,
-            to_version,
-            None,
-            state.dialect.as_ref(),
-            &cross_package_configs,
-        )
-        .await;
-        outcomes.push(outcome);
+        let pool = get_or_create_tenant_pool(state, &tid, &db_url).await;
+        if let Err(e) = &pool {
+            tracing::warn!(target = %tid, error = %e, "could not connect to Database tenant DB");
+        }
+        targets.push(DdlTarget {
+            refresh_scope: refresh_scope_for(false, &tid, None),
+            name: tid,
+            strategy: "database",
+            rls_column: None,
+            pool: pool.map_err(|e| e.to_string()),
+        });
     }
-
-    outcomes
+    targets
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -623,28 +687,14 @@ pub async fn install_package(
     // migration_pool and schema_override are no longer used directly — broadcast_ddl handles all targets.
     let package_cache_key = ctx.package_cache_key().to_string();
 
-    // Check that all declared dependency packages are already installed.
-    if let Some(deps) = manifest_obj.get("dependencies").and_then(Value::as_array) {
-        let installed_ids: std::collections::HashSet<String> =
-            list_package_ids(config_pool).await?.into_iter().collect();
-        let missing: Vec<&str> = deps
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|dep| !installed_ids.contains(*dep))
-            .collect();
-        if !missing.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "package '{}' depends on [{}] which are not installed; install them first",
-                id,
-                missing.join(", ")
-            )));
-        }
-    }
-
     let incoming_version = manifest_obj
         .get("version")
         .and_then(Value::as_str)
         .unwrap_or("");
+
+    let installed_packages = list_packages(config_pool).await?;
+    check_dependencies_installed(id, &manifest_value, &installed_packages)?;
+    check_dependents_accept_version(id, incoming_version, &installed_packages)?;
 
     // For upgrades: load old config BEFORE replacing so we can diff
     let is_upgrade = if let Some(existing) = get_package(config_pool, id).await? {
@@ -684,11 +734,7 @@ pub async fn install_package(
             schemas_body.clone()
         } else {
             let mut body = read_kind_from_zip(&mut archive, kind)?;
-            match *kind {
-                "enums" | "tables" | "indexes" => inject_schema_id(&mut body, DEFAULT_SCHEMA_ID),
-                "relationships" => inject_relationship_schema_ids(&mut body, DEFAULT_SCHEMA_ID),
-                _ => {}
-            }
+            default_schema_ids(kind, &mut body);
             body
         };
         bodies.push((*kind, body));
@@ -717,7 +763,7 @@ pub async fn install_package(
             .and_then(|_| manifest_value.get("version").and_then(Value::as_str)),
         incoming_version,
     )
-    .await;
+    .await?;
 
     // For a fresh install, abort if schema creation failed on any tenant — do NOT persist config,
     // so the package is never recorded as installed when its tables do not exist. (Upgrades keep
@@ -796,6 +842,73 @@ pub async fn install_package(
     ))
 }
 
+/// Every package `manifest` depends on must be installed, at a version its requirement accepts.
+fn check_dependencies_installed(
+    package_id: &str,
+    manifest: &Value,
+    installed: &[crate::store::PackageRow],
+) -> Result<(), AppError> {
+    let mut problems: Vec<String> = Vec::new();
+    for dep in manifest_dependencies(manifest)? {
+        match installed.iter().find(|p| p.id == dep.package_id) {
+            None => problems.push(format!("'{}' is not installed", dep.package_id)),
+            Some(p) if !satisfies(&dep, p.semantic_version.as_deref()) => problems.push(format!(
+                "'{}' {} is installed but {} is required",
+                dep.package_id,
+                p.semantic_version.as_deref().unwrap_or("(no version)"),
+                dep.requirement
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            )),
+            Some(_) => {}
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "package '{}' has unmet dependencies: {}; install or upgrade them first",
+        package_id,
+        problems.join("; ")
+    )))
+}
+
+/// Installing `version` of `package_id` must keep every installed dependent's requirement on it
+/// satisfied, so an upgrade cannot break the packages (e.g. analytics views) that read it.
+fn check_dependents_accept_version(
+    package_id: &str,
+    version: &str,
+    installed: &[crate::store::PackageRow],
+) -> Result<(), AppError> {
+    let rejected: Vec<String> = installed
+        .iter()
+        .filter(|p| p.id != package_id)
+        .filter_map(|p| {
+            manifest_dependencies(&p.payload)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|d| d.package_id == package_id && !satisfies(d, Some(version)))
+                .map(|d| {
+                    format!(
+                        "'{}' requires {}",
+                        p.id,
+                        d.requirement.map(|r| r.to_string()).unwrap_or_default()
+                    )
+                })
+        })
+        .collect();
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "cannot install '{}' version {}: {}",
+        package_id,
+        version,
+        rejected.join("; ")
+    )))
+}
+
 #[derive(Deserialize)]
 pub struct UninstallPath {
     pub package_id: String,
@@ -832,11 +945,10 @@ pub async fn uninstall_package(
         .iter()
         .filter(|row| row.id != package_id)
         .filter(|row| {
-            row.payload
-                .get("dependencies")
-                .and_then(Value::as_array)
-                .map(|deps| deps.iter().any(|d| d.as_str() == Some(package_id.as_str())))
-                .unwrap_or(false)
+            manifest_dependencies(&row.payload)
+                .unwrap_or_default()
+                .iter()
+                .any(|d| d.package_id == package_id)
         })
         .map(|row| row.id.clone())
         .collect();
@@ -851,6 +963,28 @@ pub async fn uninstall_package(
     let config = load_from_pool(config_pool, &package_id)
         .await
         .map_err(AppError::Config)?;
+
+    // Block uninstall if views outside this package read its tables: the revert drops tables
+    // with CASCADE, which on Postgres would drop those views silently.
+    let dependent_views = find_external_dependent_views(
+        migration_pool,
+        state.dialect.as_ref(),
+        &config,
+        schema_override,
+    )
+    .await?;
+    if !dependent_views.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "cannot uninstall '{}': views outside the package read its tables: [{}]; drop them or uninstall the packages that own them first",
+            package_id,
+            dependent_views
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     revert_migrations(migration_pool, &config, schema_override).await?;
     delete_package_and_config(config_pool, &package_id).await?;
 
@@ -889,16 +1023,18 @@ async fn package_detail_data(
 ) -> Result<Value, crate::error::AppError> {
     use crate::handlers::config::get_config;
 
-    let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores) = tokio::try_join!(
-        get_config(pool, "schemas", package_id),
-        get_config(pool, "enums", package_id),
-        get_config(pool, "tables", package_id),
-        get_config(pool, "columns", package_id),
-        get_config(pool, "indexes", package_id),
-        get_config(pool, "relationships", package_id),
-        get_config(pool, "api_entities", package_id),
-        get_config(pool, "kv_stores", package_id),
-    )?;
+    let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores, views) =
+        tokio::try_join!(
+            get_config(pool, "schemas", package_id),
+            get_config(pool, "enums", package_id),
+            get_config(pool, "tables", package_id),
+            get_config(pool, "columns", package_id),
+            get_config(pool, "indexes", package_id),
+            get_config(pool, "relationships", package_id),
+            get_config(pool, "api_entities", package_id),
+            get_config(pool, "kv_stores", package_id),
+            get_config(pool, "views", package_id),
+        )?;
 
     Ok(json!({
         "stats": {
@@ -910,6 +1046,7 @@ async fn package_detail_data(
             "relationships": relationships.len(),
             "apiEntities": api_entities.len(),
             "kvStores": kv_stores.len(),
+            "views": views.len(),
         },
         "schemas": schemas,
         "enums": enums,
@@ -919,6 +1056,7 @@ async fn package_detail_data(
         "relationships": relationships,
         "apiEntities": api_entities,
         "kvStores": kv_stores,
+        "views": views,
     }))
 }
 
@@ -930,7 +1068,17 @@ pub async fn list_packages_handler(
 
     let mut items: Vec<Value> = Vec::with_capacity(packages.len());
     for pkg in packages {
-        let (schemas, enums, tables, columns, indexes, relationships, api_entities, kv_stores) = tokio::try_join!(
+        let (
+            schemas,
+            enums,
+            tables,
+            columns,
+            indexes,
+            relationships,
+            api_entities,
+            kv_stores,
+            views,
+        ) = tokio::try_join!(
             count_package_kind(&state.pool, "schemas", &pkg.id),
             count_package_kind(&state.pool, "enums", &pkg.id),
             count_package_kind(&state.pool, "tables", &pkg.id),
@@ -939,6 +1087,7 @@ pub async fn list_packages_handler(
             count_package_kind(&state.pool, "relationships", &pkg.id),
             count_package_kind(&state.pool, "api_entities", &pkg.id),
             count_package_kind(&state.pool, "kv_stores", &pkg.id),
+            count_package_kind(&state.pool, "views", &pkg.id),
         )?;
 
         let name = pkg
@@ -956,12 +1105,11 @@ pub async fn list_packages_handler(
             .get("schema")
             .and_then(Value::as_str)
             .map(String::from);
-        let dependencies: Vec<&str> = pkg
-            .payload
-            .get("dependencies")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+        let dependencies: Vec<String> = manifest_dependencies(&pkg.payload)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.package_id)
+            .collect();
 
         items.push(json!({
             "id": pkg.id,
@@ -980,6 +1128,7 @@ pub async fn list_packages_handler(
                 "relationships": relationships,
                 "apiEntities": api_entities,
                 "kvStores": kv_stores,
+                "views": views,
             },
         }));
     }
@@ -1126,6 +1275,10 @@ pub async fn preview_migration_handler(
         )));
     }
 
+    let installed_packages = list_packages(&state.pool).await?;
+    check_dependencies_installed(id, &manifest_value, &installed_packages)?;
+    check_dependents_accept_version(id, incoming_version, &installed_packages)?;
+
     let from_version = existing.semantic_version.clone();
     let ctx = resolve_tenant_context(&state, Some(tenant_id), None, Some(id)).await?;
     let config_pool = ctx.config_pool();
@@ -1145,6 +1298,8 @@ pub async fn preview_migration_handler(
         "relationships",
         "api_entities",
         "kv_stores",
+        "queries",
+        "views",
     ];
     let mut all_values: std::collections::HashMap<String, Vec<Value>> =
         std::collections::HashMap::new();
@@ -1153,11 +1308,7 @@ pub async fn preview_migration_handler(
             serde_json::from_value(Value::Array(schemas_body.clone())).unwrap_or_default()
         } else {
             let mut body = read_kind_from_zip(&mut archive, kind).unwrap_or_default();
-            match *kind {
-                "enums" | "tables" | "indexes" => inject_schema_id(&mut body, DEFAULT_SCHEMA_ID),
-                "relationships" => inject_relationship_schema_ids(&mut body, DEFAULT_SCHEMA_ID),
-                _ => {}
-            }
+            default_schema_ids(kind, &mut body);
             body
         };
         all_values.insert(kind.to_string(), body);
@@ -1175,6 +1326,7 @@ pub async fn preview_migration_handler(
         &std::collections::HashMap::new(),
     )
     .map_err(|e| AppError::BadRequest(format!("migration plan error: {}", e)))?;
+    reject_upgrade_blocked_by_views(&state, ctx.migration_pool(), &old_config, &plan, id).await?;
 
     let summary = plan.summary();
     let plan_json = serde_json::to_value(&plan).map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -1315,6 +1467,30 @@ pub async fn apply_migration_handler(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("manifest missing 'schema'".into()))?;
 
+    // Dependencies and other packages' views may have changed since the preview: re-check
+    // before writing anything.
+    let installed_config = load_from_pool(config_pool, &row.package_id)
+        .await
+        .map_err(AppError::Config)?;
+    reject_upgrade_blocked_by_views(
+        &state,
+        migration_pool,
+        &installed_config,
+        &plan,
+        &row.package_id,
+    )
+    .await?;
+    let installed_packages = list_packages(config_pool).await?;
+    check_dependencies_installed(&row.package_id, &manifest_value, &installed_packages)?;
+    check_dependents_accept_version(
+        &row.package_id,
+        manifest_value
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        &installed_packages,
+    )?;
+
     let schemas_body = vec![serde_json::json!({ "id": DEFAULT_SCHEMA_ID, "name": schema_name })];
     let apply_order = config_apply_order();
     for kind in &apply_order {
@@ -1323,11 +1499,7 @@ pub async fn apply_migration_handler(
                 .map_err(|e| AppError::BadRequest(format!("schemas body: {}", e)))?
         } else {
             let mut body = read_kind_from_zip(&mut archive, kind)?;
-            match *kind {
-                "enums" | "tables" | "indexes" => inject_schema_id(&mut body, DEFAULT_SCHEMA_ID),
-                "relationships" => inject_relationship_schema_ids(&mut body, DEFAULT_SCHEMA_ID),
-                _ => {}
-            }
+            default_schema_ids(kind, &mut body);
             body
         };
         replace_config(config_pool, kind, body, false, &row.package_id, None).await?;
@@ -1343,29 +1515,45 @@ pub async fn apply_migration_handler(
         )));
     }
 
-    // Execute the DDL plan with audit
-    let result = execute_migration_plan(
-        migration_pool,
-        config_pool,
-        &plan,
-        &migration_id,
-        &row.package_id,
-        tenant_id,
-        row.from_version.as_deref(),
-        &row.to_version,
-        state.dialect.as_ref(),
-        confirm_destructive,
-    )
-    .await?;
+    // Execute the DDL plan with audit. RLS targets expand tenant tokens for a shared database
+    // and reconcile the tenant column / policies (never part of the diff plan) before views are
+    // created, so subsequent inserts and views can rely on `tenant_id`.
+    let rls_col = ctx.rls_tenant_column();
+    let target_plan = plan.for_target(rls_col.is_some(), state.dialect.as_ref());
+    let (before_views, view_creates) = match rls_col {
+        Some(_) => target_plan.split_view_creates(),
+        None => (target_plan, MigrationPlan { steps: vec![] }),
+    };
+    let run = |plan: MigrationPlan| {
+        let migration_id = migration_id.clone();
+        let package_id = row.package_id.clone();
+        let from_version = row.from_version.clone();
+        let to_version = row.to_version.clone();
+        let dialect = state.dialect.clone();
+        async move {
+            execute_migration_plan(
+                migration_pool,
+                config_pool,
+                &plan,
+                &migration_id,
+                &package_id,
+                tenant_id,
+                from_version.as_deref(),
+                &to_version,
+                dialect.as_ref(),
+                confirm_destructive,
+            )
+            .await
+        }
+    };
+    let mut result = run(before_views).await?;
 
     // Reload in-memory model
     let new_config = load_from_pool(config_pool, &row.package_id)
         .await
         .map_err(AppError::Config)?;
 
-    // For RLS tenants, the diff plan does not add the tenant column / policies to newly created
-    // tables. Reconcile them so subsequent inserts (which inject `tenant_id`) don't fail.
-    if let Some(col) = ctx.rls_tenant_column() {
+    if let Some(col) = rls_col {
         apply_rls_to_tables(
             migration_pool,
             &new_config,
@@ -1374,6 +1562,14 @@ pub async fn apply_migration_handler(
             state.dialect.as_ref(),
         )
         .await?;
+    }
+    if !view_creates.steps.is_empty() {
+        let r = run(view_creates).await?;
+        result.applied += r.applied;
+        result.warned += r.warned;
+        result.skipped += r.skipped;
+        result.warnings.extend(r.warnings);
+        result.skips.extend(r.skips);
     }
 
     let new_model = resolve(&new_config)
@@ -1529,5 +1725,6 @@ fn build_full_config_from_values(
         api_entities: parse_kind(values, "api_entities")?,
         kv_stores: parse_kind(values, "kv_stores")?,
         queries: parse_kind(values, "queries")?,
+        views: parse_kind(values, "views")?,
     })
 }

@@ -26,6 +26,7 @@ const CONFIG_TABLES: &[&str] = &[
     "_sys_api_entities",
     "_sys_kv_stores",
     "_sys_queries",
+    "_sys_views",
 ];
 
 /// `(old, new)` _sys_* table names renamed in place by `ensure_sys_tables`.
@@ -274,6 +275,28 @@ pub async fn query_cache_get(
     package_id: &str,
     cache_key: &str,
 ) -> Result<Option<serde_json::Value>, AppError> {
+    reserved_kv_get(
+        pool,
+        QUERY_CACHE_NAMESPACE,
+        tenant_id,
+        package_id,
+        cache_key,
+    )
+    .await
+}
+
+/// Reserved `_sys_kv_data` namespace holding the last refresh of each materialized view, keyed by
+/// view id under a per-database scope in the tenant column.
+pub const VIEW_REFRESH_NAMESPACE: &str = "__view_refresh__";
+
+/// Read one row of a reserved (SDK-internal) `_sys_kv_data` namespace.
+pub async fn reserved_kv_get(
+    pool: &Pool,
+    namespace: &str,
+    tenant_id: &str,
+    package_id: &str,
+    key: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
     let q = qualified_sys_table("_sys_kv_data");
     let sql = format!(
         "SELECT value FROM {} WHERE tenant_id = $1 AND package_id = $2 AND namespace = $3 AND key = $4",
@@ -282,8 +305,8 @@ pub async fn query_cache_get(
     let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
         .bind(tenant_id)
         .bind(package_id)
-        .bind(QUERY_CACHE_NAMESPACE)
-        .bind(cache_key)
+        .bind(namespace)
+        .bind(key)
         .fetch_optional(pool)
         .await
         .map_err(AppError::Db)?;
@@ -300,6 +323,28 @@ pub async fn query_cache_put(
     cache_key: &str,
     envelope: &serde_json::Value,
 ) -> Result<(), AppError> {
+    reserved_kv_put(
+        pool,
+        dialect,
+        QUERY_CACHE_NAMESPACE,
+        tenant_id,
+        package_id,
+        cache_key,
+        envelope,
+    )
+    .await
+}
+
+/// Upsert one row of a reserved (SDK-internal) `_sys_kv_data` namespace.
+pub async fn reserved_kv_put(
+    pool: &Pool,
+    dialect: &dyn Dialect,
+    namespace: &str,
+    tenant_id: &str,
+    package_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), AppError> {
     let q = qualified_sys_table("_sys_kv_data");
     let update_sql = format!(
         "UPDATE {} SET value = $5, updated_at = {} \
@@ -310,9 +355,9 @@ pub async fn query_cache_put(
     let res = sqlx::query(&update_sql)
         .bind(tenant_id)
         .bind(package_id)
-        .bind(QUERY_CACHE_NAMESPACE)
-        .bind(cache_key)
-        .bind(envelope)
+        .bind(namespace)
+        .bind(key)
+        .bind(value)
         .execute(pool)
         .await
         .map_err(AppError::Db)?;
@@ -324,9 +369,9 @@ pub async fn query_cache_put(
         sqlx::query(&insert_sql)
             .bind(tenant_id)
             .bind(package_id)
-            .bind(QUERY_CACHE_NAMESPACE)
-            .bind(cache_key)
-            .bind(envelope)
+            .bind(namespace)
+            .bind(key)
+            .bind(value)
             .execute(pool)
             .await
             .map_err(AppError::Db)?;
@@ -993,6 +1038,7 @@ pub fn sys_table_for_kind(kind: &str) -> Option<&'static str> {
         "api_entities" => Some("_sys_api_entities"),
         "kv_stores" => Some("_sys_kv_stores"),
         "queries" => Some("_sys_queries"),
+        "views" => Some("_sys_views"),
         _ => None,
     }
 }

@@ -51,6 +51,9 @@ pub struct ColumnInfo {
     pub asset_is_array: bool,
     /// Storage config for asset columns (prefix template, compression).
     pub asset_config: Option<AssetColumnConfig>,
+    /// True when the column is computed by the database (`generated` in config). Generated
+    /// columns are returned on reads but never written by INSERT/UPDATE.
+    pub generated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,11 +132,34 @@ pub struct ResolvedModel {
     pub entity_by_path: HashMap<String, ResolvedEntity>,
     /// Queries available for execution, keyed by query id.
     pub queries: HashMap<String, ResolvedQuery>,
+    /// The package's views, keyed by view id (refresh and status lookups).
+    pub views: HashMap<String, ResolvedView>,
+}
+
+/// A package view as needed at run time: where it lives and, for a materialized view, the body
+/// a refresh recomputes from.
+#[derive(Clone, Debug)]
+pub struct ResolvedView {
+    pub id: String,
+    pub name: String,
+    pub schema_name: String,
+    /// Package id this view belongs to. Set via ResolvedModel::with_package_id().
+    pub package_id: String,
+    pub materialized: bool,
+    /// The view body for the active dialect, tenant tokens unexpanded.
+    pub sql: String,
+    /// Freshness target for stale refreshes (`refresh.max_age_secs`); `None` = on demand only.
+    pub max_age_secs: Option<u64>,
 }
 
 impl ResolvedModel {
     pub fn entity_by_path(&self, path: &str) -> Option<&ResolvedEntity> {
         self.entity_by_path.get(path)
+    }
+
+    /// Look up a view by id.
+    pub fn view(&self, id: &str) -> Option<&ResolvedView> {
+        self.views.get(id)
     }
 
     /// Look up a query by id.
@@ -152,6 +178,9 @@ impl ResolvedModel {
         }
         for r in self.queries.values_mut() {
             r.package_id = package_id.to_string();
+        }
+        for v in self.views.values_mut() {
+            v.package_id = package_id.to_string();
         }
         self
     }

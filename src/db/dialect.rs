@@ -177,6 +177,39 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    // ── Generated columns ─────────────────────────────────────────────────────
+
+    /// Column-definition clause for a database-computed column, placed right after the type.
+    /// `adding_column` is true inside `ALTER TABLE … ADD COLUMN` (SQLite cannot add a STORED
+    /// generated column there and falls back to VIRTUAL).
+    fn generated_column_clause(&self, expression: &str, _adding_column: bool) -> String {
+        format!("GENERATED ALWAYS AS ({}) STORED", expression)
+    }
+
+    /// Statement that changes an existing generated column's expression in place (keeping its
+    /// indexes), or `None` when the dialect cannot. `column_def` is the full new column
+    /// definition (`"name" TYPE GENERATED ALWAYS AS (…) STORED [NOT NULL]`).
+    fn alter_generated_expression_sql(
+        &self,
+        _full_table: &str,
+        _column: &str,
+        _expression: &str,
+        _column_def: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Statement that turns a generated column into a regular one, keeping its current values,
+    /// or `None` when the dialect cannot. `column_def` is the new plain column definition.
+    fn drop_generated_expression_sql(
+        &self,
+        _full_table: &str,
+        _column: &str,
+        _column_def: &str,
+    ) -> Option<String> {
+        None
+    }
+
     // ── Introspection ─────────────────────────────────────────────────────────
     //
     // These queries feed `db::introspect`, which lets the migration executor skip steps whose
@@ -208,6 +241,98 @@ pub trait Dialect: Send + Sync + 'static {
             escape_literal(schema)
         ))
     }
+
+    /// Views (plain or materialized) that read any of `tables`, given as `(schema, table)` pairs,
+    /// directly or through other views. One row per view and table column it ultimately reads:
+    /// `(view_schema, view_name, table_schema, table_name, column_name)`, the table being one of
+    /// `tables`; `column_name` is `''` for a dependency on the table as a whole (e.g.
+    /// `count(*)`). A view reading another view inherits every column that view reads.
+    /// Feeds the package-uninstall guard (on Postgres `DROP … CASCADE` would silently drop those
+    /// views) and the upgrade guard (a view blocks retyping or dropping a column it reads).
+    /// `None` when the dialect cannot report view dependencies; `tables` is never empty.
+    fn dependent_views_sql(&self, _tables: &[(String, String)]) -> Option<String> {
+        None
+    }
+
+    // ── Views ─────────────────────────────────────────────────────────────────
+
+    /// Create (or replace) a view. `qualified` is the already-quoted `schema.name`; `body` is the
+    /// view's SELECT. Replacing must keep working when the body changes but the output columns do
+    /// not; migrations drop and recreate a view whose columns change.
+    fn create_view_sql(&self, qualified: &str, body: &str) -> String {
+        format!("CREATE OR REPLACE VIEW {} AS {}", qualified, body)
+    }
+
+    /// Whether `create_view_sql` replaces an existing view. When false, callers drop the view
+    /// first so a changed body takes effect.
+    fn create_view_replaces(&self) -> bool {
+        true
+    }
+
+    /// Drop a view if it exists. Never cascades: a view other objects still depend on must fail
+    /// to drop rather than take them with it.
+    fn drop_view_sql(&self, qualified: &str) -> String {
+        format!("DROP VIEW IF EXISTS {}", qualified)
+    }
+
+    // ── Materialized views ────────────────────────────────────────────────────
+    //
+    // A materialized view is stored in a backing relation (`qualified` below) that holds every
+    // tenant's rows; the SDK reads it through a plain wrapper view that filters by tenant.
+    // Dialects without native materialized views (the default) back it with a table.
+
+    /// Create the backing relation, populated, if it does not exist.
+    fn create_materialized_view_sql(&self, qualified: &str, body: &str) -> String {
+        format!("CREATE TABLE IF NOT EXISTS {} AS {}", qualified, body)
+    }
+
+    /// Unique index on the backing relation, when the dialect needs one to refresh without
+    /// blocking readers. `index` is the quoted index name; `columns` the quoted column list.
+    fn materialized_view_key_sql(
+        &self,
+        _index: &str,
+        _qualified: &str,
+        _columns: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    fn drop_materialized_view_sql(&self, qualified: &str) -> String {
+        format!("DROP TABLE IF EXISTS {}", qualified)
+    }
+
+    /// Statements that recompute the backing relation from `body`. Several statements run in one
+    /// transaction, so readers see the old rows until the new ones are committed.
+    fn refresh_materialized_view_sql(&self, qualified: &str, body: &str) -> Vec<String> {
+        vec![
+            format!("DELETE FROM {}", qualified),
+            format!(
+                "INSERT INTO {} SELECT * FROM ({}) AS architect_mv_refresh",
+                qualified, body
+            ),
+        ]
+    }
+
+    /// Row filter the wrapper view applies so each caller sees only its tenant's rows, keyed off
+    /// the session tenant (`app.tenant_id`). `None` when the dialect has no session tenant (no
+    /// shared-database tenants), in which case the wrapper does not filter.
+    fn tenant_session_filter_sql(&self, _column: &str) -> Option<String> {
+        None
+    }
+
+    /// A typed NULL used for the tenant column in databases that have none.
+    fn null_text_expr(&self) -> &'static str {
+        "CAST(NULL AS TEXT)"
+    }
+}
+
+/// `('s1', 't1'), ('s2', 't2')` — a row-value list for `(schema, table) IN (…)` filters.
+pub fn table_pairs_literal(tables: &[(String, String)]) -> String {
+    tables
+        .iter()
+        .map(|(s, t)| format!("('{}', '{}')", escape_literal(s), escape_literal(t)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Escape a value for inlining into a single-quoted SQL literal.

@@ -1,7 +1,8 @@
 //! Load config from in-memory structs or from architect._sys_* tables in DB.
 
 use crate::config::resolved::{
-    ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel, ResolvedQuery,
+    ColumnInfo, IncludeDirection, IncludeSpec, PkType, ResolvedEntity, ResolvedModel,
+    ResolvedQuery, ResolvedView,
 };
 use crate::config::types::*;
 use crate::config::{default_schema_id, validate, FullConfig};
@@ -34,10 +35,26 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         .map(|api| (api.entity_id.as_str(), api.path_segment.as_str()))
         .collect();
 
+    let views_by_id: HashMap<_, _> = config.views.iter().map(|v| (v.id.as_str(), v)).collect();
+
     let mut entities = Vec::new();
     let mut entity_by_path = HashMap::new();
 
     for api in &config.api_entities {
+        if let Some(view) = views_by_id.get(api.entity_id.as_str()) {
+            let view_sid = view.schema_id.as_deref().unwrap_or(default_sid);
+            let schema =
+                schemas_by_id
+                    .get(view_sid)
+                    .ok_or_else(|| ConfigError::MissingReference {
+                        kind: "schema",
+                        id: view_sid.to_string(),
+                    })?;
+            let entity = resolve_view_entity(view, &schema.name, api);
+            entity_by_path.insert(api.path_segment.clone(), entity.clone());
+            entities.push(entity);
+            continue;
+        }
         let table = tables_by_id.get(api.entity_id.as_str()).ok_or_else(|| {
             ConfigError::MissingReference {
                 kind: "table",
@@ -67,7 +84,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                 table_id: table.id.clone(),
                 column: pk_names[0].clone(),
             })?;
-        let pk_type = infer_pk_type(pk_col);
+        let pk_type = infer_pk_type(&pk_col.type_);
 
         let mut columns: Vec<ColumnInfo> = table_columns
             .iter()
@@ -89,6 +106,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     is_asset,
                     asset_is_array,
                     asset_config: c.asset.clone(),
+                    generated: c.generated.is_some(),
                 }
             })
             .collect();
@@ -115,6 +133,7 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
                     is_asset: false,
                     asset_is_array: false,
                     asset_config: None,
+                    generated: false,
                 });
             }
         }
@@ -234,11 +253,90 @@ pub fn resolve(config: &FullConfig) -> Result<ResolvedModel, ConfigError> {
         }
     }
 
+    let dialect_name = crate::db::active_dialect().name();
+    let mut views = HashMap::new();
+    for v in &config.views {
+        let sid = v.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schemas_by_id
+            .get(sid)
+            .ok_or_else(|| ConfigError::MissingReference {
+                kind: "schema",
+                id: sid.to_string(),
+            })?;
+        views.insert(
+            v.id.clone(),
+            ResolvedView {
+                id: v.id.clone(),
+                name: v.name.clone(),
+                schema_name: schema.name.clone(),
+                package_id: String::new(),
+                materialized: v.materialized,
+                sql: v.sql_for(dialect_name).to_string(),
+                max_age_secs: v.refresh.as_ref().map(|r| r.max_age_secs),
+            },
+        );
+    }
+
     Ok(ResolvedModel {
         entities,
         entity_by_path,
         queries,
+        views,
     })
+}
+
+/// Read-only entity over a view: only the declared view columns (no synthesized timestamp
+/// columns), no includes, events or archive handling. Validation has already checked the
+/// operations are list/read and that the view has a primary key.
+fn resolve_view_entity(
+    view: &ViewConfig,
+    schema_name: &str,
+    api: &ApiEntityConfig,
+) -> ResolvedEntity {
+    let pk_names = view.primary_key_columns();
+    let pk_type = view
+        .columns
+        .iter()
+        .find(|c| pk_names.first() == Some(&c.name))
+        .map(|c| infer_pk_type(&c.type_))
+        .unwrap_or(PkType::Text);
+    let columns = view
+        .columns
+        .iter()
+        .map(|c| ColumnInfo {
+            name: c.name.clone(),
+            pk_type: pk_names.contains(&c.name).then(|| pk_type.clone()),
+            nullable: c.nullable,
+            has_default: false,
+            pg_type: active_cast_name(&parse_canonical(&c.type_)),
+            is_asset: false,
+            asset_is_array: false,
+            asset_config: None,
+            generated: false,
+        })
+        .collect();
+    ResolvedEntity {
+        table_id: view.id.clone(),
+        schema_name: schema_name.to_string(),
+        table_name: view.name.clone(),
+        path_segment: api.path_segment.clone(),
+        pk_columns: pk_names,
+        pk_type,
+        columns,
+        operations: api.operations.clone(),
+        sensitive_columns: api.sensitive_columns.iter().cloned().collect(),
+        includes: Vec::new(),
+        validation: HashMap::new(),
+        events: Vec::new(),
+        archive_field: None,
+        package_id: String::new(),
+        audit_log: false,
+        global: false,
+        parent_ref_column: None,
+        versioning: None,
+        mcp: api.mcp.clone(),
+        extensible_columns: Vec::new(),
+    }
 }
 
 /// Translate a query's named-parameter SQL (`:from`, `:to`) into positional placeholders
@@ -616,6 +714,7 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         is_asset: false,
         asset_is_array: false,
         asset_config: None,
+        generated: false,
     });
     cols.push(ColumnInfo {
         name: "audit_action".to_string(),
@@ -626,6 +725,7 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         is_asset: false,
         asset_is_array: false,
         asset_config: None,
+        generated: false,
     });
     cols.push(ColumnInfo {
         name: "audit_at".to_string(),
@@ -636,6 +736,7 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         is_asset: false,
         asset_is_array: false,
         asset_config: None,
+        generated: false,
     });
     cols.push(ColumnInfo {
         name: "audit_by".to_string(),
@@ -646,6 +747,7 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         is_asset: false,
         asset_is_array: false,
         asset_config: None,
+        generated: false,
     });
     cols.push(ColumnInfo {
         name: "changed_fields".to_string(),
@@ -656,6 +758,7 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         is_asset: false,
         asset_is_array: false,
         asset_config: None,
+        generated: false,
     });
     for col in source_columns {
         cols.push(ColumnInfo {
@@ -667,14 +770,15 @@ fn build_audit_columns(source_columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
             is_asset: col.is_asset,
             asset_is_array: col.asset_is_array,
             asset_config: col.asset_config.clone(),
+            generated: false,
         });
     }
     cols
 }
 
-fn infer_pk_type(col: &ColumnConfig) -> PkType {
+fn infer_pk_type(type_: &ColumnTypeConfig) -> PkType {
     use crate::db::CanonicalType;
-    match parse_canonical(&col.type_) {
+    match parse_canonical(type_) {
         CanonicalType::Uuid => PkType::Uuid,
         CanonicalType::BigInt | CanonicalType::BigSerial => PkType::BigInt,
         CanonicalType::Int | CanonicalType::Serial | CanonicalType::SmallInt => PkType::Int,
@@ -740,6 +844,9 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
     let queries =
         load_config_table::<QueryConfig>(pool, &qualified_sys_table("_sys_queries"), package_id)
             .await?;
+    let views =
+        load_config_table::<ViewConfig>(pool, &qualified_sys_table("_sys_views"), package_id)
+            .await?;
 
     let config = FullConfig {
         schemas,
@@ -751,6 +858,7 @@ pub async fn load_from_pool(pool: &Pool, package_id: &str) -> Result<FullConfig,
         api_entities,
         kv_stores,
         queries,
+        views,
     };
     Ok(config)
 }

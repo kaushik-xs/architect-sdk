@@ -1,0 +1,15 @@
+{
+  "format": "workflow-schedules-v1",
+  "schedules": [
+    {
+      "name": "refresh-stale-views",
+      "workflow": "refresh-stale-views",
+      "cron": "* * * * *",
+      "timezone": "UTC",
+      "input": {},
+      "enabled": true,
+      "overlap": "skip",
+      "catchUp": "skip"
+    }
+  ]
+}

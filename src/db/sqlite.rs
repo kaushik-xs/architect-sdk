@@ -113,6 +113,13 @@ impl Dialect for SqliteDialect {
         format!("RETURNING {}", cols)
     }
 
+    /// SQLite rejects `ADD COLUMN … STORED`, so an added generated column is VIRTUAL
+    /// (computed on read); columns created with the table are STORED.
+    fn generated_column_clause(&self, expression: &str, adding_column: bool) -> String {
+        let kind = if adding_column { "VIRTUAL" } else { "STORED" };
+        format!("GENERATED ALWAYS AS ({}) {}", expression, kind)
+    }
+
     fn upsert_conflict(&self, conflict_cols: &[&str], set_pairs: &str) -> String {
         let cols = conflict_cols
             .iter()
@@ -184,6 +191,15 @@ impl Dialect for SqliteDialect {
     }
 
     fn supports_schemas(&self) -> bool {
+        false
+    }
+
+    fn create_view_sql(&self, qualified: &str, body: &str) -> String {
+        // No CREATE OR REPLACE VIEW in SQLite; replacement is drop + create.
+        format!("CREATE VIEW IF NOT EXISTS {} AS {}", qualified, body)
+    }
+
+    fn create_view_replaces(&self) -> bool {
         false
     }
 

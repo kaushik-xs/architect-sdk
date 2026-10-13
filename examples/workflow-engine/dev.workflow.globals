@@ -1,0 +1,6 @@
+{
+  "format": "workflow-globals-v1",
+  "globals": {
+    "PLATFORM_TENANT_ID": "_platform"
+  }
+}

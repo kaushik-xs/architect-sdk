@@ -88,6 +88,7 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
             });
         }
     }
+    validate_generated_columns(config)?;
 
     // Validate schema-qualified enum-typed columns. A column type like
     // `manufacturing_essential.material_unit` must reference an enum that this config actually
@@ -167,9 +168,34 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
         }
     }
 
+    validate_views(config, default_sid, &schema_ids, &table_ids)?;
+    let views_by_id: HashMap<&str, &crate::config::ViewConfig> =
+        config.views.iter().map(|v| (v.id.as_str(), v)).collect();
+
     let mut path_segments = HashSet::new();
     for api in &config.api_entities {
-        if !table_ids.contains(api.entity_id.as_str()) {
+        if let Some(view) = views_by_id.get(api.entity_id.as_str()) {
+            if let Some(op) = api
+                .operations
+                .iter()
+                .find(|op| !VIEW_OPERATIONS.contains(&op.as_str()))
+            {
+                return Err(ConfigError::Validation(format!(
+                    "api entity '{}' exposes view '{}': views are read-only, operation '{}' is \
+                     not allowed (use {})",
+                    api.path_segment,
+                    view.id,
+                    op,
+                    VIEW_OPERATIONS.join(", ")
+                )));
+            }
+            if view.primary_key.is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "view '{}' is exposed as api entity '{}' and needs a primary_key",
+                    view.id, api.path_segment
+                )));
+            }
+        } else if !table_ids.contains(api.entity_id.as_str()) {
             return Err(ConfigError::MissingReference {
                 kind: "table",
                 id: api.entity_id.clone(),
@@ -180,6 +206,163 @@ pub fn validate(config: &FullConfig) -> Result<(), ConfigError> {
         }
     }
 
+    Ok(())
+}
+
+/// Generated columns: a non-empty expression, known dialect overrides, and nothing that would
+/// require writing the column (default, primary key, asset upload, extensible fields).
+fn validate_generated_columns(config: &FullConfig) -> Result<(), ConfigError> {
+    let pk_by_table: HashMap<&str, Vec<&str>> = config
+        .tables
+        .iter()
+        .map(|t| {
+            let pk = match &t.primary_key {
+                PrimaryKeyConfig::Single(s) => vec![s.as_str()],
+                PrimaryKeyConfig::Composite(v) => v.iter().map(String::as_str).collect(),
+            };
+            (t.id.as_str(), pk)
+        })
+        .collect();
+    for c in &config.columns {
+        let Some(g) = &c.generated else { continue };
+        let invalid = |msg: &str| {
+            ConfigError::Validation(format!(
+                "column '{}' (table '{}'): generated column {}",
+                c.name, c.table_id, msg
+            ))
+        };
+        if g.expression.trim().is_empty()
+            || g.expression_by_dialect
+                .values()
+                .any(|e| e.trim().is_empty())
+        {
+            return Err(invalid("expression must not be empty"));
+        }
+        if let Some(key) = g
+            .expression_by_dialect
+            .keys()
+            .find(|k| !VIEW_DIALECTS.contains(&k.as_str()))
+        {
+            return Err(invalid(&format!(
+                "expression_by_dialect key '{}' is not one of {}",
+                key,
+                VIEW_DIALECTS.join(", ")
+            )));
+        }
+        if c.default.is_some() {
+            return Err(invalid("cannot have a default"));
+        }
+        if pk_by_table
+            .get(c.table_id.as_str())
+            .is_some_and(|pk| pk.contains(&c.name.as_str()))
+        {
+            return Err(invalid("cannot be part of the primary key"));
+        }
+        if c.asset.is_some() || c.extensible {
+            return Err(invalid("cannot be an asset or extensible column"));
+        }
+    }
+    Ok(())
+}
+
+/// Operations a view may expose through `api_entities`.
+pub const VIEW_OPERATIONS: &[&str] = &["list", "read"];
+
+/// Smallest `refresh.max_age_secs`: stale refreshes run from a schedule that fires at most once a
+/// minute.
+const MIN_REFRESH_MAX_AGE_SECS: u64 = 60;
+
+/// Dialect names accepted as `sql_by_dialect` keys.
+const VIEW_DIALECTS: &[&str] = &["postgres", "mysql", "sqlite"];
+
+fn validate_views(
+    config: &FullConfig,
+    default_sid: &str,
+    schema_ids: &HashSet<&str>,
+    table_ids: &HashSet<&str>,
+) -> Result<(), ConfigError> {
+    let mut view_ids: HashSet<&str> = HashSet::new();
+    for v in &config.views {
+        let invalid = |msg: String| ConfigError::Validation(format!("view '{}': {}", v.id, msg));
+        // api_entities.entity_id may name a table or a view, so the two share one id space.
+        if table_ids.contains(v.id.as_str()) || !view_ids.insert(v.id.as_str()) {
+            return Err(invalid(
+                "id is already used by another table or view".into(),
+            ));
+        }
+        let sid = v.schema_id.as_deref().unwrap_or(default_sid);
+        if !schema_ids.contains(sid) {
+            return Err(ConfigError::MissingReference {
+                kind: "schema",
+                id: sid.to_string(),
+            });
+        }
+        if let Some(r) = &v.refresh {
+            if !v.materialized {
+                return Err(invalid(
+                    "refresh applies only to materialized views (a plain view is always live)"
+                        .into(),
+                ));
+            }
+            if r.max_age_secs < MIN_REFRESH_MAX_AGE_SECS {
+                return Err(invalid(format!(
+                    "refresh.max_age_secs must be at least {}",
+                    MIN_REFRESH_MAX_AGE_SECS
+                )));
+            }
+        }
+        if v.materialized && v.primary_key.is_none() {
+            return Err(invalid(
+                "a materialized view needs a primary_key (it keys the stored rows)".into(),
+            ));
+        }
+        if v.sql.trim().is_empty() {
+            return Err(invalid("sql must not be empty".into()));
+        }
+        if let Some(key) = v
+            .sql_by_dialect
+            .keys()
+            .find(|k| !VIEW_DIALECTS.contains(&k.as_str()))
+        {
+            return Err(invalid(format!(
+                "sql_by_dialect key '{}' is not one of {}",
+                key,
+                VIEW_DIALECTS.join(", ")
+            )));
+        }
+        if v.columns.is_empty() {
+            return Err(invalid(
+                "columns must list the view's output columns".into(),
+            ));
+        }
+        let mut names: HashSet<&str> = HashSet::new();
+        for c in &v.columns {
+            if !names.insert(c.name.as_str()) {
+                return Err(invalid(format!("column '{}' is listed twice", c.name)));
+            }
+            if v.materialized && c.name == crate::migration::RLS_TENANT_COLUMN {
+                return Err(invalid(format!(
+                    "'{}' is managed by the SDK for materialized views: return it from the sql \
+                     ({{{{tenant_id:<alias>}}}} AS {}) but do not declare it",
+                    c.name, c.name
+                )));
+            }
+        }
+        for pk in v.primary_key_columns() {
+            if !names.contains(pk.as_str()) {
+                return Err(invalid(format!(
+                    "primary_key column '{}' is not one of its columns",
+                    pk
+                )));
+            }
+        }
+        if let Some(r) = v.reads.iter().find(|r| r.split_once('.').is_none()) {
+            return Err(invalid(format!(
+                "reads entry '{}' must be schema-qualified (schema.name)",
+                r
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -242,6 +425,7 @@ mod tests {
             comment: None,
             asset: None,
             extensible: false,
+            generated: None,
         }
     }
 
@@ -273,6 +457,82 @@ mod tests {
     #[test]
     fn valid_config_passes() {
         assert!(validate(&minimal_config()).is_ok());
+    }
+
+    // --- generated columns ---
+
+    fn generated(expr: &str) -> Option<crate::config::types::GeneratedColumnConfig> {
+        Some(crate::config::types::GeneratedColumnConfig {
+            expression: expr.into(),
+            expression_by_dialect: Default::default(),
+        })
+    }
+
+    #[test]
+    fn generated_column_passes() {
+        let mut c = minimal_config();
+        c.columns.push(ColumnConfig {
+            generated: generated("upper(id)"),
+            ..column("c2", "t1", "id_upper")
+        });
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn invalid_generated_columns_fail() {
+        use crate::config::types::ColumnDefaultConfig;
+        let cases: Vec<(ColumnConfig, &str)> = vec![
+            (
+                ColumnConfig {
+                    generated: generated("  "),
+                    ..column("c2", "t1", "g")
+                },
+                "expression must not be empty",
+            ),
+            (
+                ColumnConfig {
+                    generated: generated("upper(id)"),
+                    default: Some(ColumnDefaultConfig::Literal("'x'".into())),
+                    ..column("c2", "t1", "g")
+                },
+                "cannot have a default",
+            ),
+            (
+                ColumnConfig {
+                    generated: generated("upper(id)").map(|mut g| {
+                        g.expression_by_dialect.insert("oracle".into(), "x".into());
+                        g
+                    }),
+                    ..column("c2", "t1", "g")
+                },
+                "expression_by_dialect key 'oracle'",
+            ),
+            (
+                ColumnConfig {
+                    generated: generated("1"),
+                    extensible: true,
+                    ..column("c2", "t1", "g")
+                },
+                "asset or extensible",
+            ),
+        ];
+        for (col, expected) in cases {
+            let mut c = minimal_config();
+            c.columns.push(col);
+            let msg = validate(&c).unwrap_err().to_string();
+            assert!(
+                msg.contains(expected),
+                "{} does not mention {}",
+                msg,
+                expected
+            );
+        }
+        let mut c = minimal_config();
+        c.columns[0].generated = generated("1");
+        assert!(validate(&c)
+            .unwrap_err()
+            .to_string()
+            .contains("primary key"));
     }
 
     // --- empty schemas ---
@@ -461,5 +721,237 @@ mod tests {
     fn default_schema_id_empty_fails() {
         let c = FullConfig::default();
         assert!(default_schema_id(&c).is_err());
+    }
+}
+
+#[cfg(test)]
+mod view_validation_tests {
+    use super::*;
+    use crate::config::resolve;
+    use crate::config::types::{
+        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, SchemaConfig, TableConfig,
+        ViewColumnConfig, ViewConfig,
+    };
+
+    fn view() -> ViewConfig {
+        ViewConfig {
+            id: "v_sales".into(),
+            schema_id: None,
+            name: "sales".into(),
+            comment: None,
+            sql: "SELECT id, total FROM shop.orders".into(),
+            sql_by_dialect: Default::default(),
+            columns: vec![
+                ViewColumnConfig {
+                    name: "id".into(),
+                    type_: ColumnTypeConfig::Simple("uuid".into()),
+                    nullable: false,
+                    comment: None,
+                },
+                ViewColumnConfig {
+                    name: "total".into(),
+                    type_: ColumnTypeConfig::Simple("numeric".into()),
+                    nullable: true,
+                    comment: None,
+                },
+            ],
+            primary_key: Some(PrimaryKeyConfig::Single("id".into())),
+            reads: vec!["shop.orders".into()],
+            materialized: false,
+            refresh: None,
+        }
+    }
+
+    fn api(entity_id: &str, ops: &[&str]) -> ApiEntityConfig {
+        ApiEntityConfig {
+            entity_id: entity_id.into(),
+            path_segment: "sales".into(),
+            operations: ops.iter().map(|o| o.to_string()).collect(),
+            sensitive_columns: vec!["total".into()],
+            validation: Default::default(),
+            archive_field: None,
+            events: vec![],
+            parent_ref_column: None,
+            mcp: None,
+        }
+    }
+
+    fn config(v: ViewConfig, apis: Vec<ApiEntityConfig>) -> FullConfig {
+        FullConfig {
+            schemas: vec![SchemaConfig {
+                id: "s1".into(),
+                name: "an_sales".into(),
+                comment: None,
+            }],
+            views: vec![v],
+            api_entities: apis,
+            ..Default::default()
+        }
+    }
+
+    fn err(cfg: &FullConfig) -> String {
+        validate(cfg).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_valid_view_entity_resolves_read_only() {
+        let cfg = config(view(), vec![api("v_sales", &["list", "read"])]);
+        let model = resolve(&cfg).unwrap();
+        let e = model.entity_by_path("sales").unwrap();
+        assert_eq!(e.schema_name, "an_sales");
+        assert_eq!(e.table_name, "sales");
+        assert_eq!(e.pk_columns, vec!["id"]);
+        assert!(matches!(e.pk_type, crate::config::PkType::Uuid));
+        // Only the declared columns: no synthesized created_at/updated_at/archived_at.
+        let cols: Vec<&str> = e.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["id", "total"]);
+        assert!(e.sensitive_columns.contains("total"));
+        assert!(e.archive_field.is_none() && e.includes.is_empty());
+    }
+
+    #[test]
+    fn write_operations_on_a_view_are_rejected() {
+        let cfg = config(view(), vec![api("v_sales", &["list", "create"])]);
+        assert!(err(&cfg).contains("operation 'create' is not allowed"));
+    }
+
+    #[test]
+    fn an_exposed_view_needs_a_primary_key() {
+        let v = ViewConfig {
+            primary_key: None,
+            ..view()
+        };
+        assert!(validate(&config(v.clone(), vec![])).is_ok());
+        assert!(err(&config(v, vec![api("v_sales", &["list"])])).contains("needs a primary_key"));
+    }
+
+    #[test]
+    fn invalid_views_are_rejected() {
+        let mut cases: Vec<(ViewConfig, &str)> = vec![
+            (
+                ViewConfig {
+                    materialized: true,
+                    primary_key: None,
+                    ..view()
+                },
+                "materialized view needs a primary_key",
+            ),
+            (
+                ViewConfig {
+                    materialized: true,
+                    columns: vec![ViewColumnConfig {
+                        name: "tenant_id".into(),
+                        type_: ColumnTypeConfig::Simple("text".into()),
+                        nullable: true,
+                        comment: None,
+                    }],
+                    primary_key: Some(PrimaryKeyConfig::Single("tenant_id".into())),
+                    ..view()
+                },
+                "managed by the SDK",
+            ),
+            (
+                ViewConfig {
+                    sql: " ".into(),
+                    ..view()
+                },
+                "sql must not be empty",
+            ),
+            (
+                ViewConfig {
+                    columns: vec![],
+                    ..view()
+                },
+                "columns must list",
+            ),
+            (
+                ViewConfig {
+                    primary_key: Some(PrimaryKeyConfig::Single("nope".into())),
+                    ..view()
+                },
+                "primary_key column 'nope'",
+            ),
+            (
+                ViewConfig {
+                    reads: vec!["orders".into()],
+                    ..view()
+                },
+                "must be schema-qualified",
+            ),
+            (
+                ViewConfig {
+                    sql_by_dialect: [("oracle".to_string(), "SELECT 1".to_string())].into(),
+                    ..view()
+                },
+                "sql_by_dialect key 'oracle'",
+            ),
+        ];
+        let refresh = |secs| Some(crate::config::ViewRefreshConfig { max_age_secs: secs });
+        cases.push((
+            ViewConfig {
+                refresh: refresh(3600),
+                ..view()
+            },
+            "refresh applies only to materialized views",
+        ));
+        cases.push((
+            ViewConfig {
+                materialized: true,
+                refresh: refresh(30),
+                ..view()
+            },
+            "max_age_secs must be at least 60",
+        ));
+        for (v, expected) in cases {
+            let msg = err(&config(v, vec![]));
+            assert!(
+                msg.contains(expected),
+                "{} does not mention {}",
+                msg,
+                expected
+            );
+        }
+        let mut dup = view();
+        dup.columns.push(dup.columns[0].clone());
+        assert!(err(&config(dup, vec![])).contains("listed twice"));
+    }
+
+    #[test]
+    fn view_ids_must_not_collide_with_tables() {
+        let mut cfg = config(view(), vec![]);
+        cfg.tables.push(TableConfig {
+            id: "v_sales".into(),
+            schema_id: None,
+            name: "t".into(),
+            comment: None,
+            primary_key: PrimaryKeyConfig::Single("id".into()),
+            unique: vec![],
+            check: vec![],
+            audit_log: false,
+            versioning: None,
+            global: false,
+        });
+        cfg.columns.push(ColumnConfig {
+            id: "c".into(),
+            table_id: "v_sales".into(),
+            name: "id".into(),
+            type_: ColumnTypeConfig::Simple("uuid".into()),
+            nullable: false,
+            default: None,
+            comment: None,
+            asset: None,
+            extensible: false,
+            generated: None,
+        });
+        assert!(err(&cfg).contains("already used"));
+    }
+
+    #[test]
+    fn unknown_entity_ids_are_still_rejected() {
+        let cfg = config(view(), vec![api("nope", &["list"])]);
+        assert!(matches!(
+            validate(&cfg),
+            Err(ConfigError::MissingReference { kind: "table", .. })
+        ));
     }
 }

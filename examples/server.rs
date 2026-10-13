@@ -258,6 +258,16 @@ async fn load_config_from_package_path(
     let queries: Vec<architect_sdk::config::QueryConfig> =
         serde_json::from_value(serde_json::Value::Array(queries_raw))?;
 
+    let mut views = read_kind_from_dir(&dir, "views").await?;
+    for o in views.iter_mut() {
+        if let Some(obj) = o.as_object_mut() {
+            obj.entry("schema_id")
+                .or_insert_with(|| serde_json::Value::String("default".into()));
+        }
+    }
+    let views: Vec<architect_sdk::config::ViewConfig> =
+        serde_json::from_value(serde_json::Value::Array(views))?;
+
     Ok((
         FullConfig {
             schemas,
@@ -269,6 +279,7 @@ async fn load_config_from_package_path(
             api_entities,
             kv_stores,
             queries,
+            views,
         },
         package_id,
     ))

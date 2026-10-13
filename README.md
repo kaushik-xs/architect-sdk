@@ -570,6 +570,24 @@ Notes:
 - **Authorization**: the admin/index routes use dedicated verbs — `getExtensibleFields<Table>`, `putExtensibleFields<Table>`, `deleteExtensibleFields<Table>` — so managing definitions is a separate grant from row CRUD.
 - **Scale note**: for very large RLS tables, partition the shared table by `tenant_id` (list/hash) so tenant-scoped queries prune to one partition; this pairs with the per-tenant partial indexes above. (Per-tenant *Database*-strategy deployments are already sharded by database.)
 
+### 12. Generated (Computed) Columns
+
+A column can be computed by the database from other columns of the same row:
+
+```json
+{ "id": "col_lines_total", "table_id": "tbl_order_lines",
+  "name": "total", "type": "numeric(12,2)",
+  "generated": { "expression": "quantity * unit_price" } }
+```
+
+The column is emitted as `GENERATED ALWAYS AS (…) STORED`, so it is always consistent, indexable, filterable and sortable like any other column.
+
+- **Read-only over the API**: it is returned on every read, but a value supplied on create/update is ignored, and it is left out of OpenAPI/MCP request schemas.
+- **Per-dialect expressions**: `"expression_by_dialect": { "mysql": "…" }` overrides `expression` for that dialect (`postgres` / `mysql` / `sqlite`).
+- **Rules**: a generated column cannot have a `default`, be part of the primary key, or be an asset or extensible column. The expression is trusted package SQL and may reference only columns of the same row.
+- **Upgrades**: adding one is an `ADD COLUMN`. SQLite cannot add a STORED generated column, so on SQLite an *added* column is `VIRTUAL`. Changing the expression is done in place (`set_generated_expression`: Postgres 17+ `SET EXPRESSION`, MySQL `MODIFY COLUMN`). Making one regular keeps its values (`drop_generated_expression`: Postgres 13+ `DROP EXPRESSION`, MySQL `MODIFY COLUMN`). Turning a regular column into a generated one, and any expression change on SQLite, is reported for manual action.
+- Audit and history tables store the computed value as a plain column.
+
 ---
 
 ## Environment Variables
@@ -814,16 +832,72 @@ Every table automatically gets: `created_at`, `updated_at`, `archived_at`, `crea
 }
 ```
 
+### View
+
+A read-only SQL view owned by the package. Expose it through an `api_entities` entry whose `entity_id` is the view's id; only `list` and `read` are allowed.
+
+```json
+{
+  "id": "v_sales_by_region",
+  "name": "sales_by_region",
+  "sql": "SELECT c.region, SUM(o.total) AS revenue, COUNT(*) AS orders FROM shop.orders o JOIN crm.customers c ON c.id = o.customer_id GROUP BY c.region",
+  "sql_by_dialect": { "mysql": "SELECT …" },
+  "columns": [
+    { "name": "region",  "type": "text" },
+    { "name": "revenue", "type": "numeric" },
+    { "name": "orders",  "type": "bigint" }
+  ],
+  "primary_key": "region",
+  "reads": ["shop.orders", "crm.customers"]
+}
+```
+
+- `sql` must schema-qualify every table. `sql_by_dialect` (`postgres` / `mysql` / `sqlite`) overrides it for one database.
+- `columns` must match what the SQL returns; install fails otherwise. `primary_key` is required when the view is exposed through `api_entities`.
+- `reads` lists the relations the view reads. It orders views that read other views and limits which views an upgrade rebuilds; without it the view is rebuilt on every upgrade that changes the package's tables.
+- On Postgres, views are created `WITH (security_invoker = true)`, so the base tables' RLS policies apply to the caller. Views need **PostgreSQL 15+**.
+
+**Materialized views** (`"materialized": true`) store their result until refreshed — use them for heavy rollups. The SQL must also return the row's tenant using the tenant token, and `primary_key` is required:
+
+```json
+{
+  "id": "v_revenue",
+  "name": "revenue_by_region",
+  "materialized": true,
+  "sql": "SELECT {{tenant_id:o}} AS tenant_id, o.region, SUM(o.total) AS revenue FROM shop.orders o GROUP BY {{tenant_id:o}}, o.region",
+  "columns": [{ "name": "region", "type": "text" }, { "name": "revenue", "type": "numeric" }],
+  "primary_key": "region"
+}
+```
+
+- `{{tenant_id:o}}` (or `{{tenant_id}}` with no alias) expands to `o."tenant_id"` in a shared (RLS) database and to `NULL` in a tenant's own database, so one SQL works for both. Use it in the SELECT list and GROUP BY, not in joins. Do not declare `tenant_id` in `columns`.
+- The SDK creates the stored relation as `<name>__mv` (a native materialized view on Postgres with a unique index for concurrent refresh; a table on MySQL/SQLite) and a plain view `<name>` over it that returns the declared columns of the caller's tenant only (`app.tenant_id`). A session without a tenant sees no rows in a shared database.
+- The data is computed at install and on `POST /api/v1/views/:view_id/refresh` (or `/api/v1/package/:package_id/views/:view_id/refresh`). A refresh recomputes the caller's database: in a shared database that updates every tenant's rows. `GET …/views/:view_id` returns the last refresh (`refreshedAt`, `durationMs`, `lastError`) for the caller's database. Both are authorized via authrs as `service:{svc}/package:{pkg}/view:{id}` with actions `refresh` / `get`.
+- `views` is reserved as a path segment.
+
+**Scheduled refresh.** Give a materialized view a freshness target, and let one scheduler job keep every view fresh:
+
+```json
+{ "id": "v_revenue", "materialized": true, "refresh": { "max_age_secs": 3600 }, "…": "…" }
+```
+
+`POST /api/v1/views/refresh-stale` (Platform Admin tenant only) refreshes every materialized view whose last successful refresh is older than its `max_age_secs` (minimum 60), across all installed packages and all databases — the shared databases and each Database-strategy tenant's. A view whose last attempt failed or is still running is not retried for 60 seconds. One failure does not stop the run; the response lists what was refreshed and what failed (`meta.refreshed` / `failed` / `skipped`), and each failure is recorded in the view's status. Views without `refresh` refresh only on demand.
+
+Call it from a single scheduled job, e.g. a workflow-engine schedule with cron `* * * * *` (`overlap: skip`) whose workflow has one HttpRequest step: `POST <sdk-url>/api/v1/views/refresh-stale` with header `X-Tenant-ID: _platform` (or your `ARCHITECT_PLATFORM_TENANT`). Ready-to-sync definitions (workflow, `dev.workflow.schedules`, `dev.workflow.globals`) are in [`examples/workflow-engine/`](examples/workflow-engine/).
+
 ### Package Manifest
 
 ```json
 {
-  "id": "my-package",
-  "name": "My Package",
+  "id": "analytics-sales",
+  "name": "Sales analytics",
   "version": "1.0.0",
-  "schema": "my_schema"
+  "schema": "an_sales",
+  "dependencies": { "shop": ">=1.0.0, <2.0.0", "crm": "*" }
 }
 ```
+
+`dependencies` is either a list of package ids (any installed version) or an object mapping each id to a semver requirement. Install fails while a dependency is missing or outside its range, an upgrade that would move a dependency outside a dependent's range is rejected with `409`, and a package other packages depend on cannot be uninstalled.
 
 ---
 
@@ -851,6 +925,7 @@ my-package.zip
 ├── columns.json
 ├── indexes.json
 ├── relationships.json
+├── views.json
 └── api_entities.json
 ```
 
@@ -859,6 +934,8 @@ my-package.zip
 **Uninstall:** `DELETE /api/v1/config/package/:package_id`
 
 Migration steps carry `safety` (`Safe` | `BestEffort` | `WarnOnly`) and `risk` (`None` | `MayFail` | `ExistingNullsMustBeAbsent` | `DataWillBeModified` | `ManualActionRequired`) metadata so you know exactly what will happen before applying.
+
+**Views across packages.** Put views that read only their own package's tables in that package. Views that join several packages belong in a separate analytics package that owns its own schema (e.g. `an_sales`) and declares the packages it reads in `dependencies`. An upgrade drops the views it affects before changing tables and recreates them afterwards. Two guards protect views in other packages: an upgrade that retypes or drops a column such a view reads is rejected with `409`, and so is uninstalling a package whose tables such a view reads (Postgres would otherwise drop the view silently through `CASCADE`).
 
 ---
 

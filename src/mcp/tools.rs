@@ -224,7 +224,7 @@ fn column_properties(
         if pk_set.contains(&col.name) {
             continue;
         }
-        if entity.sensitive_columns.contains(&col.name) {
+        if entity.sensitive_columns.contains(&col.name) || col.generated {
             continue;
         }
         if col.has_default && !col.nullable {

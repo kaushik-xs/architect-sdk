@@ -330,23 +330,14 @@ pub async fn apply_migrations(
             .get(t.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        // (column name, DDL suffix) pairs — reused below to add columns a pre-existing table
-        // is missing, so CREATE TABLE and ALTER TABLE can never disagree about a definition.
+        // (column name, DDL suffix) pairs — the `add_columns` twin is reused below to add
+        // columns a pre-existing table is missing, so CREATE TABLE and ALTER TABLE can never
+        // disagree about a definition (beyond what ADD COLUMN forces, e.g. SQLite VIRTUAL).
         let mut columns: Vec<(String, String)> = Vec::new();
+        let mut add_columns: Vec<(String, String)> = Vec::new();
         for c in cols {
-            let typ = dialect.ddl_type(&parse_canonical(&c.type_));
-            let mut def = typ;
-            if !c.nullable {
-                def.push_str(" NOT NULL");
-            }
-            if let Some(ref d) = c.default {
-                def.push_str(" DEFAULT ");
-                match d {
-                    ColumnDefaultConfig::Literal(s) => def.push_str(s),
-                    ColumnDefaultConfig::Expression { expression } => def.push_str(expression),
-                }
-            }
-            columns.push((c.name.clone(), def));
+            columns.push((c.name.clone(), column_def_suffix(c, dialect, false)));
+            add_columns.push((c.name.clone(), column_def_suffix(c, dialect, true)));
         }
 
         let config_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
@@ -365,6 +356,7 @@ pub async fn apply_migrations(
         ] {
             if !config_col_names.contains(name) {
                 columns.push((name.to_string(), def_suffix.to_string()));
+                add_columns.push((name.to_string(), def_suffix.to_string()));
             }
         }
 
@@ -400,7 +392,15 @@ pub async fn apply_migrations(
         sqlx::query(&sql).execute(pool).await?;
 
         if table_pre_existed {
-            add_missing_columns(pool, &pre_snapshot, dialect, schema_raw, &t.name, &columns).await;
+            add_missing_columns(
+                pool,
+                &pre_snapshot,
+                dialect,
+                schema_raw,
+                &t.name,
+                &add_columns,
+            )
+            .await;
         }
 
         if t.audit_log {
@@ -660,16 +660,483 @@ pub async fn apply_migrations(
         let _ = sqlx::query(&sql).execute(pool).await;
     }
 
+    // Views last: they read the tables (and FK-joined data) created above.
+    create_views(
+        pool,
+        config,
+        schema_override,
+        dialect,
+        rls_tenant_column.is_some(),
+    )
+    .await?;
+
     Ok(())
 }
 
-/// Revert migrations for a package: drop tables, enum types, and schema (if not public) in reverse order of apply.
-/// Uses the same schema_override as apply_migrations (tables/enums live in that schema).
-pub async fn revert_migrations(
+// ─── Views ───────────────────────────────────────────────────────────────────
+
+/// In SDK-generated DDL (the materialized view's unique index): the tenant column followed by a
+/// comma in shared (RLS) databases, nothing elsewhere.
+const TENANT_KEY_TOKEN: &str = "{{tenant_key}}";
+
+/// Expand the tenant placeholders in view SQL for one target database.
+///
+/// `{{tenant_id:o}}` (or `{{tenant_id}}` without a table alias) is the row's tenant id: the RLS
+/// tenant column (`o."tenant_id"`) in a shared (RLS) database, and a typed NULL in a tenant's own
+/// database, where tables have no tenant column. Use it in SELECT lists and GROUP BY, not in
+/// joins (NULL never equals NULL). Materialized views must return it as `tenant_id`.
+pub fn render_tenant_tokens(sql: &str, rls: bool, dialect: &dyn Dialect) -> String {
+    use std::sync::OnceLock;
+    static TOKEN: OnceLock<regex::Regex> = OnceLock::new();
+    let token = TOKEN.get_or_init(|| {
+        regex::Regex::new(r"\{\{\s*tenant_id\s*(?::\s*([A-Za-z_][A-Za-z0-9_]*)\s*)?\}\}")
+            .expect("valid tenant token regex")
+    });
+    let col = quote(RLS_TENANT_COLUMN);
+    let rendered = token.replace_all(sql, |caps: &regex::Captures<'_>| {
+        if !rls {
+            return dialect.null_text_expr().to_string();
+        }
+        match caps.get(1) {
+            Some(alias) => format!("{}.{}", alias.as_str(), col),
+            None => col.clone(),
+        }
+    });
+    let key = if rls {
+        format!("{}, ", col)
+    } else {
+        String::new()
+    };
+    rendered.replace(TENANT_KEY_TOKEN, &key)
+}
+
+/// Name of a materialized view's backing relation, which holds every tenant's rows. Callers
+/// read the wrapper view under the view's own name instead.
+pub fn materialized_backing_name(view_name: &str) -> String {
+    format!("{}__mv", view_name)
+}
+
+/// Recompute a materialized view's stored rows in the database `pool` points at. Several
+/// statements (dialects without native materialized views) run in one transaction, so readers
+/// see the old rows until the new ones commit. `rls` expands tenant tokens for a shared database.
+pub async fn refresh_materialized_view(
+    pool: &Pool,
+    view: &crate::config::ResolvedView,
+    rls: bool,
+    dialect: &dyn Dialect,
+) -> Result<(), AppError> {
+    if !view.materialized {
+        return Err(AppError::BadRequest(format!(
+            "view '{}' is not materialized; it always reads live data",
+            view.id
+        )));
+    }
+    let backing = format!(
+        "{}.{}",
+        quote(&view.schema_name),
+        quote(&materialized_backing_name(&view.name))
+    );
+    let body = render_tenant_tokens(&view.sql, rls, dialect);
+    let statements = dialect.refresh_materialized_view_sql(&backing, &body);
+    if let [only] = statements.as_slice() {
+        sqlx::query(only).execute(pool).await?;
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for sql in &statements {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A package view prepared for DDL with the active dialect.
+struct ViewDdl<'a> {
+    view: &'a ViewConfig,
+    schema: String,
+    /// Quoted `schema.name`: the view callers read (a materialized view's wrapper).
+    qualified: String,
+    /// The view body for the active dialect, tenant tokens not yet expanded.
+    body: &'a str,
+}
+
+impl ViewDdl<'_> {
+    /// Lowercased `schema.name`, the form `reads` entries are matched against.
+    fn key(&self) -> String {
+        format!("{}.{}", self.schema, self.view.name).to_lowercase()
+    }
+
+    /// Lowercased `schema.name` of every relation this view creates: the view itself and, for a
+    /// materialized view, its backing relation.
+    fn relation_keys(&self) -> Vec<String> {
+        let mut keys = vec![self.key()];
+        if self.view.materialized {
+            keys.push(format!("{}.{}", self.schema, self.backing_name()).to_lowercase());
+        }
+        keys
+    }
+
+    fn backing_name(&self) -> String {
+        materialized_backing_name(&self.view.name)
+    }
+
+    fn backing_qualified(&self) -> String {
+        format!("{}.{}", quote(&self.schema), quote(&self.backing_name()))
+    }
+
+    /// Statements that create the view, as `(object_type, sql)`, tenant tokens unexpanded.
+    ///
+    /// A materialized view is a backing relation (native materialized view, or a table where the
+    /// dialect has none), a unique index where the dialect refreshes concurrently, and a plain
+    /// wrapper view under the view's own name returning the declared columns of the caller's
+    /// tenant only.
+    fn create_statements(&self, dialect: &dyn Dialect) -> Vec<(&'static str, String)> {
+        if !self.view.materialized {
+            return vec![("view", dialect.create_view_sql(&self.qualified, self.body))];
+        }
+        let backing = self.backing_qualified();
+        let mut out = vec![(
+            "materialized_view",
+            dialect.create_materialized_view_sql(&backing, self.body),
+        )];
+        let key_columns = self
+            .view
+            .primary_key_columns()
+            .iter()
+            .map(|c| quote(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(sql) = dialect.materialized_view_key_sql(
+            &quote(&format!("{}_key", self.backing_name())),
+            &backing,
+            &format!("{}{}", TENANT_KEY_TOKEN, key_columns),
+        ) {
+            out.push(("index", sql));
+        }
+        let columns = self
+            .view
+            .columns
+            .iter()
+            .map(|c| quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = dialect
+            .tenant_session_filter_sql(RLS_TENANT_COLUMN)
+            .map(|f| format!(" WHERE {}", f))
+            .unwrap_or_default();
+        let wrapper = format!("SELECT {} FROM {}{}", columns, backing, filter);
+        out.push(("view", dialect.create_view_sql(&self.qualified, &wrapper)));
+        out
+    }
+
+    /// Statements that drop the view, as `(object_type, sql)`.
+    fn drop_statements(&self, dialect: &dyn Dialect) -> Vec<(&'static str, String)> {
+        let mut out = vec![("view", dialect.drop_view_sql(&self.qualified))];
+        if self.view.materialized {
+            out.push((
+                "materialized_view",
+                dialect.drop_materialized_view_sql(&self.backing_qualified()),
+            ));
+        }
+        out
+    }
+}
+
+/// The package's views in creation order: a view that `reads` another view of the package comes
+/// after it; otherwise config order is kept. A cycle is a config error.
+fn ordered_views<'a>(
+    config: &'a FullConfig,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> Result<Vec<ViewDdl<'a>>, AppError> {
+    let default_sid = config.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+    let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut views = Vec::with_capacity(config.views.len());
+    for v in &config.views {
+        let sid = v.schema_id.as_deref().unwrap_or(default_sid);
+        let schema = schemas_by_id.get(sid).ok_or_else(|| {
+            AppError::Config(crate::error::ConfigError::MissingReference {
+                kind: "schema",
+                id: sid.to_string(),
+            })
+        })?;
+        let schema = schema_override.unwrap_or(&schema.name).to_string();
+        views.push(ViewDdl {
+            qualified: format!("{}.{}", quote(&schema), quote(&v.name)),
+            schema,
+            body: v.sql_for(dialect.name()),
+            view: v,
+        });
+    }
+
+    let keys: Vec<String> = views.iter().map(ViewDdl::key).collect();
+    // deps[i] = indexes of package views that view i reads.
+    let deps: Vec<Vec<usize>> = views
+        .iter()
+        .map(|v| {
+            v.view
+                .reads
+                .iter()
+                .filter_map(|r| keys.iter().position(|k| *k == r.to_lowercase()))
+                .collect()
+        })
+        .collect();
+
+    let mut order: Vec<usize> = Vec::with_capacity(views.len());
+    while order.len() < views.len() {
+        let next = (0..views.len())
+            .find(|i| !order.contains(i) && deps[*i].iter().all(|d| order.contains(d)));
+        match next {
+            Some(i) => order.push(i),
+            None => {
+                let stuck: Vec<&str> = (0..views.len())
+                    .filter(|i| !order.contains(i))
+                    .map(|i| views[i].view.id.as_str())
+                    .collect();
+                return Err(AppError::Config(crate::error::ConfigError::Validation(
+                    format!("views read each other in a cycle: [{}]", stuck.join(", ")),
+                )));
+            }
+        }
+    }
+    let mut slots: Vec<Option<ViewDdl<'a>>> = views.into_iter().map(Some).collect();
+    Ok(order.into_iter().filter_map(|i| slots[i].take()).collect())
+}
+
+/// Check that a view body (tenant tokens expanded) compiles against the database and returns
+/// exactly the declared columns — plus `tenant_id` for a materialized view — before the view is
+/// created.
+async fn check_view_columns(pool: &Pool, v: &ViewDdl<'_>, body: &str) -> Result<(), AppError> {
+    use sqlx::{Column, Executor};
+    let probe = format!("SELECT * FROM ({}) AS architect_view_check", body);
+    let described = pool.describe(&probe).await.map_err(|e| {
+        AppError::BadRequest(format!("view '{}': sql does not compile: {}", v.view.id, e))
+    })?;
+    let actual: Vec<String> = described
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+    let mut declared: Vec<&str> = v.view.columns.iter().map(|c| c.name.as_str()).collect();
+    if v.view.materialized {
+        declared.push(RLS_TENANT_COLUMN);
+    }
+    let missing: Vec<&str> = declared
+        .iter()
+        .filter(|d| !actual.iter().any(|a| a.eq_ignore_ascii_case(d)))
+        .copied()
+        .collect();
+    let extra: Vec<&str> = actual
+        .iter()
+        .filter(|a| !declared.iter().any(|d| a.eq_ignore_ascii_case(d)))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() && extra.is_empty() {
+        return Ok(());
+    }
+    let hint = if v.view.materialized && missing.contains(&RLS_TENANT_COLUMN) {
+        format!(
+            "; a materialized view must also return {{{{tenant_id:<alias>}}}} AS {}",
+            RLS_TENANT_COLUMN
+        )
+    } else {
+        String::new()
+    };
+    Err(AppError::BadRequest(format!(
+        "view '{}': declared columns do not match its sql (missing from sql: [{}]; not declared: [{}]){}",
+        v.view.id,
+        missing.join(", "),
+        extra.join(", "),
+        hint
+    )))
+}
+
+/// Create every view of the package, in dependency order, after checking each one's columns.
+/// `rls` selects how tenant tokens expand (see [`render_tenant_tokens`]).
+async fn create_views(
     pool: &Pool,
     config: &FullConfig,
     schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+    rls: bool,
 ) -> Result<(), AppError> {
+    for v in ordered_views(config, schema_override, dialect)? {
+        check_view_columns(pool, &v, &render_tenant_tokens(v.body, rls, dialect)).await?;
+        if !dialect.create_view_replaces() {
+            exec_revert_ddl(pool, &dialect.drop_view_sql(&v.qualified)).await;
+        }
+        for (_, sql) in v.create_statements(dialect) {
+            sqlx::query(&render_tenant_tokens(&sql, rls, dialect))
+                .execute(pool)
+                .await
+                .map_err(|e| view_ddl_error(&v, "create", &e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every view of the package in reverse dependency order. Best-effort, like the rest of
+/// the revert: failures are logged.
+async fn drop_views(
+    pool: &Pool,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> Result<(), AppError> {
+    for v in ordered_views(config, schema_override, dialect)?
+        .iter()
+        .rev()
+    {
+        for (_, sql) in v.drop_statements(dialect) {
+            exec_revert_ddl(pool, &sql).await;
+        }
+    }
+    Ok(())
+}
+
+fn view_ddl_error(v: &ViewDdl<'_>, action: &str, e: &sqlx::Error) -> AppError {
+    let msg = e.to_string();
+    let hint = if msg.contains("security_invoker") {
+        " (views need PostgreSQL 15 or later)"
+    } else {
+        ""
+    };
+    AppError::BadRequest(format!(
+        "could not {} view '{}': {}{}",
+        action, v.view.id, msg, hint
+    ))
+}
+
+/// Upgrade steps for views, as `(drops, creates)`: drops run before every table step and
+/// creates after them, so table changes never trip over a view reading the table.
+///
+/// A view is rebuilt (dropped and recreated) when it is new, its body or columns changed, it
+/// reads a relation the table steps touch (or declares no `reads` while any table step exists),
+/// or it reads another rebuilt view. Removed views are dropped. Unaffected views are left alone,
+/// so views in other packages that read them keep working.
+fn view_plan_steps(
+    old: &FullConfig,
+    new: &FullConfig,
+    table_steps: &[MigrationStep],
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> Result<(Vec<MigrationStep>, Vec<MigrationStep>), AppError> {
+    let old_views = ordered_views(old, schema_override, dialect)?;
+    let new_views = ordered_views(new, schema_override, dialect)?;
+    let touched: HashSet<String> = table_steps
+        .iter()
+        .filter_map(|s| {
+            s.table
+                .as_ref()
+                .map(|t| format!("{}.{}", s.schema, t).to_lowercase())
+        })
+        .collect();
+    let has_table_steps = !table_steps.is_empty();
+
+    let changed = |nv: &ViewDdl<'_>, ov: &ViewDdl<'_>| {
+        nv.body != ov.body
+            || nv.qualified != ov.qualified
+            || nv.view.materialized != ov.view.materialized
+            || nv.view.primary_key_columns() != ov.view.primary_key_columns()
+            || nv.view.columns.len() != ov.view.columns.len()
+            || nv
+                .view
+                .columns
+                .iter()
+                .zip(&ov.view.columns)
+                .any(|(a, b)| a.name != b.name || a.type_ != b.type_)
+    };
+
+    // New views to (re)create, in creation order; their keys feed the "reads a rebuilt view" rule.
+    let mut rebuilt_keys: HashSet<String> = HashSet::new();
+    let mut creates: Vec<&ViewDdl<'_>> = Vec::new();
+    for nv in &new_views {
+        let old_match = old_views.iter().find(|ov| ov.view.id == nv.view.id);
+        let reads: Vec<String> = nv.view.reads.iter().map(|r| r.to_lowercase()).collect();
+        let rebuild = match old_match {
+            None => true,
+            Some(ov) => {
+                changed(nv, ov)
+                    || (has_table_steps && reads.is_empty())
+                    || reads
+                        .iter()
+                        .any(|r| touched.contains(r) || rebuilt_keys.contains(r))
+            }
+        };
+        if rebuild {
+            rebuilt_keys.insert(nv.key());
+            creates.push(nv);
+        }
+    }
+
+    // Old views to drop: removed ones and existing ones being rebuilt, in reverse creation order.
+    let drops: Vec<&ViewDdl<'_>> = old_views
+        .iter()
+        .rev()
+        .filter(
+            |ov| match new_views.iter().find(|nv| nv.view.id == ov.view.id) {
+                None => true,
+                Some(nv) => creates.iter().any(|c| c.view.id == nv.view.id),
+            },
+        )
+        .collect();
+
+    // One step per statement. Safe: a failed view step aborts the upgrade. A drop fails when
+    // objects outside the package still read the view, which must stop the upgrade before tables
+    // change. Index steps use CreateView too: the pre-flight snapshot predates the drop of the
+    // relation the index belongs to, so CreateIndex reconciliation would wrongly skip it.
+    let steps = |op: MigrationOperation, v: &ViewDdl<'_>, statements: Vec<(&str, String)>| {
+        let verb = match op {
+            MigrationOperation::DropView => "Drop",
+            _ => "Create",
+        };
+        statements
+            .into_iter()
+            .map(|(object_type, ddl)| MigrationStep {
+                step: 0,
+                operation: op.clone(),
+                schema: v.schema.clone(),
+                table: None,
+                object: v.view.name.clone(),
+                from_object: None,
+                object_type: object_type.into(),
+                description: format!(
+                    "{} {} of view \"{}\".\"{}\"",
+                    verb,
+                    object_type.replace('_', " "),
+                    v.schema,
+                    v.view.name
+                ),
+                ddl: Some(ddl),
+                safety: MigrationSafety::Safe,
+                risk: MigrationRisk::None,
+                risk_detail: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let drop_steps = drops
+        .into_iter()
+        .flat_map(|v| steps(MigrationOperation::DropView, v, v.drop_statements(dialect)))
+        .collect();
+    let create_steps = creates
+        .into_iter()
+        .flat_map(|v| {
+            steps(
+                MigrationOperation::CreateView,
+                v,
+                v.create_statements(dialect),
+            )
+        })
+        .collect();
+    Ok((drop_steps, create_steps))
+}
+
+/// Physical tables `revert_migrations` drops for a package, as `(schema, table)` pairs: each
+/// table's `_audit` / `_history` companions (when enabled) followed by the table itself.
+fn package_physical_tables(
+    config: &FullConfig,
+    schema_override: Option<&str>,
+) -> Result<Vec<(String, String)>, AppError> {
     let default_sid = config
         .schemas
         .first()
@@ -682,7 +1149,7 @@ pub async fn revert_migrations(
 
     let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
 
-    // 1. Drop tables (CASCADE drops FKs and dependent objects)
+    let mut out = Vec::new();
     for t in &config.tables {
         let sid = t.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id.get(sid).ok_or_else(|| {
@@ -691,28 +1158,257 @@ pub async fn revert_migrations(
                 id: sid.to_string(),
             })
         })?;
-        let schema_raw = schema_override.unwrap_or(&schema.name);
-        let schema_name = quote(schema_raw);
-        let table_name = quote(&t.name);
-        let full_name = format!("{}.{}", schema_name, table_name);
+        let schema_raw = schema_override.unwrap_or(&schema.name).to_string();
         if t.audit_log {
-            let audit_full = format!("{}.{}", schema_name, quote(&format!("{}_audit", t.name)));
-            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {} CASCADE", audit_full))
-                .execute(pool)
-                .await;
+            out.push((schema_raw.clone(), format!("{}_audit", t.name)));
         }
         if t.versioning.as_ref().is_some_and(|v| v.enabled) {
-            let history_full = format!("{}.{}", schema_name, quote(&format!("{}_history", t.name)));
-            let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {} CASCADE", history_full))
-                .execute(pool)
-                .await;
+            out.push((schema_raw.clone(), format!("{}_history", t.name)));
         }
-        let drop_sql = format!("DROP TABLE IF EXISTS {} CASCADE", full_name);
-        let _ = sqlx::query(&drop_sql).execute(pool).await;
+        out.push((schema_raw, t.name.clone()));
+    }
+    Ok(out)
+}
+
+/// Schemas `revert_migrations` drops whole: the package's own schemas, except `public` and
+/// except when a schema override is in effect (the override schema is shared).
+fn package_dropped_schemas(config: &FullConfig, schema_override: Option<&str>) -> Vec<String> {
+    if schema_override.is_some() {
+        return Vec::new();
+    }
+    config
+        .schemas
+        .iter()
+        .filter(|s| !s.name.eq_ignore_ascii_case("public"))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// A view outside a package that reads one of the package's tables.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct DependentView {
+    pub view_schema: String,
+    pub view_name: String,
+    pub table_schema: String,
+    pub table_name: String,
+    /// The column read, or `None` for a dependency on the table as a whole.
+    pub column: Option<String>,
+}
+
+impl std::fmt::Display for DependentView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{} (reads {}.{}",
+            self.view_schema, self.view_name, self.table_schema, self.table_name
+        )?;
+        if let Some(c) = &self.column {
+            write!(f, ".{}", c)?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// Every view reading `tables` (directly or through other views), one entry per column read.
+/// Empty when the dialect cannot report view dependencies.
+async fn find_dependent_views(
+    pool: &Pool,
+    dialect: &dyn Dialect,
+    tables: &[(String, String)],
+) -> Result<Vec<DependentView>, AppError> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(sql) = dialect.dependent_views_sql(tables) else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            use sqlx::Row;
+            Some(DependentView {
+                view_schema: row.try_get::<String, _>(0).ok()?,
+                view_name: row.try_get::<String, _>(1).ok()?,
+                table_schema: row.try_get::<String, _>(2).ok()?,
+                table_name: row.try_get::<String, _>(3).ok()?,
+                column: row.try_get::<String, _>(4).ok().filter(|c| !c.is_empty()),
+            })
+        })
+        .collect())
+}
+
+/// Lowercased `schema.name` of every view the package owns.
+fn own_view_keys(
+    config: &FullConfig,
+    schema_override: Option<&str>,
+    dialect: &dyn Dialect,
+) -> Result<Vec<String>, AppError> {
+    Ok(ordered_views(config, schema_override, dialect)?
+        .iter()
+        .flat_map(ViewDdl::relation_keys)
+        .collect())
+}
+
+/// Views outside the package that would block an upgrade `plan`: views reading a column the plan
+/// retypes or drops. Postgres refuses such an `ALTER`, which would otherwise leave the stored
+/// config ahead of the database. The package's own views are rebuilt by the plan, so they do not
+/// block. Run against every target database before anything executes.
+pub async fn find_views_blocking_upgrade(
+    pool: &Pool,
+    dialect: &dyn Dialect,
+    config: &FullConfig,
+    plan: &MigrationPlan,
+) -> Result<Vec<DependentView>, AppError> {
+    let changed: Vec<(String, String, String)> = plan
+        .steps
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.operation,
+                MigrationOperation::AlterColumnType | MigrationOperation::DropColumn
+            )
+        })
+        .filter_map(|s| {
+            s.table
+                .as_ref()
+                .map(|t| (s.schema.clone(), t.clone(), s.object.clone()))
+        })
+        .collect();
+    let mut tables: Vec<(String, String)> = changed
+        .iter()
+        .map(|(s, t, _)| (s.clone(), t.clone()))
+        .collect();
+    tables.sort();
+    tables.dedup();
+    let found = find_dependent_views(pool, dialect, &tables).await?;
+    Ok(views_reading_changed_columns(
+        found,
+        &changed,
+        &own_view_keys(config, None, dialect)?,
+    ))
+}
+
+/// Of `found`, the views outside `own_views` that read one of the `changed` `(schema, table,
+/// column)` columns, sorted and de-duplicated. Table-level dependencies do not block a column
+/// change.
+fn views_reading_changed_columns(
+    found: Vec<DependentView>,
+    changed: &[(String, String, String)],
+    own_views: &[String],
+) -> Vec<DependentView> {
+    let mut out: Vec<DependentView> = found
+        .into_iter()
+        .filter(|v| {
+            let key = format!("{}.{}", v.view_schema, v.view_name).to_lowercase();
+            !own_views.contains(&key)
+        })
+        .filter(|v| {
+            v.column.as_deref().is_some_and(|col| {
+                changed.iter().any(|(s, t, c)| {
+                    s.eq_ignore_ascii_case(&v.table_schema)
+                        && t.eq_ignore_ascii_case(&v.table_name)
+                        && c.eq_ignore_ascii_case(col)
+                })
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Views that `revert_migrations` would break: views reading one of the package's tables that
+/// live outside the schemas the package drops. On Postgres `DROP TABLE … CASCADE` would drop them
+/// silently; on MySQL they would be left invalid. Views inside the package's own schemas belong
+/// to the package and go with it, so they are not reported.
+///
+/// Returns an empty list when the dialect cannot report view dependencies (SQLite). A failing
+/// catalog query is an error rather than an empty list, so the guard never passes by accident.
+pub async fn find_external_dependent_views(
+    pool: &Pool,
+    dialect: &dyn Dialect,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+) -> Result<Vec<DependentView>, AppError> {
+    let tables = package_physical_tables(config, schema_override)?;
+    // Uninstall drops whole tables, so report each view once per table, not per column.
+    let found = find_dependent_views(pool, dialect, &tables)
+        .await?
+        .into_iter()
+        .map(|v| DependentView { column: None, ..v })
+        .collect();
+    Ok(external_dependent_views(
+        found,
+        &package_dropped_schemas(config, schema_override),
+        &own_view_keys(config, schema_override, dialect)?,
+    ))
+}
+
+/// Keep only views outside `dropped_schemas` that are not the package's own views (lowercased
+/// `schema.name` in `own_views`), sorted and de-duplicated.
+fn external_dependent_views(
+    found: Vec<DependentView>,
+    dropped_schemas: &[String],
+    own_views: &[String],
+) -> Vec<DependentView> {
+    let mut out: Vec<DependentView> = found
+        .into_iter()
+        .filter(|v| {
+            !dropped_schemas
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&v.view_schema))
+        })
+        .filter(|v| {
+            let key = format!("{}.{}", v.view_schema, v.view_name).to_lowercase();
+            !own_views.contains(&key)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Run one revert DDL statement. Revert stays best-effort (one failed drop must not leave the
+/// rest of the package behind), but failures are logged instead of discarded.
+async fn exec_revert_ddl(pool: &Pool, sql: &str) {
+    if let Err(e) = sqlx::query(sql).execute(pool).await {
+        tracing::warn!(sql, error = %e, "package revert statement failed");
+    }
+}
+
+/// Revert migrations for a package: drop tables, enum types, and schema (if not public) in reverse order of apply.
+/// Uses the same schema_override as apply_migrations (tables/enums live in that schema).
+/// Callers should first check [`find_external_dependent_views`]: the drops use `CASCADE`.
+pub async fn revert_migrations(
+    pool: &Pool,
+    config: &FullConfig,
+    schema_override: Option<&str>,
+) -> Result<(), AppError> {
+    let dialect = crate::db::active_dialect();
+
+    // 0. Drop the package's views before the tables they read
+    drop_views(pool, config, schema_override, dialect.as_ref()).await?;
+
+    // 1. Drop tables (CASCADE drops FKs and dependent objects)
+    for (schema, table) in package_physical_tables(config, schema_override)? {
+        let drop_sql = format!(
+            "DROP TABLE IF EXISTS {}.{} CASCADE",
+            quote(&schema),
+            quote(&table)
+        );
+        exec_revert_ddl(pool, &drop_sql).await;
     }
 
     // 2. Drop enum types
-    for e in &config.enums {
+    let enums: &[EnumConfig] = if dialect.supports_named_enum_types() {
+        &config.enums
+    } else {
+        &[]
+    };
+    let default_sid = config.schemas.first().map(|s| s.id.as_str()).unwrap_or("");
+    let schemas_by_id: HashMap<_, _> = config.schemas.iter().map(|s| (s.id.as_str(), s)).collect();
+    for e in enums {
         let sid = e.schema_id.as_deref().unwrap_or(default_sid);
         let schema = schemas_by_id.get(sid).ok_or_else(|| {
             AppError::Config(crate::error::ConfigError::MissingReference {
@@ -723,19 +1419,16 @@ pub async fn revert_migrations(
         let schema_name = quote(schema_override.unwrap_or(&schema.name));
         let type_name = quote(&e.name);
         let drop_sql = format!("DROP TYPE IF EXISTS {}.{} CASCADE", schema_name, type_name);
-        let _ = sqlx::query(&drop_sql).execute(pool).await;
+        exec_revert_ddl(pool, &drop_sql).await;
     }
 
     // 3. Drop schema only if not public (shared schema)
-    if schema_override.is_none() {
-        for s in &config.schemas {
-            if s.name.eq_ignore_ascii_case("public") {
-                continue;
-            }
-            let schema_name = quote(&s.name);
-            let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", schema_name);
-            let _ = sqlx::query(&drop_sql).execute(pool).await;
-        }
+    if !dialect.supports_schemas() {
+        return Ok(());
+    }
+    for s in package_dropped_schemas(config, schema_override) {
+        let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote(&s));
+        exec_revert_ddl(pool, &drop_sql).await;
     }
 
     Ok(())
@@ -758,6 +1451,27 @@ fn add_column_ddl(dialect: &dyn Dialect, full_table: &str, col_def: &str) -> Str
     }
 }
 
+/// Column definition after the name: `TYPE [GENERATED ALWAYS AS (…) STORED] [NOT NULL]
+/// [DEFAULT …]`. The generated clause sits directly after the type because MySQL requires it
+/// there. `adding_column` is true inside `ALTER TABLE … ADD COLUMN`.
+fn column_def_suffix(c: &ColumnConfig, dialect: &dyn Dialect, adding_column: bool) -> String {
+    let mut def = dialect.ddl_type(&parse_canonical(&c.type_));
+    if let Some(g) = &c.generated {
+        def.push(' ');
+        def.push_str(
+            &dialect.generated_column_clause(g.expression_for(dialect.name()), adding_column),
+        );
+    }
+    if !c.nullable {
+        def.push_str(" NOT NULL");
+    }
+    if let Some(d) = &c.default {
+        def.push_str(" DEFAULT ");
+        def.push_str(&default_str(d));
+    }
+    def
+}
+
 // ─── Migration plan types ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -774,6 +1488,10 @@ pub enum MigrationOperation {
     DropColumn,
     RenameColumn,
     AlterColumnType,
+    /// Change the expression of a generated column in place.
+    SetGeneratedExpression,
+    /// Turn a generated column into a regular one, keeping its current values.
+    DropGeneratedExpression,
     BackfillNulls,
     SetNotNull,
     DropNotNull,
@@ -783,6 +1501,8 @@ pub enum MigrationOperation {
     DropIndex,
     AddForeignKey,
     DropForeignKey,
+    CreateView,
+    DropView,
 }
 
 impl std::fmt::Display for MigrationOperation {
@@ -871,6 +1591,40 @@ pub struct MigrationSummary {
 }
 
 impl MigrationPlan {
+    /// The plan for one target database, with tenant tokens in view DDL expanded for a shared
+    /// (RLS) database when `rls` is true. Plans are computed once and broadcast, so expansion
+    /// happens per target. [`execute_migration_plan`] expands any token still left as for a
+    /// tenant's own database, which in a shared database makes materialized views show no rows
+    /// rather than other tenants' rows.
+    pub fn for_target(&self, rls: bool, dialect: &dyn Dialect) -> MigrationPlan {
+        let mut plan = self.clone();
+        for s in &mut plan.steps {
+            if let Some(ddl) = &s.ddl {
+                s.ddl = Some(render_tenant_tokens(ddl, rls, dialect));
+            }
+        }
+        plan
+    }
+
+    /// Split off the trailing view-creation steps, as `(before, view_creates)`. RLS targets run
+    /// the tenant-column reconciliation between the two, so views can read the tenant column of
+    /// tables the upgrade creates.
+    pub fn split_view_creates(&self) -> (MigrationPlan, MigrationPlan) {
+        let at = self
+            .steps
+            .iter()
+            .rposition(|s| !matches!(s.operation, MigrationOperation::CreateView))
+            .map_or(0, |i| i + 1);
+        (
+            MigrationPlan {
+                steps: self.steps[..at].to_vec(),
+            },
+            MigrationPlan {
+                steps: self.steps[at..].to_vec(),
+            },
+        )
+    }
+
     pub fn summary(&self) -> MigrationSummary {
         let (mut safe, mut best_effort, mut warn_only, mut destructive) = (0, 0, 0, 0);
         for s in &self.steps {
@@ -906,6 +1660,132 @@ fn default_str(d: &ColumnDefaultConfig) -> String {
     match d {
         ColumnDefaultConfig::Literal(s) => s.clone(),
         ColumnDefaultConfig::Expression { expression } => expression.clone(),
+    }
+}
+
+/// Steps for a column whose `generated` definition changed between versions. Generated values
+/// are derived data, so in-place statements are used where the dialect has them (keeping the
+/// column's indexes); everything else is surfaced for manual action rather than guessed at.
+fn generated_change_steps(
+    old_col: &ColumnConfig,
+    new_col: &ColumnConfig,
+    schema: &str,
+    table: &str,
+    full: &str,
+    dialect: &dyn Dialect,
+) -> Vec<MigrationStep> {
+    let old_expr = old_col
+        .generated
+        .as_ref()
+        .map(|g| g.expression_for(dialect.name()));
+    let new_expr = new_col
+        .generated
+        .as_ref()
+        .map(|g| g.expression_for(dialect.name()));
+    let col = quote(&new_col.name);
+    let col_def = format!("{} {}", col, column_def_suffix(new_col, dialect, false));
+    let step = |operation, description: String, ddl: Option<String>, safety, risk, risk_detail| {
+        MigrationStep {
+            step: 0,
+            operation,
+            schema: schema.to_string(),
+            table: Some(table.to_string()),
+            object: new_col.name.clone(),
+            object_type: "column".into(),
+            from_object: None,
+            description,
+            ddl,
+            safety,
+            risk,
+            risk_detail,
+        }
+    };
+    let manual = |description: String, detail: String| {
+        step(
+            MigrationOperation::AlterColumnType,
+            description,
+            None,
+            MigrationSafety::WarnOnly,
+            MigrationRisk::ManualActionRequired,
+            Some(detail),
+        )
+    };
+    match (old_expr, new_expr) {
+        (Some(old), Some(new)) if old != new => {
+            let description = format!(
+                "Change generated expression of \"{}\".\"{}\".\"{}\": ({}) → ({})",
+                schema, table, new_col.name, old, new
+            );
+            match dialect.alter_generated_expression_sql(full, &col, new, &col_def) {
+                Some(ddl) => {
+                    let detail = match dialect.name() {
+                        "postgres" => "Requires PostgreSQL 17+ (SET EXPRESSION); rewrites the table. On older versions drop and re-add the column manually.",
+                        _ => "Rewrites the table to recompute every row.",
+                    };
+                    vec![step(
+                        MigrationOperation::SetGeneratedExpression,
+                        description,
+                        Some(ddl),
+                        MigrationSafety::BestEffort,
+                        MigrationRisk::MayFail,
+                        Some(detail.into()),
+                    )]
+                }
+                None => vec![manual(
+                    description,
+                    format!(
+                        "{} cannot change a generated column's expression in place. Drop and re-add the column manually (recreate any index on it).",
+                        dialect.name()
+                    ),
+                )],
+            }
+        }
+        (Some(old), None) => {
+            let plain_def = format!(
+                "{} {}",
+                col,
+                column_def_suffix(
+                    &ColumnConfig {
+                        generated: None,
+                        ..new_col.clone()
+                    },
+                    dialect,
+                    false
+                )
+            );
+            let description = format!(
+                "Make \"{}\".\"{}\".\"{}\" a regular column (was generated as ({})); current values are kept",
+                schema, table, new_col.name, old
+            );
+            match dialect.drop_generated_expression_sql(full, &col, &plain_def) {
+                Some(ddl) => vec![step(
+                    MigrationOperation::DropGeneratedExpression,
+                    description,
+                    Some(ddl),
+                    MigrationSafety::BestEffort,
+                    MigrationRisk::MayFail,
+                    Some(match dialect.name() {
+                        "postgres" => "Requires PostgreSQL 13+ (DROP EXPRESSION).".into(),
+                        _ => "Only STORED generated columns can become regular columns.".into(),
+                    }),
+                )],
+                None => vec![manual(
+                    description,
+                    format!(
+                        "{} cannot drop a column's generation expression. Recreate the column manually.",
+                        dialect.name()
+                    ),
+                )],
+            }
+        }
+        (None, Some(new)) => vec![manual(
+            format!(
+                "Make \"{}\".\"{}\".\"{}\" generated as ({})",
+                schema, table, new_col.name, new
+            ),
+            "A regular column cannot become a generated column in place. Drop and re-add it manually; existing values will be replaced by computed ones.".into(),
+        )],
+        _ => Vec::new(),
     }
 }
 
@@ -1385,18 +2265,11 @@ pub fn compute_migration_plan(
             .unwrap_or(&[]);
         let mut col_defs: Vec<String> = Vec::new();
         for c in cols {
-            let typ = dialect.ddl_type(&parse_canonical(&c.type_));
-            let mut def = format!("{} {}", quote(&c.name), typ);
-            if !c.nullable {
-                def.push_str(" NOT NULL");
-            }
-            if let Some(ref d) = c.default {
-                def.push_str(" DEFAULT ");
-                match d {
-                    ColumnDefaultConfig::Literal(s) => def.push_str(s),
-                    ColumnDefaultConfig::Expression { expression } => def.push_str(expression),
-                }
-            }
+            let def = format!(
+                "{} {}",
+                quote(&c.name),
+                column_def_suffix(c, dialect, false)
+            );
             col_defs.push(def);
         }
         let cfg_col_names: HashSet<&str> = cols.iter().map(|c| c.name.as_str()).collect();
@@ -1707,6 +2580,15 @@ pub fn compute_migration_plan(
                 ));
             }
 
+            steps.extend(generated_change_steps(
+                old_col,
+                new_col,
+                &schema,
+                &table.name,
+                &full,
+                dialect,
+            ));
+
             // Type change
             let old_type = dialect.ddl_type(&parse_canonical(&old_col.type_));
             let new_type = dialect.ddl_type(&parse_canonical(&new_col.type_));
@@ -1883,17 +2765,11 @@ pub fn compute_migration_plan(
         } else {
             // New column: ADD COLUMN
             let new_type = dialect.ddl_type(&parse_canonical(&new_col.type_));
-            let mut col_def = format!("{} {}", quote(&new_col.name), new_type);
-            if !new_col.nullable {
-                col_def.push_str(" NOT NULL");
-            }
-            if let Some(ref d) = new_col.default {
-                col_def.push_str(" DEFAULT ");
-                match d {
-                    ColumnDefaultConfig::Literal(s) => col_def.push_str(s),
-                    ColumnDefaultConfig::Expression { expression } => col_def.push_str(expression),
-                }
-            }
+            let col_def = format!(
+                "{} {}",
+                quote(&new_col.name),
+                column_def_suffix(new_col, dialect, true)
+            );
             steps.push(MigrationStep {
                 step: 0,
                 operation: MigrationOperation::AddColumn,
@@ -2224,6 +3100,13 @@ pub fn compute_migration_plan(
         });
     }
 
+    let (view_drops, view_creates) = view_plan_steps(old, new, &steps, schema_override, dialect)?;
+    let mut steps: Vec<MigrationStep> = view_drops
+        .into_iter()
+        .chain(steps)
+        .chain(view_creates)
+        .collect();
+
     // Assign sequential step numbers
     for (i, s) in steps.iter_mut().enumerate() {
         s.step = i + 1;
@@ -2291,7 +3174,13 @@ pub fn reconcile_step(step: &MigrationStep, snap: &DbSnapshot) -> StepDecision {
         Op::RenameColumn => rename_skip_reason(step, snap, schema, table, table_known),
 
         // A column that is gone cannot be retyped, defaulted or backfilled.
-        Op::AlterColumnType | Op::BackfillNulls | Op::SetDefault if column_gone => {
+        Op::AlterColumnType
+        | Op::SetGeneratedExpression
+        | Op::DropGeneratedExpression
+        | Op::BackfillNulls
+        | Op::SetDefault
+            if column_gone =>
+        {
             Some(missing_column())
         }
 
@@ -2550,6 +3439,8 @@ pub async fn execute_migration_plan(
                 let Some(ref sql) = step.ddl else {
                     continue;
                 };
+                let rendered = render_tenant_tokens(sql, false, dialect);
+                let sql = &rendered;
 
                 if let StepDecision::Skip(reason) = reconcile_step(step, &snapshot) {
                     tracing::info!(step = step.step, %op, %reason, "migration step already satisfied — skipping");
@@ -2912,6 +3803,7 @@ mod enum_recreate_tests {
             comment: None,
             asset: None,
             extensible: false,
+            generated: None,
         }
     }
 
@@ -3065,6 +3957,7 @@ mod companion_sync_tests {
             comment: None,
             asset: None,
             extensible: false,
+            generated: None,
         }
     }
 
@@ -3498,5 +4391,744 @@ mod postgres_idempotent_ddl_tests {
         assert!(d.is_duplicate_object_code("42710"));
         // undefined_column must still be a real failure.
         assert!(!d.is_duplicate_object_code("42703"));
+    }
+}
+
+#[cfg(test)]
+mod uninstall_guard_tests {
+    use super::*;
+
+    fn config() -> FullConfig {
+        let table =
+            |id: &str, name: &str, schema_id: &str, audit: bool, versioning: bool| TableConfig {
+                id: id.into(),
+                schema_id: Some(schema_id.into()),
+                name: name.into(),
+                comment: None,
+                primary_key: PrimaryKeyConfig::Single("id".into()),
+                unique: vec![],
+                check: vec![],
+                audit_log: audit,
+                versioning: versioning.then_some(VersioningConfig {
+                    enabled: true,
+                    keep_versions: None,
+                }),
+                global: false,
+            };
+        FullConfig {
+            schemas: vec![
+                SchemaConfig {
+                    id: "s1".into(),
+                    name: "ecommerce".into(),
+                    comment: None,
+                },
+                SchemaConfig {
+                    id: "s2".into(),
+                    name: "public".into(),
+                    comment: None,
+                },
+            ],
+            tables: vec![
+                table("t1", "orders", "s1", true, true),
+                table("t2", "settings", "s2", false, false),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn view(view_schema: &str, view_name: &str, table: &str) -> DependentView {
+        DependentView {
+            view_schema: view_schema.into(),
+            view_name: view_name.into(),
+            table_schema: "ecommerce".into(),
+            table_name: table.into(),
+            column: None,
+        }
+    }
+
+    fn pair(s: &str, t: &str) -> (String, String) {
+        (s.into(), t.into())
+    }
+
+    #[test]
+    fn physical_tables_include_companions_in_drop_order() {
+        assert_eq!(
+            package_physical_tables(&config(), None).unwrap(),
+            vec![
+                pair("ecommerce", "orders_audit"),
+                pair("ecommerce", "orders_history"),
+                pair("ecommerce", "orders"),
+                pair("public", "settings"),
+            ]
+        );
+    }
+
+    #[test]
+    fn physical_tables_follow_schema_override() {
+        let tables = package_physical_tables(&config(), Some("tenant_x")).unwrap();
+        assert!(tables.iter().all(|(s, _)| s == "tenant_x"));
+        assert_eq!(tables.len(), 4);
+    }
+
+    #[test]
+    fn dropped_schemas_skip_public_and_override() {
+        assert_eq!(package_dropped_schemas(&config(), None), vec!["ecommerce"]);
+        assert!(package_dropped_schemas(&config(), Some("tenant_x")).is_empty());
+    }
+
+    #[test]
+    fn views_inside_dropped_schemas_are_not_external() {
+        let found = vec![
+            view("an_sales", "sales_daily", "orders"),
+            view("ECOMMERCE", "v_orders", "orders"),
+            view("an_sales", "sales_daily", "orders"),
+            view("an_finance", "revenue", "orders"),
+        ];
+        assert_eq!(
+            external_dependent_views(found, &["ecommerce".into()], &[]),
+            vec![
+                view("an_finance", "revenue", "orders"),
+                view("an_sales", "sales_daily", "orders"),
+            ]
+        );
+    }
+
+    #[test]
+    fn views_in_shared_schemas_are_external() {
+        // With a schema override nothing is dropped whole, so every dependent view counts.
+        let found = vec![view("tenant_x", "v_orders", "orders")];
+        assert_eq!(external_dependent_views(found.clone(), &[], &[]), found);
+    }
+
+    #[test]
+    fn the_packages_own_views_are_not_external() {
+        let found = vec![
+            view("tenant_x", "v_orders", "orders"),
+            view("tenant_x", "other", "orders"),
+        ];
+        assert_eq!(
+            external_dependent_views(found, &[], &["tenant_x.v_orders".into()]),
+            vec![view("tenant_x", "other", "orders")]
+        );
+    }
+
+    #[test]
+    fn only_views_reading_a_changed_column_block_an_upgrade() {
+        let col = |view_name: &str, c: Option<&str>| DependentView {
+            column: c.map(String::from),
+            ..view("an_sales", view_name, "orders")
+        };
+        let found = vec![
+            col("by_total", Some("TOTAL")),
+            col("by_region", Some("region")),
+            col("counts", None),
+            col("own", Some("total")),
+        ];
+        let changed = vec![("ecommerce".into(), "orders".into(), "total".into())];
+        assert_eq!(
+            views_reading_changed_columns(found, &changed, &["an_sales.own".into()]),
+            vec![col("by_total", Some("TOTAL"))]
+        );
+    }
+
+    #[test]
+    fn dependent_view_display_names_the_column_when_known() {
+        let v = DependentView {
+            column: Some("total".into()),
+            ..view("an_sales", "sales_daily", "orders")
+        };
+        assert_eq!(
+            v.to_string(),
+            "an_sales.sales_daily (reads ecommerce.orders.total)"
+        );
+    }
+
+    #[test]
+    fn dependent_view_display_names_view_and_table() {
+        assert_eq!(
+            view("an_sales", "sales_daily", "orders").to_string(),
+            "an_sales.sales_daily (reads ecommerce.orders)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn view(id: &str, name: &str, sql: &str, reads: &[&str]) -> ViewConfig {
+        ViewConfig {
+            id: id.into(),
+            schema_id: Some("s1".into()),
+            name: name.into(),
+            comment: None,
+            sql: sql.into(),
+            sql_by_dialect: HashMap::new(),
+            columns: vec![ViewColumnConfig {
+                name: "id".into(),
+                type_: ColumnTypeConfig::Simple("int".into()),
+                nullable: false,
+                comment: None,
+            }],
+            primary_key: Some(PrimaryKeyConfig::Single("id".into())),
+            reads: reads.iter().map(|r| r.to_string()).collect(),
+            materialized: false,
+            refresh: None,
+        }
+    }
+
+    fn config(views: Vec<ViewConfig>) -> FullConfig {
+        FullConfig {
+            schemas: vec![SchemaConfig {
+                id: "s1".into(),
+                name: "an".into(),
+                comment: None,
+            }],
+            views,
+            ..Default::default()
+        }
+    }
+
+    fn table_step(schema: &str, table: &str) -> MigrationStep {
+        MigrationStep {
+            step: 0,
+            operation: MigrationOperation::AddColumn,
+            schema: schema.into(),
+            table: Some(table.into()),
+            object: "c".into(),
+            from_object: None,
+            object_type: "column".into(),
+            description: String::new(),
+            ddl: Some("ALTER TABLE …".into()),
+            safety: MigrationSafety::Safe,
+            risk: MigrationRisk::None,
+            risk_detail: None,
+        }
+    }
+
+    fn names(steps: &[MigrationStep]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|s| format!("{}:{}", s.operation, s.object))
+            .collect()
+    }
+
+    fn plan(
+        old: &FullConfig,
+        new: &FullConfig,
+        table_steps: &[MigrationStep],
+    ) -> (Vec<String>, Vec<String>) {
+        let dialect = crate::db::active_dialect();
+        let (d, c) = view_plan_steps(old, new, table_steps, None, dialect.as_ref()).unwrap();
+        (names(&d), names(&c))
+    }
+
+    #[test]
+    fn views_are_ordered_by_reads() {
+        let cfg = config(vec![
+            view("v_top", "top", "SELECT 1", &["an.mid"]),
+            view("v_mid", "mid", "SELECT 1", &["an.base"]),
+            view("v_base", "base", "SELECT 1", &["shop.orders"]),
+        ]);
+        let dialect = crate::db::active_dialect();
+        let order: Vec<&str> = ordered_views(&cfg, None, dialect.as_ref())
+            .unwrap()
+            .iter()
+            .map(|v| v.view.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["v_base", "v_mid", "v_top"]);
+    }
+
+    #[test]
+    fn view_cycles_are_rejected() {
+        let cfg = config(vec![
+            view("v_a", "a", "SELECT 1", &["an.b"]),
+            view("v_b", "b", "SELECT 1", &["AN.A"]),
+        ]);
+        let dialect = crate::db::active_dialect();
+        assert!(ordered_views(&cfg, None, dialect.as_ref()).is_err());
+    }
+
+    #[test]
+    fn new_views_are_created_and_removed_views_dropped() {
+        let old = config(vec![view("v_old", "old", "SELECT 1", &[])]);
+        let new = config(vec![view("v_new", "new", "SELECT 1", &[])]);
+        assert_eq!(
+            plan(&old, &new, &[]),
+            (vec!["drop_view:old".into()], vec!["create_view:new".into()])
+        );
+    }
+
+    #[test]
+    fn unchanged_views_are_left_alone() {
+        let cfg = config(vec![view("v", "v", "SELECT 1", &["shop.orders"])]);
+        assert_eq!(plan(&cfg, &cfg, &[]), (vec![], vec![]));
+        // A table step on a relation the view does not read leaves it alone too.
+        assert_eq!(
+            plan(&cfg, &cfg, &[table_step("shop", "customers")]),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn changed_body_rebuilds_the_view() {
+        let old = config(vec![view("v", "v", "SELECT 1", &[])]);
+        let new = config(vec![view("v", "v", "SELECT 2", &[])]);
+        assert_eq!(
+            plan(&old, &new, &[]),
+            (vec!["drop_view:v".into()], vec!["create_view:v".into()])
+        );
+    }
+
+    #[test]
+    fn touched_tables_rebuild_their_readers_and_dependent_views() {
+        let cfg = config(vec![
+            view("v_base", "base", "SELECT 1", &["shop.orders"]),
+            view("v_top", "top", "SELECT 1", &["an.base"]),
+            view("v_other", "other", "SELECT 1", &["shop.customers"]),
+        ]);
+        assert_eq!(
+            plan(&cfg, &cfg, &[table_step("SHOP", "Orders")]),
+            (
+                // Dependents drop before what they read; creation runs the other way.
+                vec!["drop_view:top".into(), "drop_view:base".into()],
+                vec!["create_view:base".into(), "create_view:top".into()]
+            )
+        );
+    }
+
+    #[test]
+    fn views_without_reads_rebuild_on_any_table_step() {
+        let cfg = config(vec![view("v", "v", "SELECT 1", &[])]);
+        assert_eq!(
+            plan(&cfg, &cfg, &[table_step("shop", "anything")]),
+            (vec!["drop_view:v".into()], vec!["create_view:v".into()])
+        );
+    }
+
+    #[test]
+    fn plan_wraps_table_steps_with_view_steps() {
+        let old = config(vec![view("v", "v", "SELECT 1", &[])]);
+        let new = config(vec![view("v", "v", "SELECT 2", &[])]);
+        let dialect = crate::db::active_dialect();
+        let p = compute_migration_plan(&old, &new, None, None, dialect.as_ref(), &HashMap::new())
+            .unwrap();
+        assert_eq!(names(&p.steps), vec!["drop_view:v", "create_view:v"]);
+        assert_eq!(
+            p.steps.iter().map(|s| s.step).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_column_tests {
+    use super::*;
+    #[cfg(feature = "sqlite")]
+    use crate::db::sqlite::SqliteDialect;
+
+    fn col(id: &str, name: &str, ty: &str, generated: Option<&str>) -> ColumnConfig {
+        ColumnConfig {
+            id: id.into(),
+            table_id: "t1".into(),
+            name: name.into(),
+            type_: ColumnTypeConfig::Simple(ty.into()),
+            nullable: true,
+            default: None,
+            comment: None,
+            asset: None,
+            extensible: false,
+            generated: generated.map(|e| GeneratedColumnConfig {
+                expression: e.into(),
+                expression_by_dialect: Default::default(),
+            }),
+        }
+    }
+
+    fn config(columns: Vec<ColumnConfig>) -> FullConfig {
+        FullConfig {
+            schemas: vec![SchemaConfig {
+                id: "s1".into(),
+                name: "app".into(),
+                comment: None,
+            }],
+            tables: vec![TableConfig {
+                id: "t1".into(),
+                schema_id: Some("s1".into()),
+                name: "lines".into(),
+                comment: None,
+                primary_key: PrimaryKeyConfig::Single("id".into()),
+                unique: vec![],
+                check: vec![],
+                audit_log: false,
+                versioning: None,
+                global: false,
+            }],
+            columns,
+            ..Default::default()
+        }
+    }
+
+    /// Same schema, no tables — so the plan creates the table.
+    #[cfg(feature = "sqlite")]
+    fn empty() -> FullConfig {
+        let mut cfg = config(vec![]);
+        cfg.tables.clear();
+        cfg
+    }
+
+    fn base(total: Option<&str>) -> FullConfig {
+        config(vec![
+            col("c0", "id", "uuid", None),
+            col("c1", "qty", "integer", None),
+            col("c2", "price", "integer", None),
+            col("c3", "total", "integer", total),
+        ])
+    }
+
+    fn steps(old: &FullConfig, new: &FullConfig, dialect: &dyn Dialect) -> Vec<MigrationStep> {
+        compute_migration_plan(old, new, None, None, dialect, &HashMap::new())
+            .unwrap()
+            .steps
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn ddls(steps: &[MigrationStep]) -> Vec<&str> {
+        steps.iter().filter_map(|s| s.ddl.as_deref()).collect()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_table_emits_stored_generated_column() {
+        let s = steps(&empty(), &base(Some("qty * price")), &SqliteDialect);
+        assert!(
+            ddls(&s)
+                .iter()
+                .any(|d| d.contains(r#""total" INTEGER GENERATED ALWAYS AS (qty * price) STORED"#)),
+            "{:?}",
+            ddls(&s)
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn generated_clause_precedes_not_null() {
+        // MySQL only accepts the generated clause directly after the type.
+        let mut c = col("c3", "total", "integer", Some("qty * price"));
+        c.nullable = false;
+        let def = column_def_suffix(&c, &SqliteDialect, false);
+        assert!(
+            def.ends_with(" GENERATED ALWAYS AS (qty * price) STORED NOT NULL"),
+            "{}",
+            def
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn add_column_on_sqlite_is_virtual() {
+        let mut old = base(None);
+        old.columns.pop();
+        let s = steps(&old, &base(Some("qty * price")), &SqliteDialect);
+        let add = s
+            .iter()
+            .find(|s| matches!(s.operation, MigrationOperation::AddColumn))
+            .and_then(|s| s.ddl.clone())
+            .unwrap();
+        assert!(
+            add.ends_with("GENERATED ALWAYS AS (qty * price) VIRTUAL"),
+            "{}",
+            add
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn dialect_override_wins() {
+        let mut new = base(Some("qty * price"));
+        new.columns[3]
+            .generated
+            .as_mut()
+            .unwrap()
+            .expression_by_dialect
+            .insert("sqlite".into(), "qty * price * 1".into());
+        let s = steps(&empty(), &new, &SqliteDialect);
+        assert!(ddls(&s)
+            .iter()
+            .any(|d| d.contains("AS (qty * price * 1) STORED")));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn unchanged_expression_emits_nothing() {
+        let s = steps(
+            &base(Some("qty * price")),
+            &base(Some("qty * price")),
+            &SqliteDialect,
+        );
+        assert!(s.is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_expression_changes_are_manual() {
+        for (old, new) in [
+            (Some("qty * price"), Some("qty * price * 2")),
+            (Some("qty * price"), None),
+            (None, Some("qty * price")),
+        ] {
+            let s = steps(&base(old), &base(new), &SqliteDialect);
+            assert_eq!(s.len(), 1, "{:?} → {:?}", old, new);
+            assert!(s[0].ddl.is_none());
+            assert!(matches!(s[0].risk, MigrationRisk::ManualActionRequired));
+        }
+    }
+
+    #[test]
+    fn generated_step_on_missing_column_is_skipped() {
+        let step = MigrationStep {
+            step: 0,
+            operation: MigrationOperation::SetGeneratedExpression,
+            schema: "app".into(),
+            table: Some("lines".into()),
+            object: "total".into(),
+            object_type: "column".into(),
+            from_object: None,
+            description: String::new(),
+            ddl: Some("ALTER TABLE …".into()),
+            safety: MigrationSafety::BestEffort,
+            risk: MigrationRisk::MayFail,
+            risk_detail: None,
+        };
+        let mut snap = DbSnapshot::default();
+        snap.introspected = true;
+        snap.add_table("app", "lines");
+        assert!(matches!(
+            reconcile_step(&step, &snap),
+            StepDecision::Skip(_)
+        ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_changes_expression_in_place() {
+        use crate::db::postgres::PostgresDialect;
+        let s = steps(
+            &base(Some("qty * price")),
+            &base(Some("qty * price * 2")),
+            &PostgresDialect,
+        );
+        assert!(matches!(
+            s[0].operation,
+            MigrationOperation::SetGeneratedExpression
+        ));
+        assert_eq!(
+            s[0].ddl.as_deref(),
+            Some(
+                r#"ALTER TABLE "app"."lines" ALTER COLUMN "total" SET EXPRESSION AS (qty * price * 2)"#
+            )
+        );
+        let s = steps(&base(Some("qty * price")), &base(None), &PostgresDialect);
+        assert_eq!(
+            s[0].ddl.as_deref(),
+            Some(r#"ALTER TABLE "app"."lines" ALTER COLUMN "total" DROP EXPRESSION"#)
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_changes_expression_with_modify_column() {
+        use crate::db::mysql::MySqlDialect;
+        let s = steps(
+            &base(Some("qty * price")),
+            &base(Some("qty * price * 2")),
+            &MySqlDialect,
+        );
+        let ddl = s[0].ddl.as_deref().unwrap();
+        assert!(ddl.contains(r#"MODIFY COLUMN "total""#), "{}", ddl);
+        assert!(
+            ddl.ends_with("GENERATED ALWAYS AS (qty * price * 2) STORED"),
+            "{}",
+            ddl
+        );
+    }
+}
+
+#[cfg(test)]
+mod materialized_view_tests {
+    use super::*;
+
+    fn mv() -> ViewConfig {
+        ViewConfig {
+            id: "v_sales".into(),
+            schema_id: Some("s1".into()),
+            name: "sales".into(),
+            comment: None,
+            sql: "SELECT {{tenant_id:o}} AS tenant_id, o.region, COUNT(*) AS n FROM shop.orders o \
+                  GROUP BY {{ tenant_id : o }}, o.region"
+                .into(),
+            sql_by_dialect: HashMap::new(),
+            columns: vec![
+                ViewColumnConfig {
+                    name: "region".into(),
+                    type_: ColumnTypeConfig::Simple("text".into()),
+                    nullable: true,
+                    comment: None,
+                },
+                ViewColumnConfig {
+                    name: "n".into(),
+                    type_: ColumnTypeConfig::Simple("bigint".into()),
+                    nullable: true,
+                    comment: None,
+                },
+            ],
+            primary_key: Some(PrimaryKeyConfig::Single("region".into())),
+            reads: vec!["shop.orders".into()],
+            materialized: true,
+            refresh: None,
+        }
+    }
+
+    fn config(v: ViewConfig) -> FullConfig {
+        FullConfig {
+            schemas: vec![SchemaConfig {
+                id: "s1".into(),
+                name: "an".into(),
+                comment: None,
+            }],
+            views: vec![v],
+            ..Default::default()
+        }
+    }
+
+    fn statements(f: impl Fn(&ViewDdl<'_>) -> Vec<(&'static str, String)>) -> Vec<String> {
+        let cfg = config(mv());
+        let dialect = crate::db::active_dialect();
+        let views = ordered_views(&cfg, None, dialect.as_ref()).unwrap();
+        f(&views[0]).into_iter().map(|(_, s)| s).collect()
+    }
+
+    #[test]
+    fn tenant_tokens_expand_per_target() {
+        let dialect = crate::db::active_dialect();
+        let sql = "SELECT {{tenant_id:o}}, {{ tenant_id }}, {{tenant_key}}x";
+        assert_eq!(
+            render_tenant_tokens(sql, true, dialect.as_ref()),
+            "SELECT o.\"tenant_id\", \"tenant_id\", \"tenant_id\", x"
+        );
+        let null = dialect.null_text_expr();
+        assert_eq!(
+            render_tenant_tokens(sql, false, dialect.as_ref()),
+            format!("SELECT {null}, {null}, x")
+        );
+        // Text that is not a token is left alone.
+        assert_eq!(
+            render_tenant_tokens("SELECT '{{tenant}}'", true, dialect.as_ref()),
+            "SELECT '{{tenant}}'"
+        );
+    }
+
+    #[test]
+    fn a_materialized_view_owns_its_backing_relation() {
+        let cfg = config(mv());
+        let dialect = crate::db::active_dialect();
+        assert_eq!(
+            own_view_keys(&cfg, None, dialect.as_ref()).unwrap(),
+            vec!["an.sales", "an.sales__mv"]
+        );
+    }
+
+    #[test]
+    fn dropping_removes_the_wrapper_before_the_backing_relation() {
+        let drops = statements(|v| v.drop_statements(crate::db::active_dialect().as_ref()));
+        assert_eq!(drops.len(), 2);
+        assert!(drops[0].contains("VIEW") && drops[0].contains("\"an\".\"sales\""));
+        assert!(drops[1].contains("\"an\".\"sales__mv\""));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_backs_a_materialized_view_with_a_table_and_an_unfiltered_wrapper() {
+        let creates = statements(|v| v.create_statements(crate::db::active_dialect().as_ref()));
+        assert_eq!(
+            creates,
+            vec![
+                format!(
+                    "CREATE TABLE IF NOT EXISTS \"an\".\"sales__mv\" AS {}",
+                    mv().sql
+                ),
+                "CREATE VIEW IF NOT EXISTS \"an\".\"sales\" AS SELECT \"region\", \"n\" FROM \"an\".\"sales__mv\""
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_keys_the_materialized_view_by_tenant_and_filters_the_wrapper() {
+        let creates = statements(|v| v.create_statements(crate::db::active_dialect().as_ref()));
+        assert_eq!(creates.len(), 3);
+        assert!(
+            creates[0].starts_with("CREATE MATERIALIZED VIEW IF NOT EXISTS \"an\".\"sales__mv\"")
+        );
+        assert_eq!(
+            creates[1],
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"sales__mv_key\" ON \"an\".\"sales__mv\" ({{tenant_key}}\"region\")"
+        );
+        assert!(creates[2].contains(
+            "SELECT \"region\", \"n\" FROM \"an\".\"sales__mv\" WHERE \"tenant_id\" IS NOT DISTINCT FROM NULLIF(current_setting('app.tenant_id', true), '')"
+        ));
+    }
+
+    #[test]
+    fn switching_to_materialized_rebuilds_the_view() {
+        let plain = config(ViewConfig {
+            materialized: false,
+            ..mv()
+        });
+        let materialized = config(mv());
+        let dialect = crate::db::active_dialect();
+        let (drops, creates) =
+            view_plan_steps(&plain, &materialized, &[], None, dialect.as_ref()).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert!(creates.len() >= 2);
+        assert!(creates
+            .iter()
+            .all(|s| matches!(s.operation, MigrationOperation::CreateView)));
+        assert_eq!(creates[0].object_type, "materialized_view");
+        assert_eq!(creates.last().unwrap().object_type, "view");
+    }
+
+    #[test]
+    fn plans_split_off_trailing_view_creations_and_render_per_target() {
+        let dialect = crate::db::active_dialect();
+        let old = config(ViewConfig {
+            sql: "SELECT 1".into(),
+            ..mv()
+        });
+        let plan = compute_migration_plan(
+            &old,
+            &config(mv()),
+            None,
+            None,
+            dialect.as_ref(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let (before, creates) = plan.split_view_creates();
+        assert!(before
+            .steps
+            .iter()
+            .all(|s| matches!(s.operation, MigrationOperation::DropView)));
+        assert!(!creates.steps.is_empty());
+        assert_eq!(before.steps.len() + creates.steps.len(), plan.steps.len());
+
+        let rls = plan.for_target(true, dialect.as_ref());
+        let ddl = rls
+            .steps
+            .iter()
+            .filter_map(|s| s.ddl.as_deref())
+            .collect::<String>();
+        assert!(ddl.contains("o.\"tenant_id\"") && !ddl.contains("{{"));
     }
 }

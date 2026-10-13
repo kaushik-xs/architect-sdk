@@ -167,6 +167,51 @@ pub async fn check_query_permission_opt(
     query: &ResolvedQuery,
     action: &str,
 ) -> Result<(), AppError> {
+    check_package_resource_permission_opt(
+        client_opt,
+        tenant_id,
+        user_id,
+        &query.package_id,
+        "query",
+        &query.id,
+        action,
+    )
+    .await
+}
+
+/// Check view permission against authrs. No-op when authrs is not configured.
+///
+/// Resource format: `service:{SERVICE_NAME}/package:{package_id}/view:{view_id}`
+/// Action format:   `{action}` (`get` for status, `refresh`).
+pub async fn check_view_permission_opt(
+    client_opt: &Option<Arc<AuthrsClient>>,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    view: &crate::config::ResolvedView,
+    action: &str,
+) -> Result<(), AppError> {
+    check_package_resource_permission_opt(
+        client_opt,
+        tenant_id,
+        user_id,
+        &view.package_id,
+        "view",
+        &view.id,
+        action,
+    )
+    .await
+}
+
+/// Shared check for `service:{SERVICE_NAME}/package:{package_id}/{kind}:{id}` resources.
+async fn check_package_resource_permission_opt(
+    client_opt: &Option<Arc<AuthrsClient>>,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    package_id: &str,
+    kind: &str,
+    id: &str,
+    action: &str,
+) -> Result<(), AppError> {
     let client = match client_opt {
         Some(c) => c,
         None => return Ok(()),
@@ -177,15 +222,15 @@ pub async fn check_query_permission_opt(
     let tenant_id = tenant_id.unwrap_or("");
 
     let resource = format!(
-        "service:{}/package:{}/query:{}",
-        client.service_name, query.package_id, query.id
+        "service:{}/package:{}/{}:{}",
+        client.service_name, package_id, kind, id
     );
 
     tracing::debug!(
         user_id = %user_id,
         resource = %resource,
         action = %action,
-        "checking authrs query permission"
+        "checking authrs {} permission", kind
     );
 
     let allowed = client.check(tenant_id, user_id, &resource, action).await?;
@@ -196,7 +241,7 @@ pub async fn check_query_permission_opt(
             tenant_id = %tenant_id,
             resource = %resource,
             action = %action,
-            "query permission granted"
+            "{} permission granted", kind
         );
     } else {
         tracing::warn!(
@@ -204,7 +249,7 @@ pub async fn check_query_permission_opt(
             tenant_id = %tenant_id,
             resource = %resource,
             action = %action,
-            "query permission denied"
+            "{} permission denied", kind
         );
         return Err(AppError::Unauthorized(format!(
             "action '{}' not permitted on '{}'",

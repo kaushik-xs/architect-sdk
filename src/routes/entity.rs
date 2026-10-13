@@ -15,6 +15,10 @@ use crate::handlers::extensible_fields::{
     put_registry_package,
 };
 use crate::handlers::kv::{kv_delete, kv_get, kv_list_keys, kv_put};
+use crate::handlers::views::{
+    get_package_view_status, get_view_status, refresh_package_view, refresh_stale_views,
+    refresh_view,
+};
 use crate::state::AppState;
 use axum::{routing::get, routing::post, Router};
 
@@ -49,6 +53,19 @@ pub fn entity_routes(state: AppState) -> Router {
         .route(
             "/:path_segment/:id/history/:version",
             get(read_history_version),
+        )
+        // Static `views` segment — takes precedence over /:path_segment/:id (like /kv), so
+        // `views` is reserved as a path_segment.
+        .route("/views/refresh-stale", post(refresh_stale_views))
+        .route("/views/:view_id", get(get_view_status))
+        .route("/views/:view_id/refresh", post(refresh_view))
+        .route(
+            "/package/:package_id/views/:view_id",
+            get(get_package_view_status),
+        )
+        .route(
+            "/package/:package_id/views/:view_id/refresh",
+            post(refresh_package_view),
         )
         .route("/package/:package_id/kv/:namespace", get(kv_list_keys))
         .route(

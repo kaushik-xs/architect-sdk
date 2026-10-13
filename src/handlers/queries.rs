@@ -95,7 +95,7 @@ fn effective_cache_ttl(query: &ResolvedQuery) -> Option<i64> {
 /// 64-bit FNV-1a hash rendered as 16 hex chars — a bounded, deterministic cache key. Collisions are
 /// astronomically unlikely and, because the cached envelope records the exact query/tenant/params,
 /// a collision fails verification and is treated as a miss (never a wrong hit).
-fn fnv1a_hex(s: &str) -> String {
+pub(crate) fn fnv1a_hex(s: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         hash ^= *b as u64;

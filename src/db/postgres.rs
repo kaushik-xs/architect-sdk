@@ -3,7 +3,7 @@
 //! Free functions are kept for zero-overhead internal use. `PostgresDialect` implements the
 //! `Dialect` trait for use via `Arc<dyn Dialect>` in AppState.
 
-use super::dialect::{escape_literal, Dialect};
+use super::dialect::{escape_literal, table_pairs_literal, Dialect};
 use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 /// Zero-sized marker for the PostgreSQL dialect.
@@ -290,6 +290,33 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// `SET EXPRESSION` requires PostgreSQL 17+.
+    fn alter_generated_expression_sql(
+        &self,
+        full_table: &str,
+        column: &str,
+        expression: &str,
+        _column_def: &str,
+    ) -> Option<String> {
+        Some(format!(
+            "ALTER TABLE {} ALTER COLUMN {} SET EXPRESSION AS ({})",
+            full_table, column, expression
+        ))
+    }
+
+    /// `DROP EXPRESSION` requires PostgreSQL 13+.
+    fn drop_generated_expression_sql(
+        &self,
+        full_table: &str,
+        column: &str,
+        _column_def: &str,
+    ) -> Option<String> {
+        Some(format!(
+            "ALTER TABLE {} ALTER COLUMN {} DROP EXPRESSION",
+            full_table, column
+        ))
+    }
+
     fn is_duplicate_object_code(&self, code: &str) -> bool {
         matches!(
             code,
@@ -333,6 +360,92 @@ impl Dialect for PostgresDialect {
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              WHERE n.nspname = '{}'",
             escape_literal(schema)
+        ))
+    }
+
+    fn create_view_sql(&self, qualified: &str, body: &str) -> String {
+        // security_invoker (PostgreSQL 15+) makes the base tables' RLS policies apply to the
+        // caller; without it a view runs with its owner's rights and bypasses RLS.
+        format!(
+            "CREATE OR REPLACE VIEW {} WITH (security_invoker = true) AS {}",
+            qualified, body
+        )
+    }
+
+    fn create_materialized_view_sql(&self, qualified: &str, body: &str) -> String {
+        format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {} AS {}",
+            qualified, body
+        )
+    }
+
+    fn materialized_view_key_sql(
+        &self,
+        index: &str,
+        qualified: &str,
+        columns: &str,
+    ) -> Option<String> {
+        // REFRESH … CONCURRENTLY needs a unique index over plain columns.
+        Some(format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})",
+            index, qualified, columns
+        ))
+    }
+
+    fn drop_materialized_view_sql(&self, qualified: &str) -> String {
+        format!("DROP MATERIALIZED VIEW IF EXISTS {}", qualified)
+    }
+
+    fn refresh_materialized_view_sql(&self, qualified: &str, _body: &str) -> Vec<String> {
+        vec![format!(
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY {}",
+            qualified
+        )]
+    }
+
+    fn tenant_session_filter_sql(&self, column: &str) -> Option<String> {
+        // Shared-database rows carry their tenant id and the session sets app.tenant_id, so a
+        // caller sees only its rows, and a session without a tenant sees none. In a tenant's own
+        // database both sides are NULL, so every row matches. SET LOCAL leaves '' behind once
+        // its transaction ends, hence NULLIF.
+        Some(format!(
+            "{} IS NOT DISTINCT FROM NULLIF(current_setting('app.tenant_id', true), '')",
+            self.quote_ident(column)
+        ))
+    }
+
+    fn dependent_views_sql(&self, tables: &[(String, String)]) -> Option<String> {
+        // A view's dependency on a relation is recorded against its rewrite rule, not the view
+        // itself, one row per column read (refobjsubid = attnum; 0 = the relation as a whole).
+        // Recursive so a view reading another view that reads the table is found too — CASCADE
+        // would drop the whole chain. Each row names the package table and column at its root.
+        Some(format!(
+            "WITH RECURSIVE edges AS ( \
+               SELECT DISTINCT r.ev_class AS view_oid, d.refobjid AS rel_oid, d.refobjsubid AS col_num \
+               FROM pg_depend d JOIN pg_rewrite r ON r.oid = d.objid \
+               WHERE d.classid = 'pg_rewrite'::regclass \
+                 AND d.refclassid = 'pg_class'::regclass \
+                 AND r.ev_class <> d.refobjid \
+             ), reach(view_oid, root_oid, root_col) AS ( \
+               SELECT e.view_oid, t.oid, e.col_num FROM edges e \
+               JOIN pg_class t ON t.oid = e.rel_oid \
+               JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+               WHERE (tn.nspname, t.relname) IN ({}) \
+               UNION \
+               SELECT e.view_oid, reach.root_oid, reach.root_col \
+               FROM reach JOIN edges e ON e.rel_oid = reach.view_oid \
+             ) \
+             SELECT DISTINCT vn.nspname::text, v.relname::text, tn.nspname::text, t.relname::text, \
+               COALESCE(a.attname::text, '') \
+             FROM reach \
+             JOIN pg_class v ON v.oid = reach.view_oid \
+             JOIN pg_namespace vn ON vn.oid = v.relnamespace \
+             JOIN pg_class t ON t.oid = reach.root_oid \
+             JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+             LEFT JOIN pg_attribute a \
+               ON a.attrelid = reach.root_oid AND a.attnum = reach.root_col AND reach.root_col > 0 \
+             WHERE v.relkind IN ('v', 'm')",
+            table_pairs_literal(tables)
         ))
     }
 }

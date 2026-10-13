@@ -132,7 +132,8 @@ fn entity_body_schema(entity: &ResolvedEntity, for_create: bool) -> Schema {
         )));
     let mut required = Vec::new();
     for col in &entity.columns {
-        if entity.sensitive_columns.contains(&col.name) {
+        // Generated columns are database-computed and read-only.
+        if entity.sensitive_columns.contains(&col.name) || col.generated {
             continue;
         }
         let camel = to_camel_case(&col.name);
@@ -569,7 +570,7 @@ fn graph_child_body_schema(child: &ResolvedEntity, fk_column: &str) -> Schema {
         )));
     let mut required = Vec::new();
     for col in &child.columns {
-        if child.sensitive_columns.contains(&col.name) || col.name == *fk_column {
+        if child.sensitive_columns.contains(&col.name) || col.name == *fk_column || col.generated {
             continue;
         }
         let camel = to_camel_case(&col.name);
@@ -1392,6 +1393,7 @@ mod tests {
             entities: vec![],
             entity_by_path: HashMap::new(),
             queries: HashMap::new(),
+            views: HashMap::new(),
         };
         let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
         let json = serde_json::to_string(&spec).expect("serialize spec");
@@ -1416,6 +1418,7 @@ mod tests {
             ],
             entity_by_path: HashMap::new(),
             queries: HashMap::new(),
+            views: HashMap::new(),
         };
         let spec = build_spec(&model, "/api/v1", &HashMap::new(), &HashMap::new());
         let json = serde_json::to_string(&spec).expect("serialize spec");
@@ -1433,6 +1436,7 @@ mod tests {
             entities: vec![entity("products", vec!["attributes".into()])],
             entity_by_path: HashMap::new(),
             queries: HashMap::new(),
+            views: HashMap::new(),
         };
         let mut package_models = HashMap::new();
         package_models.insert(
@@ -1441,6 +1445,7 @@ mod tests {
                 entities: vec![entity("invoices", vec!["meta".into()])],
                 entity_by_path: HashMap::new(),
                 queries: HashMap::new(),
+                views: HashMap::new(),
             },
         );
         let spec = build_spec(&default_model, "/api/v1", &package_models, &HashMap::new());

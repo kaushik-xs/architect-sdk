@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use architect_sdk::{
     apply_migrations, compute_migration_plan,
     config::{
-        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, FullConfig, PrimaryKeyConfig,
-        SchemaConfig, TableConfig, ValidationRule,
+        ApiEntityConfig, ColumnConfig, ColumnTypeConfig, FullConfig, GeneratedColumnConfig,
+        PrimaryKeyConfig, SchemaConfig, TableConfig, ValidationRule, ViewColumnConfig, ViewConfig,
     },
     db::active_dialect,
     ensure_sys_tables, execute_migration_plan, resolve,
@@ -70,6 +70,7 @@ fn notes_config() -> FullConfig {
                 comment: None,
                 asset: None,
                 extensible: false,
+                generated: None,
             },
             ColumnConfig {
                 id: "c_notes_body".into(),
@@ -81,6 +82,7 @@ fn notes_config() -> FullConfig {
                 comment: None,
                 asset: None,
                 extensible: false,
+                generated: None,
             },
         ],
         indexes: vec![],
@@ -115,6 +117,7 @@ fn notes_config() -> FullConfig {
         }],
         kv_stores: vec![],
         queries: vec![],
+        views: vec![],
     }
 }
 
@@ -150,6 +153,7 @@ fn users_config() -> FullConfig {
                 comment: None,
                 asset: None,
                 extensible: false,
+                generated: None,
             },
             ColumnConfig {
                 id: "c_users_name".into(),
@@ -161,6 +165,7 @@ fn users_config() -> FullConfig {
                 comment: None,
                 asset: None,
                 extensible: false,
+                generated: None,
             },
             ColumnConfig {
                 id: "c_users_email".into(),
@@ -172,6 +177,7 @@ fn users_config() -> FullConfig {
                 comment: None,
                 asset: None,
                 extensible: false,
+                generated: None,
             },
         ],
         indexes: vec![],
@@ -205,6 +211,7 @@ fn users_config() -> FullConfig {
         }],
         kv_stores: vec![],
         queries: vec![],
+        views: vec![],
     }
 }
 
@@ -342,6 +349,7 @@ fn notes_config_v2() -> FullConfig {
         comment: None,
         asset: None,
         extensible: false,
+        generated: None,
     });
     cfg
 }
@@ -473,6 +481,109 @@ async fn a_column_the_database_already_has_does_not_fail_the_upgrade() {
         "{:?}",
         result.skips
     );
+}
+
+// ── Generated (computed) columns ─────────────────────────────────────────────
+
+/// `notes_config` plus `body_upper`, computed by the database as `upper(body)`.
+fn notes_with_generated_config() -> FullConfig {
+    let mut cfg = notes_config();
+    cfg.columns.push(ColumnConfig {
+        id: "c_notes_body_upper".into(),
+        table_id: "t_notes".into(),
+        name: "body_upper".into(),
+        type_: ColumnTypeConfig::Simple("text".into()),
+        nullable: true,
+        default: None,
+        comment: None,
+        asset: None,
+        extensible: false,
+        generated: Some(GeneratedColumnConfig {
+            expression: "upper(body)".into(),
+            expression_by_dialect: HashMap::new(),
+        }),
+    });
+    cfg
+}
+
+#[tokio::test]
+async fn generated_column_is_computed_and_never_written() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let config = notes_with_generated_config();
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install");
+    let model = resolve(&config).unwrap();
+    let entity = model.entity_by_path.get("notes").unwrap();
+
+    // A client-supplied value for the generated column is ignored, not an error.
+    let mut body = HashMap::new();
+    body.insert("body".to_string(), json!("hello"));
+    body.insert("body_upper".to_string(), json!("ignored"));
+    let mut exec = TenantExecutor::pool(&pool, dialect.as_ref());
+    let created = CrudService::create(&mut exec, entity, &body, None, None, None, dialect.as_ref())
+        .await
+        .expect("create");
+    assert_eq!(created.get("body_upper"), Some(&json!("HELLO")));
+
+    let id = created.get("id").cloned().unwrap();
+    let mut patch = HashMap::new();
+    patch.insert("body".to_string(), json!("bye"));
+    patch.insert("body_upper".to_string(), json!("ignored"));
+    let mut exec = TenantExecutor::pool(&pool, dialect.as_ref());
+    let updated = CrudService::update(&mut exec, entity, &id, &patch, None, None, dialect.as_ref())
+        .await
+        .expect("update")
+        .expect("row returned");
+    assert_eq!(updated.get("body_upper"), Some(&json!("BYE")));
+}
+
+#[tokio::test]
+async fn upgrade_adds_a_generated_column_to_a_populated_table() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let v1 = notes_config();
+    let v2 = notes_with_generated_config();
+
+    apply_migrations(&pool, &v1, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("install v1");
+    sqlx::query(r#"INSERT INTO "main"."notes" ("body") VALUES ('existing')"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let plan = compute_migration_plan(&v1, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .expect("migration plan");
+    let result = execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-gen",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+        false,
+    )
+    .await
+    .expect("upgrade");
+    assert_eq!(result.applied, 1);
+
+    let upper: String = sqlx::query_scalar(r#"SELECT "body_upper" FROM "main"."notes""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(upper, "EXISTING");
 }
 
 // ── CrudService: notes (serial / integer PK) ─────────────────────────────────
@@ -979,4 +1090,427 @@ async fn extensible_index_ddl_applies_and_is_idempotent() {
     .await
     .expect("count indexes");
     assert_eq!(count, 1, "expected exactly one generated index");
+}
+
+// ── views ────────────────────────────────────────────────────────────────────
+
+fn view_column(name: &str, ty: &str) -> ViewColumnConfig {
+    ViewColumnConfig {
+        name: name.into(),
+        type_: ColumnTypeConfig::Simple(ty.into()),
+        nullable: true,
+        comment: None,
+    }
+}
+
+/// `notes_config` plus a read-only `notes_summary` view exposed at `/notes-summary`.
+fn notes_with_view_config(body_expr: &str) -> FullConfig {
+    let mut config = notes_config();
+    config.views.push(ViewConfig {
+        id: "v_notes_summary".into(),
+        schema_id: Some("s1".into()),
+        name: "notes_summary".into(),
+        comment: None,
+        sql: format!(
+            "SELECT id, {} AS body, length(body) AS body_len FROM \"main\".\"notes\"",
+            body_expr
+        ),
+        sql_by_dialect: HashMap::new(),
+        columns: vec![
+            view_column("id", "int"),
+            view_column("body", "text"),
+            view_column("body_len", "int"),
+        ],
+        primary_key: Some(PrimaryKeyConfig::Single("id".into())),
+        reads: vec!["main.notes".into()],
+        materialized: false,
+        refresh: None,
+    });
+    config.api_entities.push(ApiEntityConfig {
+        entity_id: "v_notes_summary".into(),
+        path_segment: "notes-summary".into(),
+        operations: vec!["list".into(), "read".into()],
+        sensitive_columns: vec![],
+        validation: HashMap::new(),
+        archive_field: None,
+        events: vec![],
+        parent_ref_column: None,
+        mcp: None,
+    });
+    config
+}
+
+async fn create_note(pool: &SqlitePool, model: &architect_sdk::config::ResolvedModel, body: &str) {
+    let dialect = active_dialect();
+    let entity = model.entity_by_path.get("notes").unwrap();
+    let mut exec = TenantExecutor::pool(pool, dialect.as_ref());
+    let mut row = HashMap::new();
+    row.insert("body".to_string(), json!(body));
+    CrudService::create(&mut exec, entity, &row, None, None, None, dialect.as_ref())
+        .await
+        .expect("create note");
+}
+
+async fn list_summary(
+    pool: &SqlitePool,
+    model: &architect_sdk::config::ResolvedModel,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let dialect = active_dialect();
+    let entity = model.entity_by_path.get("notes-summary").unwrap();
+    let mut exec = TenantExecutor::pool(pool, dialect.as_ref());
+    CrudService::list(
+        &mut exec,
+        entity,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        dialect.as_ref(),
+        None,
+    )
+    .await
+    .expect("list view")
+    .into_iter()
+    .map(|v| v.as_object().cloned().expect("row object"))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_view_is_created_and_served_through_list_and_read() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let config = notes_with_view_config("body");
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install with view");
+    let model = resolve(&config).unwrap();
+    create_note(&pool, &model, "hello").await;
+
+    let rows = list_summary(&pool, &model).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("body"), Some(&json!("hello")));
+    assert_eq!(rows[0].get("body_len"), Some(&json!(5)));
+    // Only the declared view columns come back.
+    assert_eq!(rows[0].len(), 3);
+
+    let entity = model.entity_by_path.get("notes-summary").unwrap();
+    let mut exec = TenantExecutor::pool(&pool, dialect.as_ref());
+    let read = CrudService::read(&mut exec, entity, &rows[0]["id"], None, dialect.as_ref())
+        .await
+        .expect("read view row")
+        .expect("row exists");
+    assert_eq!(read.get("body_len"), Some(&json!(5)));
+}
+
+#[tokio::test]
+async fn a_view_whose_columns_differ_from_its_sql_fails_the_install() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let mut config = notes_with_view_config("body");
+    config.views[0].columns.pop();
+    let err = apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect_err("column mismatch must fail")
+    .to_string();
+    assert!(err.contains("not declared: [body_len]"), "{}", err);
+}
+
+#[tokio::test]
+async fn a_view_with_invalid_sql_fails_the_install() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let mut config = notes_with_view_config("body");
+    config.views[0].sql = "SELECT id FROM \"main\".\"missing_table\"".into();
+    let err = apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect_err("invalid sql must fail")
+    .to_string();
+    assert!(err.contains("does not compile"), "{}", err);
+}
+
+#[tokio::test]
+async fn an_upgrade_rebuilds_a_changed_view() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let v1 = notes_with_view_config("body");
+    let v2 = notes_with_view_config("upper(body)");
+    apply_migrations(&pool, &v1, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("install v1");
+    let model = resolve(&v1).unwrap();
+    create_note(&pool, &model, "hello").await;
+
+    let plan = compute_migration_plan(&v1, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .expect("plan");
+    let ops: Vec<String> = plan.steps.iter().map(|s| s.operation.to_string()).collect();
+    assert_eq!(ops, vec!["drop_view", "create_view"]);
+    execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-view",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+        false,
+    )
+    .await
+    .expect("upgrade");
+
+    let rows = list_summary(&pool, &resolve(&v2).unwrap()).await;
+    assert_eq!(rows[0].get("body"), Some(&json!("HELLO")));
+
+    // Installing again on startup must not fail on the existing view.
+    apply_migrations(&pool, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("re-apply is idempotent");
+}
+
+#[tokio::test]
+async fn uninstall_drops_the_packages_views() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let config = notes_with_view_config("body");
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install");
+    architect_sdk::migration::revert_migrations(&pool, &config, None)
+        .await
+        .expect("revert");
+    let views: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'view'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(views, 0);
+}
+
+// ── materialized views ───────────────────────────────────────────────────────
+
+/// `notes_config` plus a materialized `note_lengths` view exposed at `/note-lengths`.
+fn notes_with_materialized_view() -> FullConfig {
+    let mut config = notes_config();
+    config.views.push(ViewConfig {
+        id: "v_note_lengths".into(),
+        schema_id: Some("s1".into()),
+        name: "note_lengths".into(),
+        comment: None,
+        sql: "SELECT {{tenant_id}} AS tenant_id, length(body) AS body_len, COUNT(*) AS notes \
+              FROM \"main\".\"notes\" GROUP BY length(body)"
+            .into(),
+        sql_by_dialect: HashMap::new(),
+        columns: vec![view_column("body_len", "int"), view_column("notes", "int")],
+        primary_key: Some(PrimaryKeyConfig::Single("body_len".into())),
+        reads: vec!["main.notes".into()],
+        materialized: true,
+        refresh: None,
+    });
+    config.api_entities.push(ApiEntityConfig {
+        entity_id: "v_note_lengths".into(),
+        path_segment: "note-lengths".into(),
+        operations: vec!["list".into(), "read".into()],
+        sensitive_columns: vec![],
+        validation: HashMap::new(),
+        archive_field: None,
+        events: vec![],
+        parent_ref_column: None,
+        mcp: None,
+    });
+    config
+}
+
+async fn list_note_lengths(
+    pool: &SqlitePool,
+    model: &architect_sdk::config::ResolvedModel,
+) -> Vec<serde_json::Value> {
+    let dialect = active_dialect();
+    let entity = model.entity_by_path.get("note-lengths").unwrap();
+    let mut exec = TenantExecutor::pool(pool, dialect.as_ref());
+    CrudService::list(
+        &mut exec,
+        entity,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        dialect.as_ref(),
+        None,
+    )
+    .await
+    .expect("list materialized view")
+}
+
+#[tokio::test]
+async fn a_materialized_view_serves_stored_rows_until_refreshed() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let config = notes_with_materialized_view();
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("install with materialized view");
+    let model = resolve(&config).unwrap();
+
+    create_note(&pool, &model, "hello").await;
+    create_note(&pool, &model, "howdy").await;
+    // Stored at install time, before the notes existed.
+    assert!(list_note_lengths(&pool, &model).await.is_empty());
+
+    let view = model.view("v_note_lengths").unwrap();
+    architect_sdk::migration::refresh_materialized_view(&pool, view, false, dialect.as_ref())
+        .await
+        .expect("refresh");
+    let rows = list_note_lengths(&pool, &model).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["body_len"], json!(5));
+    assert_eq!(rows[0]["notes"], json!(2));
+    // The SDK-managed tenant column is not exposed.
+    assert!(rows[0].get("tenant_id").is_none());
+
+    // Refreshing again replaces rather than appends.
+    architect_sdk::migration::refresh_materialized_view(&pool, view, false, dialect.as_ref())
+        .await
+        .expect("second refresh");
+    assert_eq!(list_note_lengths(&pool, &model).await[0]["notes"], json!(2));
+
+    // Re-applying on startup keeps the stored rows.
+    apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect("re-apply");
+    assert_eq!(list_note_lengths(&pool, &model).await.len(), 1);
+
+    architect_sdk::migration::revert_migrations(&pool, &config, None)
+        .await
+        .expect("revert");
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('note_lengths', 'note_lengths__mv')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn a_materialized_view_must_return_the_tenant_column() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let mut config = notes_with_materialized_view();
+    config.views[0].sql = "SELECT length(body) AS body_len, COUNT(*) AS notes \
+                           FROM \"main\".\"notes\" GROUP BY length(body)"
+        .into();
+    let err = apply_migrations(
+        &pool,
+        &config,
+        None,
+        None,
+        dialect.as_ref(),
+        &HashMap::new(),
+    )
+    .await
+    .expect_err("missing tenant column must fail")
+    .to_string();
+    assert!(
+        err.contains("{{tenant_id:<alias>}} AS tenant_id"),
+        "{}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn refreshing_a_plain_view_is_rejected() {
+    let config = notes_with_view_config("body");
+    let model = resolve(&config).unwrap();
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let view = model.view("v_notes_summary").unwrap();
+    let err =
+        architect_sdk::migration::refresh_materialized_view(&pool, view, false, dialect.as_ref())
+            .await
+            .expect_err("plain views cannot be refreshed")
+            .to_string();
+    assert!(err.contains("not materialized"), "{}", err);
+}
+
+#[tokio::test]
+async fn an_upgrade_can_turn_a_view_into_a_materialized_view() {
+    let pool = memory_pool().await;
+    let dialect = active_dialect();
+    let mut v1 = notes_with_materialized_view();
+    v1.views[0].materialized = false;
+    v1.views[0].sql = "SELECT length(body) AS body_len, COUNT(*) AS notes \
+                       FROM \"main\".\"notes\" GROUP BY length(body)"
+        .into();
+    let v2 = notes_with_materialized_view();
+    apply_migrations(&pool, &v1, None, None, dialect.as_ref(), &HashMap::new())
+        .await
+        .expect("install v1");
+    create_note(&pool, &resolve(&v1).unwrap(), "hello").await;
+
+    let plan = compute_migration_plan(&v1, &v2, None, None, dialect.as_ref(), &HashMap::new())
+        .expect("plan");
+    execute_migration_plan(
+        &pool,
+        &pool,
+        &plan,
+        "mig-mv",
+        "pkg",
+        "t1",
+        Some("1.0.0"),
+        "2.0.0",
+        dialect.as_ref(),
+        false,
+    )
+    .await
+    .expect("upgrade");
+    // Created populated from the existing notes.
+    let rows = list_note_lengths(&pool, &resolve(&v2).unwrap()).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["notes"], json!(1));
 }

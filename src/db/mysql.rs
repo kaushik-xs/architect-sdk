@@ -1,6 +1,6 @@
 //! MySQL dialect implementation.
 
-use super::dialect::{escape_literal, Dialect};
+use super::dialect::{escape_literal, table_pairs_literal, Dialect};
 use super::types::{CanonicalType, TypeCategory, TypeSupport};
 
 pub struct MySqlDialect;
@@ -121,6 +121,32 @@ impl Dialect for MySqlDialect {
         format!("ON DUPLICATE KEY UPDATE {}", set_pairs)
     }
 
+    fn alter_generated_expression_sql(
+        &self,
+        full_table: &str,
+        _column: &str,
+        _expression: &str,
+        column_def: &str,
+    ) -> Option<String> {
+        Some(format!(
+            "ALTER TABLE {} MODIFY COLUMN {}",
+            full_table, column_def
+        ))
+    }
+
+    /// MySQL keeps a STORED generated column's values when it becomes a regular column.
+    fn drop_generated_expression_sql(
+        &self,
+        full_table: &str,
+        _column: &str,
+        column_def: &str,
+    ) -> Option<String> {
+        Some(format!(
+            "ALTER TABLE {} MODIFY COLUMN {}",
+            full_table, column_def
+        ))
+    }
+
     fn to_one_subquery(&self, col_exprs: &[String], from_clause: &str) -> String {
         let pairs = col_exprs
             .iter()
@@ -231,6 +257,41 @@ impl Dialect for MySqlDialect {
             "SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS \
              WHERE CONSTRAINT_SCHEMA = '{}'",
             escape_literal(schema)
+        ))
+    }
+
+    fn create_view_sql(&self, qualified: &str, body: &str) -> String {
+        format!(
+            "CREATE OR REPLACE SQL SECURITY INVOKER VIEW {} AS {}",
+            qualified, body
+        )
+    }
+
+    fn null_text_expr(&self) -> &'static str {
+        "CAST(NULL AS CHAR)"
+    }
+
+    fn dependent_views_sql(&self, tables: &[(String, String)]) -> Option<String> {
+        // VIEW_TABLE_USAGE / VIEW_COLUMN_USAGE exist from MySQL 8.0.13. MySQL does not cascade
+        // the drop; the views would be left invalid instead. Table-level rows (column '') catch
+        // views that read no specific column (`count(*)`). Recursive so views reading a dependent
+        // view are found too; each row names the package table and column at its root.
+        let pairs = table_pairs_literal(tables);
+        Some(format!(
+            "WITH RECURSIVE reach (view_schema, view_name, root_schema, root_name, root_col) AS ( \
+               SELECT VIEW_SCHEMA, VIEW_NAME, TABLE_SCHEMA, TABLE_NAME, CAST(COLUMN_NAME AS CHAR(64)) \
+               FROM information_schema.VIEW_COLUMN_USAGE \
+               WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+               UNION \
+               SELECT VIEW_SCHEMA, VIEW_NAME, TABLE_SCHEMA, TABLE_NAME, '' \
+               FROM information_schema.VIEW_TABLE_USAGE \
+               WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+               UNION \
+               SELECT u.VIEW_SCHEMA, u.VIEW_NAME, reach.root_schema, reach.root_name, reach.root_col \
+               FROM reach JOIN information_schema.VIEW_TABLE_USAGE u \
+                 ON u.TABLE_SCHEMA = reach.view_schema AND u.TABLE_NAME = reach.view_name \
+             ) \
+             SELECT DISTINCT view_schema, view_name, root_schema, root_name, root_col FROM reach"
         ))
     }
 }

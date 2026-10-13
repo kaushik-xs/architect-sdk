@@ -75,7 +75,7 @@ pub struct VersioningConfig {
     pub keep_versions: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ColumnTypeConfig {
     Simple(String),
@@ -153,6 +153,33 @@ pub struct ColumnConfig {
     /// for non-JSON columns.
     #[serde(default)]
     pub extensible: bool,
+    /// When set, the column is computed by the database from other columns of the same row
+    /// (`GENERATED ALWAYS AS (…) STORED`). It is read-only over the API: values supplied on
+    /// create/update are ignored. Cannot be combined with `default`.
+    #[serde(default)]
+    pub generated: Option<GeneratedColumnConfig>,
+}
+
+/// Database-computed column definition. The expression is trusted SQL authored in the package
+/// (never request input) and may reference only other columns of the same row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedColumnConfig {
+    /// Portable generation expression, e.g. `price * quantity`.
+    pub expression: String,
+    /// Per-dialect expression overrides keyed by dialect name (`postgres`, `mysql`, `sqlite`);
+    /// the active dialect's entry wins over `expression`.
+    #[serde(default)]
+    pub expression_by_dialect: std::collections::HashMap<String, String>,
+}
+
+impl GeneratedColumnConfig {
+    /// The generation expression for `dialect_name`: its override, else the portable one.
+    pub fn expression_for(&self, dialect_name: &str) -> &str {
+        self.expression_by_dialect
+            .get(dialect_name)
+            .map(String::as_str)
+            .unwrap_or(&self.expression)
+    }
 }
 
 fn default_true() -> bool {
@@ -401,6 +428,83 @@ pub struct QueryConfig {
     pub cache_ttl_secs: Option<i64>,
 }
 
+/// One output column of a view. Declared so the API layer knows the view's shape (types for
+/// filtering, casts, OpenAPI) without parsing SQL; checked against the real view at install.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewColumnConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: ColumnTypeConfig,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// A read-only SQL view owned by a package. The body is trusted SQL authored in the package
+/// (never request input). Views that read only their own package's tables can live in any
+/// package; views that join several packages belong in an analytics package with its own schema.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewConfig {
+    pub id: String,
+    #[serde(default)]
+    pub schema_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Portable view body (`SELECT …`). Must reference every table with its schema.
+    pub sql: String,
+    /// Per-dialect body overrides keyed by dialect name (`postgres`, `mysql`, `sqlite`); the
+    /// active dialect's entry wins over `sql`.
+    #[serde(default)]
+    pub sql_by_dialect: std::collections::HashMap<String, String>,
+    /// Output columns, in order. Install fails if the view's real columns differ.
+    pub columns: Vec<ViewColumnConfig>,
+    /// Column(s) that uniquely identify a row. Required when the view is exposed through
+    /// `api_entities` (list orders by it; read looks rows up by it).
+    #[serde(default)]
+    pub primary_key: Option<PrimaryKeyConfig>,
+    /// Relations the view reads, as `schema.name` (tables or views). Used to order views that
+    /// read other views and to decide which views an upgrade must rebuild. When empty, the view
+    /// is rebuilt on every upgrade that changes the package's tables.
+    #[serde(default)]
+    pub reads: Vec<String>,
+    /// Store the result and serve it until refreshed (`POST …/views/:id/refresh`). The sql must
+    /// also return the row's tenant as `{{tenant_id:<alias>}} AS tenant_id` (not declared in
+    /// `columns`); reads only return the caller's tenant's rows. Requires `primary_key`.
+    #[serde(default)]
+    pub materialized: bool,
+    /// How fresh a materialized view must stay. `POST /views/refresh-stale` refreshes it once its
+    /// last refresh is older than `max_age_secs`. Without it, the view refreshes only on demand.
+    #[serde(default)]
+    pub refresh: Option<ViewRefreshConfig>,
+}
+
+/// Freshness of a materialized view, enforced by `POST /views/refresh-stale`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewRefreshConfig {
+    /// Maximum age, in seconds, of the stored rows before a stale-refresh run recomputes them.
+    pub max_age_secs: u64,
+}
+
+impl ViewConfig {
+    /// The view body for `dialect_name`: its `sql_by_dialect` entry, else the portable `sql`.
+    pub fn sql_for(&self, dialect_name: &str) -> &str {
+        self.sql_by_dialect
+            .get(dialect_name)
+            .map(String::as_str)
+            .unwrap_or(&self.sql)
+    }
+
+    pub fn primary_key_columns(&self) -> Vec<String> {
+        match &self.primary_key {
+            Some(PrimaryKeyConfig::Single(s)) => vec![s.clone()],
+            Some(PrimaryKeyConfig::Composite(v)) => v.clone(),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// All config types in one struct for in-memory loading.
 #[derive(Clone, Debug, Default)]
 pub struct FullConfig {
@@ -413,4 +517,5 @@ pub struct FullConfig {
     pub api_entities: Vec<ApiEntityConfig>,
     pub kv_stores: Vec<KvStoreConfig>,
     pub queries: Vec<QueryConfig>,
+    pub views: Vec<ViewConfig>,
 }

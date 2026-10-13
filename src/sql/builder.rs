@@ -846,6 +846,10 @@ pub fn insert(
         if c.pk_type.is_some() && !include_pk {
             continue;
         }
+        // Generated columns are computed by the database and cannot be written.
+        if c.generated {
+            continue;
+        }
         // archive_field may only be written via the dedicated archive endpoint, never via POST/create.
         if entity.archive_field.as_deref().is_some_and(|af| name == af) {
             continue;
@@ -931,6 +935,9 @@ pub fn update(
         let Some(c) = col_by_name.get(k.as_str()) else {
             continue;
         };
+        if c.generated {
+            continue;
+        }
         let v = coerce_json_value_for_column(v.clone(), c.pg_type.as_deref());
         let param_num = q.push_param(v);
         let rhs = c
@@ -1306,6 +1313,7 @@ mod versioning_tests {
                     is_asset: false,
                     asset_is_array: false,
                     asset_config: None,
+                    generated: false,
                 },
                 ColumnInfo {
                     name: "name".into(),
@@ -1316,6 +1324,7 @@ mod versioning_tests {
                     is_asset: false,
                     asset_is_array: false,
                     asset_config: None,
+                    generated: false,
                 },
                 ColumnInfo {
                     name: "updated_at".into(),
@@ -1326,6 +1335,7 @@ mod versioning_tests {
                     is_asset: false,
                     asset_is_array: false,
                     asset_config: None,
+                    generated: false,
                 },
             ],
             operations: vec![],
@@ -1342,6 +1352,55 @@ mod versioning_tests {
             mcp: None,
             extensible_columns: vec![],
         }
+    }
+
+    fn entity_with_generated_column() -> ResolvedEntity {
+        let mut entity = make_entity();
+        entity.columns.push(ColumnInfo {
+            name: "name_upper".into(),
+            pk_type: None,
+            nullable: true,
+            has_default: false,
+            pg_type: None,
+            is_asset: false,
+            asset_is_array: false,
+            asset_config: None,
+            generated: true,
+        });
+        entity
+    }
+
+    #[test]
+    fn insert_never_writes_generated_columns() {
+        let entity = entity_with_generated_column();
+        let body: HashMap<String, Value> = [
+            ("name".to_string(), Value::String("a".into())),
+            ("name_upper".to_string(), Value::String("X".into())),
+        ]
+        .into();
+        let q = insert(&entity, &body, false, None, None, None, &PgDialect);
+        let (cols, returning) = q.sql.split_once("RETURNING").unwrap();
+        assert!(!cols.contains("\"name_upper\""), "{}", q.sql);
+        assert!(returning.contains("\"name_upper\""), "{}", q.sql);
+        assert!(!q.params.contains(&Value::String("X".into())));
+    }
+
+    #[test]
+    fn update_never_writes_generated_columns() {
+        let entity = entity_with_generated_column();
+        let body: HashMap<String, Value> =
+            [("name_upper".to_string(), Value::String("X".into()))].into();
+        let q = update(
+            &entity,
+            &Value::String("00000000-0000-0000-0000-000000000000".into()),
+            &body,
+            None,
+            None,
+            &PgDialect,
+        );
+        let (sets, _) = q.sql.split_once("WHERE").unwrap();
+        assert!(!sets.contains("\"name_upper\""), "{}", q.sql);
+        assert!(!q.params.contains(&Value::String("X".into())));
     }
 
     #[test]
