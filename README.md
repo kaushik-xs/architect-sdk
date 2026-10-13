@@ -107,10 +107,10 @@ No database or network connection required — all tests are in-process.
 
 ### Coverage
 
-Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **183 tests** (159 unit + 24 SQLite integration):
+Measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (LLVM instrumentation), across **244 tests** (209 unit + 35 SQLite integration):
 
 ```
-TOTAL   lines: 33.28%   functions: 36.30%   regions: 34.05%
+TOTAL   lines: 38.89%   functions: 43.14%   regions: 39.75%
 ```
 
 Coverage nearly doubled after adding SQLite integration tests (was 8.15% lines / 14.02% functions). The remaining uncovered code is Axum HTTP handlers, OpenAPI generation, package ZIP processing, event publishing, and Authrs — all of which require a full HTTP stack or external services and are exercised through end-to-end testing.
@@ -121,7 +121,7 @@ Coverage nearly doubled after adding SQLite integration tests (was 8.15% lines /
 |---|---|---|---|---|
 | `src/case.rs` | **93.41%** | **92.59%** | **94.90%** | 18 |
 | `src/service/validation.rs` | **95.71%** | **98.41%** | **96.28%** | 24 |
-| `src/config/validator.rs` | **91.55%** | **100.00%** | **89.04%** | 9 |
+| `src/config/validator.rs` | **95.45%** | **100.00%** | **93.49%** | 9 |
 | `src/sql/rsql.rs` | **85.49%** | **96.97%** | **87.28%** | 14 |
 
 ### SQLite integration tests (in-memory DB, no Postgres needed)
@@ -131,11 +131,11 @@ These tests run the full CRUD stack — migrations, SQL builder, `CrudService`, 
 | File | Lines | Functions | Regions |
 |---|---|---|---|
 | `src/service/crud.rs` | **18.94%** | **31.65%** | **16.29%** |
-| `src/sql/builder.rs` | **56.75%** | **54.69%** | **56.04%** |
-| `src/store.rs` | **30.35%** | **17.39%** | **32.09%** |
-| `src/migration.rs` | **49.80%** | **54.07%** | **47.33%** |
-| `src/config/loader.rs` | **62.09%** | **62.50%** | **65.95%** |
-| `src/db/sqlite.rs` | **44.87%** | **55.56%** | **43.72%** |
+| `src/sql/builder.rs` | **58.73%** | **56.49%** | **57.79%** |
+| `src/store.rs` | **28.59%** | **16.00%** | **31.23%** |
+| `src/migration.rs` | **65.08%** | **71.77%** | **63.71%** |
+| `src/config/loader.rs` | **64.28%** | **64.06%** | **68.28%** |
+| `src/db/sqlite.rs` | **50.00%** | **61.54%** | **48.98%** |
 
 To regenerate coverage numbers and update this file automatically (requires `llvm` via Homebrew):
 
